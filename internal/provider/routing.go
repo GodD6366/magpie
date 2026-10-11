@@ -125,7 +125,7 @@ type Limit struct {
 	Unit       string
 	matches    func(string) bool
 	partial    bool   // of a reading that may leave windows out (QuotaWindow.partial)
-	name       string // QuotaWindow.Name: which window it is, one reading to the next
+	Name       string // QuotaWindow.Name: which window it is, one reading to the next (WindowCapID)
 	// ResetRunsOut is when the reset the account spends by itself before
 	// it runs out does (resetRunsOut): spent then, it starts this window
 	// again — at Restarts, which routing takes for the window's renewal
@@ -416,15 +416,20 @@ func Allowances(agent string) map[string]Allowance {
 			share := renewalShare(agent) // read before the lock: it reads providers.json
 			began := time.Now()
 			all := map[string]Allowance{}
-			for user, q := range LoginUsage(ctx, agent) {
+			readings, readAt := loginUsageAt(ctx, agent)
+			for user, q := range readings {
 				if q.Error != "" || len(q.Windows) == 0 {
 					continue
 				}
 				all[user] = allowanceOf(q.Windows, time.Now()).restartedBy(resetRunsOut(agent, user, q.Windows, q.Resets))
 			}
 			c.Lock()
-			at := time.Now()
-			now := at
+			now := time.Now()
+			// as old as its oldest reading: one the Usage page made 50s
+			// ago, taken here, is read again in 10s, not kept a minute
+			// more — near its cap an account was sent on a reading two
+			// minutes old (#1295)
+			at := readAt
 			if c.seen == nil {
 				c.seen = map[string]reading{}
 			}
@@ -515,6 +520,47 @@ func tellRenewed(agent, user string) {
 	}
 }
 
+// AwaitAllowance has agent's accounts read again unless a reading is out,
+// and waits, till ctx ends, for one that knows user: after a reset is
+// spent, routing then counts the account's windows started again, rather
+// than not known and behind the rest till a later request reads them
+// (#1491). A reading out already, begun before the reset, doesn't count
+// it, so another is asked for; three at most. It says whether user is
+// known now.
+func AwaitAllowance(ctx context.Context, agent, user string) bool {
+	c := &usedCache
+	knows := func() bool {
+		c.Lock()
+		defer c.Unlock()
+		for u := range c.m[agent] {
+			if strings.EqualFold(u, user) {
+				return true
+			}
+		}
+		return false
+	}
+	for range 3 {
+		Allowances(agent)
+		c.Lock()
+		done := c.loading[agent]
+		c.Unlock()
+		if done != nil {
+			select {
+			case <-done:
+			case <-ctx.Done():
+				return knows()
+			}
+		}
+		if knows() {
+			return true
+		}
+		if done == nil {
+			return false // read lately, and user wasn't in it
+		}
+	}
+	return knows()
+}
+
 // forgetAllowance leaves agent's account user out of the allowances last
 // read, and has the next Allowances read them again.
 func forgetAllowance(agent, user string) {
@@ -549,6 +595,9 @@ func forgetAllowance(agent, user string) {
 // has run out.
 func StaleAllowance(agent, user string) {
 	key := agent + "/" + strings.ToLower(user)
+	if readsAsked() {
+		markStaleRead(agent, user) // read though allowances are read only when asked (#1518)
+	}
 	loginUsageCache.Lock()
 	delete(loginUsageCache.m, key)
 	delete(loginUsageCache.pending, key) // nor a reading asked for before
@@ -618,7 +667,7 @@ func allowanceOf(ws []QuotaWindow, now time.Time) Allowance {
 		if w.Aside {
 			continue
 		}
-		l := Limit{Used: w.Used, Span: w.Span, Model: w.Model, Amount: w.Amount, Of: w.Limit, Unit: w.Unit, matches: w.matches, partial: w.partial, name: w.Name}
+		l := Limit{Used: w.Used, Span: w.Span, Model: w.Model, Amount: w.Amount, Of: w.Limit, Unit: w.Unit, matches: w.matches, partial: w.partial, Name: w.Name}
 		if ids := families[w.Model]; ids != nil && w.Family != "" && w.matches == nil {
 			l.Model = ""
 			l.matches = func(model string) bool { return ids[model] }

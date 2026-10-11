@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -252,7 +253,7 @@ func fetchOne(ctx context.Context, url, key string, anthropic bool, headers map[
 	// The user's own headers, after the defaults so a private auth scheme
 	// wins. Written directly so the name keeps the exact case the user typed.
 	for k, v := range headers {
-		req.Header[k] = []string{v}
+		PutUserHeader(req.Header, k, v)
 	}
 	res, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -286,16 +287,21 @@ func fetchOne(ctx context.Context, url, key string, anthropic bool, headers map[
 		if id == "" {
 			continue
 		}
-		// a model that draws is kept, marked, for Settings → Images; any
-		// other that isn't for text (embeddings, speech) is left out
+		// Another magpie's list is already what its user exposed. Keep
+		// its retrieval models too; a vendor's general list still leaves
+		// out models agents can't chat with.
+		decision := r.Kind == "decision"
 		films := r.Kind == "video"
-		drawer := !films && (DrawsID(id) && !strings.Contains(strings.ToLower(id), "deep-research") || r.Kind == "image")
-		if !drawer && !films && !textModel(mdModel{ID: id}) {
+		drawer := !films && !decision && (DrawsID(id) && !strings.Contains(strings.ToLower(id), "deep-research") || r.Kind == "image")
+		if !drawer && !films && !decision && headers["X-Magpie-Drawers"] == "" && !textModel(mdModel{ID: id}) {
 			continue
 		}
-		name := r.DisplayName
+		name, plain := r.DisplayName, ""
 		if r.Label != "" {
 			name = r.Label
+			if r.DisplayName != "" && r.DisplayName != r.Label {
+				plain = r.DisplayName
+			}
 		}
 		if name == "" {
 			name = id
@@ -308,7 +314,7 @@ func fetchOne(ctx context.Context, url, key string, anthropic bool, headers map[
 		if len(apis) == 0 {
 			apis = targetAPIs(r.TypeTarget)
 		}
-		m := Model{ID: id, Name: name, ImageInput: input, APIs: apis, Draws: drawer, Films: films}
+		m := Model{ID: id, Name: name, Plain: plain, ImageInput: input, APIs: apis, Draws: drawer, Films: films, Decides: decision}
 		if n, ok := r.ContextLength.(float64); ok && n > 0 {
 			m.Context = int(n)
 		}
@@ -321,6 +327,11 @@ func fetchOne(ctx context.Context, url, key string, anthropic bool, headers map[
 		}
 		if input != nil {
 			m.Images = *input
+		}
+		m.Tiers = tiersOf(r.Tiers)
+		var pr *Price
+		if len(r.Price) > 0 && json.Unmarshal(r.Price, &pr) == nil && pr != nil && pr.sane() {
+			m.Price = pr
 		}
 		out = append(out, m)
 	}
@@ -377,16 +388,41 @@ type liveModel struct {
 	Output any      `json:"max_output_tokens"`
 	Levels any      `json:"supported_reasoning_levels"`
 	// another magpie's name for the model with its provider there after
-	// it, and "image" on one it draws with, "video" on one it makes videos
-	// with
+	// it, and "image", "video" or "decision" for its other models
 	Label string `json:"magpie_label"`
 	Kind  string `json:"kind"`
 	// how another magpie searches the web for the model: "native" or
 	// "magpie" (Model.WebSearch)
 	WebSearch string `json:"web_search"`
+	// the service tiers another magpie offers its Codex on the model
+	// (Fast's "priority"), as Codex's catalog writes them ({"id":…}) or
+	// as plain ids: kept as Model.Tiers (#1234). any, as an odd value
+	// mustn't lose the whole list
+	Tiers any `json:"service_tiers"`
+	// what another magpie counts a call to the model at, asked for with
+	// its X-Magpie-Prices header: the price its user set, else its list
+	// price. Raw, as an odd value mustn't lose the whole list
+	Price json.RawMessage `json:"magpie_price"`
 	// the protocol family PipeLLM routes the model by: openai, anthropic
 	// or gemini
 	TypeTarget string `json:"type_target"`
+}
+
+// tiersOf are the ids of a list's service_tiers, as Codex's catalog
+// writes them ([{"id":"priority","name":"Fast"}]) or as plain ids.
+func tiersOf(v any) []string {
+	xs, _ := v.([]any)
+	var out []string
+	for _, x := range xs {
+		id, _ := x.(string)
+		if o, ok := x.(map[string]any); ok {
+			id, _ = o["id"].(string)
+		}
+		if id != "" && !slices.Contains(out, id) {
+			out = append(out, id)
+		}
+	}
+	return out
 }
 
 // levelsOf are the efforts of a list's supported_reasoning_levels, as
@@ -481,4 +517,26 @@ func Decorate(live []Model, known []Model) []Model {
 		out = append(out, m)
 	}
 	return out
+}
+
+// sane reports whether a price another magpie sent is one a vendor could
+// charge: no part below zero or out of range, and tiers of a size.
+func (p Price) sane() bool {
+	ok := func(vs ...float64) bool {
+		for _, v := range vs {
+			if math.IsNaN(v) || v < 0 || v > 1e6 {
+				return false
+			}
+		}
+		return true
+	}
+	if !ok(p.Input, p.Output, p.CacheRead, p.CacheWrite, p.CacheWrite1h) {
+		return false
+	}
+	for _, t := range p.Tiers {
+		if t.Above <= 0 || !ok(t.Input, t.Output, t.CacheRead, t.CacheWrite, t.CacheWrite1h) {
+			return false
+		}
+	}
+	return true
 }

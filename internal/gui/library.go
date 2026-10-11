@@ -29,14 +29,23 @@ type libraryJSON struct {
 	Problems []library.Problem `json:"problems,omitempty"`
 }
 
-func libraryView(res *library.Result) (libraryJSON, error) {
+func libraryView(res *library.Result) (libraryJSON, error) { return libraryRead(res, false) }
+
+// libraryRead is libraryView, or with glance the page but for what takes
+// reading the agents' skill folders through (library.Glance), for the
+// page to show at once while the rest is read (#541).
+func libraryRead(res *library.Result, glance bool) (libraryJSON, error) {
 	lastProblems.Lock()
 	if res != nil {
 		lastProblems.p = res.Problems
 	}
 	p := lastProblems.p
 	lastProblems.Unlock()
-	v, err := library.Read(p)
+	read := library.Read
+	if glance {
+		read = library.Glance
+	}
+	v, err := read(p)
 	home, _ := os.UserHomeDir()
 	return libraryJSON{View: v, Result: res, Home: home, Problems: p}, err
 }
@@ -88,7 +97,7 @@ func revealable(v *library.View) []string {
 
 func libraryRoutes(mux *http.ServeMux, w Windows) {
 	mux.HandleFunc("GET /api/library", func(rw http.ResponseWriter, r *http.Request) {
-		v, err := libraryView(nil)
+		v, err := libraryRead(nil, r.URL.Query().Get("glance") == "1")
 		if err != nil {
 			fail(rw, err)
 			return
@@ -325,6 +334,24 @@ func libraryRoutes(mux *http.ServeMux, w Windows) {
 		}
 		writeJSON(rw, map[string]any{"servers": m})
 	})
+	// the servers as an agent's project file has them, for the user to
+	// paste into a project magpie doesn't keep (#1478); nothing is written
+	mux.HandleFunc("POST /api/library/mcp/config", func(rw http.ResponseWriter, r *http.Request) {
+		var in struct {
+			Agent string
+			Names []string
+		}
+		if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+			fail(rw, err)
+			return
+		}
+		c, err := library.ConfigOfServers(in.Agent, in.Names)
+		if err != nil {
+			fail(rw, err)
+			return
+		}
+		writeJSON(rw, c)
+	})
 	// every change answers with the page as it is after it, and what it did
 	mux.HandleFunc("POST /api/library/{what}/{action}", func(rw http.ResponseWriter, r *http.Request) {
 		var in struct {
@@ -345,6 +372,9 @@ func libraryRoutes(mux *http.ServeMux, w Windows) {
 			Keep   bool              // a project removed keeps what magpie put in it
 			On     bool              // every skill or server given to the agents, or taken from them
 			How    string            // link or copy: how skills are given to Agent, or to every agent with none (#896)
+			// Replace updates a skill changed here all the same, its
+			// changed version kept with the backups (#1449)
+			Replace bool
 			library.InstructionsChange
 		}
 		if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
@@ -377,7 +407,7 @@ func libraryRoutes(mux *http.ServeMux, w Windows) {
 		case "skills/install":
 			res, err = library.InstallSkills(in.Source, in.Paths, in.Agents)
 		case "skills/update":
-			res, err = library.UpdateSkill(in.Name)
+			res, err = library.UpdateSkill(in.Name, in.Replace)
 		case "skills/update-all":
 			res, err = library.UpdateSkills()
 		case "skills/update-some":
@@ -404,6 +434,8 @@ func libraryRoutes(mux *http.ServeMux, w Windows) {
 			res, err = library.ImportSkill(in.Name)
 		case "skills/import-all":
 			res, err = library.ImportSkills(in.Names)
+		case "skills/remove-found":
+			res, err = library.RemoveFoundSkill(in.Name)
 		case "skills/use-library":
 			res, err = library.UseLibrarySkill(in.Name, in.Agent)
 		case "skills/how":

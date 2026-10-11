@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/yetone/magpie/internal/catalog"
+	"github.com/yetone/magpie/internal/netproxy"
 	"github.com/yetone/magpie/internal/provider"
 	"github.com/yetone/magpie/internal/settings"
 )
@@ -54,6 +55,20 @@ type searchForKey struct{}
 type CallFor struct {
 	Agent string `json:"agent"`
 	Model string `json:"model"`
+	// Unknown, on an image's description, is that the model was counted
+	// text-only because nothing magpie knows says whether it sees images
+	// (blindTo), not because its list or the user says it takes text only.
+	// The Routing view says which, so a user whose model does see knows
+	// to say so (#1287).
+	Unknown bool `json:"unknown,omitempty"`
+	// Missing, on an image's description, is the Image recognition model
+	// the user picked in Settings that magpie can't find any more: the
+	// model that described is the one magpie picks in its place
+	// (VisionMissing), and the Routing view names both.
+	Missing string `json:"missing,omitempty"`
+	// MCP, on a web search, is that the agent called magpie's web search
+	// MCP server (SearchMCPPath) itself, for no model of magpie's.
+	MCP bool `json:"mcp,omitempty"`
 }
 
 func searchFor(ctx context.Context) *CallFor {
@@ -142,7 +157,11 @@ func searchAsked(proto provider.Protocol, body []byte) bool {
 // searcher is the model magpie searches with: the one Settings names, while
 // it can (chosenSearcher), else the first of the providers that search by
 // themselves, with a small model of theirs, as searching needs no more.
+// An explicit "off" leaves only the search APIs.
 func searcher() (provider.Provider, string, bool) {
+	if settings.Load().Searcher == "off" {
+		return provider.Provider{}, "", false
+	}
 	if p, m, why := chosenSearcher(); why == "" && p != nil {
 		return *p, m, true
 	}
@@ -226,10 +245,11 @@ const (
 // chosenSearcher is the provider and model Settings' Searcher names
 // ("<provider>" for its small model, or "<provider>/<model>"), and why it
 // can't be used, "" when it can. A model it no longer lists gives way to
-// its small model, as when none is named. Nil when none is named.
+// its small model, as when none is named. Nil when none is named or
+// provider search is explicitly off.
 func chosenSearcher() (*provider.Provider, string, string) {
 	v := strings.TrimSpace(settings.Load().Searcher)
-	if v == "" {
+	if v == "" || v == "off" {
 		return nil, "", ""
 	}
 	id, model, _ := strings.Cut(v, "/")
@@ -393,7 +413,20 @@ const searchSystem = "You are a web search tool. Search the web for what is aske
 // then with the searcher's model, or, without one or when it fails, with
 // the search APIs the user set up (#419). Settings can put the search APIs
 // first (#928): the providers then search only when none of them answers.
+// With provider search off, only the search APIs are asked.
 func (s *Server) webSearch(ctx context.Context, query string) (string, []Hit, error) {
+	// a search is magpie's own request, not the turn's provider's: the
+	// search APIs go through the global proxy and each searcher through
+	// its own (Provider.Via), never through the proxy the turn's provider
+	// is set to (#1522: Codex asked while a "direct" provider served the
+	// turn dialed chatgpt.com directly)
+	ctx = netproxy.With(ctx, "")
+	if settings.Load().Searcher == "off" {
+		if len(provider.SearchAPIs()) == 0 {
+			return "", nil, errNoSearcher
+		}
+		return s.apiSearch(ctx, query)
+	}
 	var errs []error
 	apiFirst := settings.Load().SearchFirst == settings.SearchFirstAPI && len(provider.SearchAPIs()) > 0
 	if apiFirst {
@@ -574,7 +607,7 @@ func (s *Server) searchReply(w http.ResponseWriter, r *http.Request, from provid
 		defer close(events)
 		s.searchRounds(ctx, &q, tool.Name, first, ask, events)
 	}()
-	return relay(w, r, from, name, req, events, usage, cancel, func(string, string, bool) {})
+	return relay(w, r, from, name, req, events, usage, cancel, nil, func(string, string, bool) {})
 }
 
 func (s *Server) searchRounds(ctx context.Context, q *Request, tool string, in <-chan Event, ask round, out chan<- Event) {

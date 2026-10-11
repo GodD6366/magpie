@@ -38,10 +38,14 @@ func printed(t *testing.T, fn func() error) (string, error) {
 
 // A providers.json that can't be read is not "no providers yet": magpie
 // providers and magpie models end in why, and leave the file as it is
-// (#415's review).
+// (#415's review). With no good providers.json.bak to read instead
+// (#1505), it is unknown.
 func TestProvidersCmdSaysUnreadable(t *testing.T) {
 	groupsHome(t)
 	catalog.Changed = nil
+	if err := os.Remove(provider.Path() + ".bak"); err != nil && !errors.Is(err, os.ErrNotExist) {
+		t.Fatal(err)
+	}
 	whole, err := os.ReadFile(provider.Path())
 	if err != nil {
 		t.Fatal(err)

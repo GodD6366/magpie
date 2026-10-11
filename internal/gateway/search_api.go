@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"regexp"
 	"strings"
+	"sync"
 	"unicode/utf8"
 
 	"github.com/yetone/magpie/internal/provider"
@@ -88,9 +89,7 @@ func SearcherUnused() string {
 func (s *Server) apiSearch(ctx context.Context, query string) (string, []Hit, error) {
 	var errs []error
 	for _, a := range provider.SearchAPIs() {
-		ctx, cancel := context.WithTimeout(ctx, searchTimeout/4)
-		pages, err := s.askSearchAPI(ctx, a, query)
-		cancel()
+		pages, err := s.askSearchAPIKeys(ctx, a, query)
 		if err != nil {
 			errs = append(errs, fmt.Errorf("%s: %w", a.Name(), err))
 			continue
@@ -103,6 +102,68 @@ func (s *Server) apiSearch(ctx context.Context, query string) (string, []Hit, er
 		return said, hits, nil
 	}
 	return "", nil, errors.Join(errs...)
+}
+
+// searchKeyAt is, by vendor, the key of its several (SearchAPI.Keys) that
+// last answered, so each search doesn't first spend a request on one
+// that is out of credit.
+var searchKeyAt sync.Map
+
+// askSearchAPIKeys asks a search API with its keys: from the one that last
+// answered, on to the next while one is refused (out of credit, rate
+// limited, turned away; #1477). Anything else, such as no answer in time,
+// isn't about the key, and the next isn't tried.
+func (s *Server) askSearchAPIKeys(ctx context.Context, a provider.SearchAPI, query string) ([]foundPage, error) {
+	keys := a.Keys()
+	if len(keys) == 0 {
+		keys = []string{""}
+	}
+	start := 0
+	if v, ok := searchKeyAt.Load(a.Vendor); ok {
+		start = v.(int) % len(keys)
+	}
+	var errs []error
+	for n := range keys {
+		i := (start + n) % len(keys)
+		one := a
+		one.Key = keys[i]
+		ctx, cancel := context.WithTimeout(ctx, searchTimeout/4)
+		pages, err := s.askSearchAPI(ctx, one, query)
+		cancel()
+		if err == nil {
+			searchKeyAt.Store(a.Vendor, i)
+			return pages, nil
+		}
+		if len(keys) > 1 {
+			err = fmt.Errorf("key %d: %w", i+1, err)
+		}
+		errs = append(errs, err)
+		var r searchRefused
+		if !errors.As(err, &r) {
+			break
+		}
+	}
+	return nil, errors.Join(errs...)
+}
+
+// searchRefused is a search API's refusal of the key it was asked with,
+// by its status: 401/403 turned away, 402/432/433 out of credit (Tavily's
+// plan and pay-as-you-go limits), 429 rate limited.
+type searchRefused struct {
+	status int
+	msg    string
+}
+
+func (e searchRefused) Error() string { return e.msg }
+
+// keyRefusal is whether an answer's status is about the key it was asked
+// with (searchRefused).
+func keyRefusal(status int) bool {
+	switch status {
+	case 401, 402, 403, 429, 432, 433:
+		return true
+	}
+	return false
 }
 
 // pagesSaid is what the pages a search found say, as its model is given
@@ -174,6 +235,9 @@ func (s *Server) askSearchAPI(ctx context.Context, a provider.SearchAPI, query s
 	defer res.Body.Close()
 	b, _ := io.ReadAll(io.LimitReader(res.Body, 4<<20))
 	if res.StatusCode >= 300 {
+		if keyRefusal(res.StatusCode) {
+			return nil, searchRefused{res.StatusCode, provider.APIError(b, res.Status)}
+		}
 		return nil, errors.New(provider.APIError(b, res.Status))
 	}
 	pages, err := readSearchAPI(a.Vendor, b)

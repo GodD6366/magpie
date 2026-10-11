@@ -14,7 +14,9 @@ import (
 // SearchAPI is a web search API the user gave magpie a key to.
 type SearchAPI struct {
 	Vendor string `json:"vendor"` // one of SearchVendors
-	Key    string `json:"key,omitempty"`
+	// Key is its key, or several separated by commas (Keys), each tried
+	// when the one before is refused (#1477).
+	Key string `json:"key,omitempty"`
 	// URL is where it is: a SearXNG's own, or another address for one of
 	// the others (a Firecrawl run by the user); empty is the vendor's.
 	URL string `json:"url,omitempty"`
@@ -43,6 +45,28 @@ func SearchVendorOf(id string) (SearchVendor, bool) {
 		return SearchVendor{}, false
 	}
 	return SearchVendors[i], true
+}
+
+// Keys are the keys in Key: one, or several the user gave separated by
+// commas, spaces or lines, each once, in the order given.
+func (a SearchAPI) Keys() []string {
+	var out []string
+	for _, k := range strings.FieldsFunc(a.Key, func(r rune) bool { return r == ',' || r == ';' || r == ' ' || r == '\t' || r == '\n' || r == '\r' }) {
+		if !slices.Contains(out, k) {
+			out = append(out, k)
+		}
+	}
+	return out
+}
+
+// MaskedKey is Key as shown: each of its keys masked (Mask), so a list of
+// them shows no more of any one than a single key does.
+func (a SearchAPI) MaskedKey() string {
+	ks := a.Keys()
+	for i, k := range ks {
+		ks[i] = Mask(k)
+	}
+	return strings.Join(ks, ", ")
 }
 
 // Name is the vendor's name.
@@ -106,7 +130,7 @@ func StoredSearchAPIs() []SearchAPI { return load().Searches }
 // where it is; a change with no key keeps the key it has.
 func SetSearchAPI(a SearchAPI) error {
 	a.Vendor = strings.ToLower(strings.TrimSpace(a.Vendor))
-	a.Key, a.URL = strings.TrimSpace(a.Key), strings.TrimSpace(a.URL)
+	a.Key, a.URL = strings.Join(a.Keys(), ","), strings.TrimSpace(a.URL)
 	f, err := read()
 	if err != nil {
 		return err

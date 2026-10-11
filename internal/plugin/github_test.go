@@ -17,7 +17,8 @@ import (
 // do, from testdata/github (npm's real answers for the packages it has): search.json is a real answer for a topic (five
 // repositories), with three more items made from its first — a fork, an
 // archived one and magpie-community's — and someone/word-guard, whose
-// package.json is word-guard's own, a middleware alone; alfaoz's
+// package.json is word-guard's own, a middleware alone; someone/agent-aider,
+// magpie-community's agent-aider package.json and module, an agent alone; alfaoz's
 // opencode-see-image (real), whose main is a dist the repository hasn't;
 // and someone/flaky-entry, whose main GitHub doesn't answer for.
 // reads counts what fakeGitHub answered other than searches: package.json,
@@ -50,8 +51,10 @@ func fakeGitHub(t *testing.T, up *atomic.Bool, asked *atomic.Int32) {
 	}
 	items = append(items,
 		like("someone/word-guard", map[string]any{"description": "word guard", "stargazers_count": 3, "license": nil}),
+		like("someone/agent-aider", nil),
 		like("alfaoz/opencode-see-image", nil),
 		like("someone/flaky-entry", map[string]any{"license": map[string]any{"key": "other", "spdx_id": "NOASSERTION"}}),
+		like("cyberElar/magpie-x-search", nil),
 		like("forker/opencode-claude-auth", map[string]any{"fork": true}),
 		like("old/opencode-old", map[string]any{"archived": true}),
 		like("magpie-community/plugins", nil))
@@ -122,8 +125,10 @@ func TestTaggedRepos(t *testing.T) {
 	}
 	// iPolloWork and learn-opencode (a workspace and a course) have no
 	// index.js to load, nor see-image its dist: installed from GitHub,
-	// none would load
-	want := "rynfar/meridian griffinmartin/opencode-claude-auth slkiser/opencode-quota someone/word-guard someone/flaky-entry"
+	// none would load. magpie-x-search (real, #1327) is on npm from its
+	// repository, but a command alone, an MCP server: npm's copy names no
+	// file to load, and it has no index.js
+	want := "rynfar/meridian griffinmartin/opencode-claude-auth slkiser/opencode-quota someone/word-guard someone/agent-aider someone/flaky-entry"
 	if strings.Join(repos, " ") != want {
 		t.Fatalf("repos %v\nwant %s", repos, want)
 	}
@@ -138,6 +143,17 @@ func TestTaggedRepos(t *testing.T) {
 	}
 	if x := byRepo["someone/flaky-entry"]; x.License != "" {
 		t.Fatalf("NOASSERTION is no license: %+v", x)
+	}
+	// its own picture, package.json's magpie.icon, as an installed
+	// plugin's provider has it; none when it gives none
+	if x := byRepo["someone/flaky-entry"]; !strings.HasPrefix(x.Icon, "data:image/svg+xml;base64,") {
+		t.Fatalf("magpie.icon: %q", x.Icon)
+	}
+	if c.Icon != "" {
+		t.Fatalf("no magpie.icon, yet %q", c.Icon)
+	}
+	if x := byRepo["someone/agent-aider"]; x.Kind != "agent" || x.Spec != "github:someone/agent-aider" {
+		t.Fatalf("an agent alone: %+v", x)
 	}
 	if x := byRepo["someone/word-guard"]; x.Kind != "middleware" || x.Package != "@magpie-community/middleware-word-guard" || x.License != "" {
 		t.Fatalf("a middleware alone: %+v", x)
@@ -168,7 +184,7 @@ func TestTaggedRepos(t *testing.T) {
 	taggedAt = time.Now().Add(-taggedTTL - time.Second)
 	taggedMu.Unlock()
 	before := reads.Load()
-	if l := TaggedRepos(ctx); len(l) != 5 || asked.Load() != 2 {
+	if l := TaggedRepos(ctx); len(l) != 6 || asked.Load() != 2 {
 		t.Fatalf("ten minutes on: asked %d times, %d repos", asked.Load(), len(l))
 	}
 	if n := reads.Load() - before; n != 3 {
@@ -183,7 +199,7 @@ func TestTaggedRepos(t *testing.T) {
 	if err := os.Chtimes(taggedCache(), time.Now(), time.Now()); err != nil {
 		t.Fatal(err)
 	}
-	if l := TaggedRepos(ctx); len(l) != 5 || asked.Load() != 1 {
+	if l := TaggedRepos(ctx); len(l) != 6 || asked.Load() != 1 {
 		t.Fatalf("restarted: asked %d times, %d repos", asked.Load(), len(l))
 	}
 
@@ -194,7 +210,7 @@ func TestTaggedRepos(t *testing.T) {
 	}
 	up.Store(false)
 	forget()
-	if l := TaggedRepos(ctx); len(l) != 5 || l[1].Package != "opencode-claude-auth" || asked.Load() != 1 {
+	if l := TaggedRepos(ctx); len(l) != 6 || l[1].Package != "opencode-claude-auth" || asked.Load() != 1 {
 		t.Fatalf("down: %+v", l)
 	}
 

@@ -159,16 +159,38 @@ func TestGatewayKeyLimitCLI(t *testing.T) {
 		t.Fatal(got)
 	}
 	for _, args := range [][]string{{"limit"}, {"limit", id, "hour", "--tokens", "5"}, {"limit", id, "day"}, {"limit", id, "day", "--tokens", "lots"},
-		{"limit", id, "day", "--cost"}, {"limit", id, "day", "--what"}, {"limit", "missing", "day", "--tokens", "5"}, {"limit", id, "off", "extra"}} {
+		{"limit", id, "day", "--cost"}, {"limit", id, "day", "--what"}, {"limit", "missing", "day", "--tokens", "5"}, {"limit", id, "off", "extra"},
+		{"limit", id, "0d", "--tokens", "5"}, {"limit", id, "3651d", "--tokens", "5"}, {"limit", id, "xd", "--tokens", "5"}, {"limit", id, "days", "--tokens", "5"}, {"limit", id, "reset", "extra"}} {
 		if _, err := call(args...); err == nil {
 			t.Error("accepted", args)
 		}
+	}
+	// every 10 days (#1509), and Reset
+	if got, err = call("limit", id, "10d", "--cost", "800"); err != nil || !strings.Contains(got, "this 10-day cycle") {
+		t.Fatal(got, err)
+	}
+	keys, _ = access.List()
+	if l := keys[0].Limit; l == nil || l.Period != "days" || l.Days != 10 || l.Cost != 800 || l.Since.IsZero() {
+		t.Fatalf("limit kept as %+v", keys[0].Limit)
+	}
+	if got, _ := call("list"); !strings.Contains(got, "$0.00/$800.00 every 10 days") {
+		t.Fatal(got)
+	}
+	since := keys[0].Limit.Since
+	if got, err = call("limit", id, "reset"); err != nil || !strings.Contains(got, "this 10-day cycle") {
+		t.Fatal(got, err)
+	}
+	if keys, _ = access.List(); keys[0].Limit.Since.Before(since) || keys[0].Limit.Cost != 800 {
+		t.Fatalf("reset kept %+v", keys[0].Limit)
 	}
 	if got, err := call("limit", id, "off"); err != nil || !strings.Contains(got, "no limit") {
 		t.Fatal(got, err)
 	}
 	if keys, _ = access.List(); keys[0].Limit != nil {
 		t.Fatal("off kept", keys[0].Limit)
+	}
+	if _, err := call("limit", id, "reset"); err == nil {
+		t.Fatal("reset a key with no limit")
 	}
 }
 

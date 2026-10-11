@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"slices"
@@ -12,6 +13,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/yetone/magpie/internal/lastgood"
 	"github.com/yetone/magpie/internal/settings"
 	"github.com/yetone/magpie/internal/steady"
 )
@@ -69,6 +71,15 @@ type Model struct {
 	// ImageSaid is whether the plugin (or models.dev) said if it takes
 	// images: Image false without it is not known
 	ImageSaid bool `json:"imageSaid"`
+	// Fast is set by the plugin on a model it runs in its vendor's fast
+	// mode when the request says service_tier "priority" (m.fast: Cursor's
+	// plugin from 0.2.2, for a model Cursor has a fast variant of)
+	Fast bool `json:"fast"`
+	// Decides is set by the plugin on a model that answers System One's
+	// questions rather than a conversation (m.decides: a decision model
+	// not named jev-…, Clef or a vendor's own). It counts only where the
+	// provider says it serves a decision API (Provider.Decide).
+	Decides bool `json:"decides,omitempty"`
 }
 
 // Provider is a provider a plugin signs in to.
@@ -86,7 +97,12 @@ type Provider struct {
 	Usage bool `json:"usage"`
 	// Checkin says the plugin presses its vendor's daily check-in for each
 	// account (auth.checkin)
-	Checkin   bool    `json:"checkin,omitempty"`
+	Checkin bool `json:"checkin,omitempty"`
+	// Decide says the plugin serves a decision API (TypeSafe's System
+	// One) for this provider: its config hook set decide on it. magpie
+	// posts the questions to the provider's own base, at /systemone,
+	// through the plugin's fetch (#1514).
+	Decide    bool    `json:"decide,omitempty"`
 	SignedIn  bool    `json:"signedIn"`
 	AuthType  string  `json:"authType"`
 	AccountID string  `json:"accountId"`
@@ -289,7 +305,7 @@ func listingProxies() map[string]map[string]string {
 		return out
 	}
 	var m map[string]json.RawMessage
-	if b, err := steady.ReadFile(AuthPath()); err == nil {
+	if b, err := readAuthFile(); err == nil {
 		_ = json.Unmarshal(b, &m)
 	}
 	for k := range m {
@@ -353,16 +369,19 @@ func keepUnloaded(ps, last []Provider) []Provider {
 			_ = json.Unmarshal(b, &last)
 		}
 	}
-	told := map[string]bool{}
+	told, ids := map[string]bool{}, map[string]bool{}
 	for _, p := range ps {
-		told[p.Spec] = true
+		told[p.Spec], ids[p.ID] = true, true
 	}
 	installed := map[string]bool{}
 	for _, e := range list().Plugins {
 		installed[e.Spec] = true
 	}
 	for _, p := range last {
-		if installed[p.Spec] && !told[p.Spec] {
+		// a provider another plugin serves now (two plugins sign in to
+		// it, and the other was installed or picked for it) isn't kept as
+		// this one's too: it would be listed twice under one id
+		if installed[p.Spec] && !told[p.Spec] && !ids[p.ID] {
 			ps = append(ps, p)
 		}
 	}
@@ -534,11 +553,22 @@ func firstNonEmpty(ss ...string) string {
 
 func readAuth() map[string]storedAuth {
 	var m map[string]storedAuth
-	if b, err := steady.ReadFile(AuthPath()); err == nil {
+	if b, err := readAuthFile(); err == nil {
 		_ = json.Unmarshal(b, &m)
 	}
 	return m
 }
+
+// validAuth is plugin-auth.json's contents: one object of sign-ins.
+func validAuth(b []byte) bool {
+	var m map[string]json.RawMessage
+	return json.Unmarshal(b, &m) == nil
+}
+
+// readAuthFile is plugin-auth.json, or its last good generation when a
+// crash left it all zero (#1505): sign-ins that don't read are unknown,
+// never none.
+func readAuthFile() ([]byte, error) { return lastgood.Read(AuthPath(), validAuth) }
 
 // SignedIn is whether a plugin sign-in is kept for provider.
 func SignedIn(provider string) bool {
@@ -667,9 +697,12 @@ func SignOut(ctx context.Context, provider, account string) error {
 	unlock := lockAuth()
 	defer unlock()
 	var m map[string]json.RawMessage
-	b, err := steady.ReadFile(AuthPath())
-	if err != nil {
+	b, err := readAuthFile()
+	if errors.Is(err, fs.ErrNotExist) {
 		return nil
+	}
+	if err != nil {
+		return err // sign-ins that don't read are not written over
 	}
 	if err := json.Unmarshal(b, &m); err != nil {
 		return err
@@ -680,6 +713,9 @@ func SignOut(ctx context.Context, provider, account string) error {
 		}
 	}
 	b, _ = json.MarshalIndent(m, "", "  ")
+	if err := lastgood.Keep(AuthPath(), validAuth, 0o600); err != nil {
+		return err
+	}
 	if err := writeWhole(AuthPath(), append(b, '\n')); err != nil {
 		return err
 	}
@@ -774,7 +810,7 @@ func Check(ctx context.Context, provider, account string) (Checked, error) {
 // Auths are provider's sign-ins as plugin-auth.json keeps them, by key.
 func Auths(provider string) map[string]map[string]any {
 	var m map[string]map[string]any
-	if b, err := steady.ReadFile(AuthPath()); err == nil {
+	if b, err := readAuthFile(); err == nil {
 		_ = json.Unmarshal(b, &m)
 	}
 	out := map[string]map[string]any{}

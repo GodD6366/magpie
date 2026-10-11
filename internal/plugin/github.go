@@ -34,10 +34,13 @@ type Tagged struct {
 	License     string    `json:"license,omitempty"` // SPDX id
 	Pushed      time.Time `json:"pushed"`
 	// from its package.json on the default branch: what bun will install
-	// it as, its version, and whether it is gateway middleware
+	// it as, its version, and whether it is gateway middleware or an agent
 	Package string `json:"package,omitempty"`
 	Version string `json:"version,omitempty"`
-	Kind    string `json:"kind,omitempty"` // "middleware" when that is all it is
+	Kind    string `json:"kind,omitempty"` // "middleware" or "agent" when that is all it is
+	// its package.json's magpie.icon, as an installed plugin gives its
+	// provider one: an https URL or a data:image URI, as it is written
+	Icon string `json:"icon,omitempty"`
 }
 
 // Where GitHub is asked, moved by tests.
@@ -196,7 +199,7 @@ func askTagged(ctx context.Context) ([]Tagged, error) {
 			if branch == "" {
 				branch = "HEAD"
 			}
-			pb, err := fetchJSON(pc, githubRaw+"/"+t.Repo+"/"+url.PathEscape(branch)+"/package.json", 256<<10)
+			pb, err := fetchJSON(pc, githubRaw+"/"+t.Repo+"/"+url.PathEscape(branch)+"/package.json", 2<<20)
 			if err != nil {
 				read = errors.Is(err, errNotFound)
 				return
@@ -208,6 +211,8 @@ func askTagged(ctx context.Context) ([]Tagged, error) {
 				Exports json.RawMessage `json:"exports"`
 				Magpie  struct {
 					Middleware string `json:"middleware"`
+					Agent      string `json:"agent"`
+					Icon       string `json:"icon"`
 				} `json:"magpie"`
 			}
 			if json.Unmarshal(pb, &pj) != nil || !pkgName.MatchString(pj.Name) {
@@ -215,28 +220,49 @@ func askTagged(ctx context.Context) ([]Tagged, error) {
 				return
 			}
 			t.Package, t.Version = pj.Name, pj.Version
-			if strings.TrimSpace(pj.Magpie.Middleware) != "" && pj.Main == "" && len(pj.Exports) == 0 {
-				t.Kind = "middleware"
+			// a picture, as host.js's iconOf takes one: magpie checks and
+			// keeps it before the page shows it (the GUI's /api/plugins/github)
+			t.Icon = ownIcon(pj.Magpie.Icon)
+			if pj.Main == "" && len(pj.Exports) == 0 {
+				switch {
+				case strings.TrimSpace(pj.Magpie.Middleware) != "":
+					t.Kind = "middleware"
+				case strings.TrimSpace(pj.Magpie.Agent) != "":
+					t.Kind = "agent"
+				}
 			}
 			// published to npm from this repository: npm's copy is the one
 			// built to be installed (a repository often leaves its dist out,
 			// built only to publish), so it is installed from npm
 			b, err := fetchJSON(pc, npmRegistry+"/"+npmPath(pj.Name)+"/latest", 1<<20)
 			known := err == nil || errors.Is(err, errNotFound)
+			// npmNames is whether npm's copy names what it loads (main,
+			// exports); one that names nothing loads an index file
+			npmNames := false
 			if err == nil {
 				var l npmLatest
 				if json.Unmarshal(b, &l) == nil && l.Version != "" && strings.EqualFold(githubRepo(repoURL(l.Repository)), t.Repo) {
 					t.Spec, t.Version = pj.Name, l.Version
+					npmNames = l.Main != "" || len(l.Exports) > 0
 				}
 			}
 			// installed from the repository, the file it loads must be in
 			// it: one whose dist is built only to publish couldn't load
 			// (GitHub not answering is no answer, and keeps it; so is a
-			// name Bun would add .js or /index.js to)
-			if IsGit(t.Spec) {
+			// name Bun would add .js or /index.js to). Installed from npm,
+			// a copy that names no file loads index.js, which the
+			// repository has too when it is a plugin at all: a package
+			// that is only a command (bin), an MCP server, has none and
+			// would never load (#1327)
+			if IsGit(t.Spec) || !npmNames {
 				entry := pj.Magpie.Middleware
-				if t.Kind != "middleware" {
+				if t.Kind == "agent" {
+					entry = pj.Magpie.Agent
+				} else if t.Kind != "middleware" {
 					entry = pkgEntry(pj.Exports, pj.Main)
+					if !IsGit(t.Spec) {
+						entry = pkgEntry(nil, "")
+					}
 				}
 				if path.Ext(entry) != "" {
 					_, err := fetchJSON(pc, githubRaw+"/"+t.Repo+"/"+url.PathEscape(branch)+"/"+strings.TrimPrefix(path.Clean("/"+entry), "/"), 1)

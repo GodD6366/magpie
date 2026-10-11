@@ -33,8 +33,10 @@ import (
 
 	"github.com/yetone/magpie/internal/appdir"
 	"github.com/yetone/magpie/internal/catalog"
+	"github.com/yetone/magpie/internal/claudecode"
 	"github.com/yetone/magpie/internal/plugin"
 	"github.com/yetone/magpie/internal/proc"
+	"github.com/yetone/magpie/internal/settings"
 )
 
 // Account is the signed-in agent behind a provider.
@@ -73,6 +75,14 @@ type Account struct {
 	body   func(body []byte) []byte // request tweaks the backend insists on
 	models func() []catalog.Model
 	fetch  func(ctx context.Context) ([]catalog.Model, error)
+	// magpieList is set on an account whose fetch asks no vendor and
+	// keeps a copy of models, magpie's own list (Claude's, from the
+	// models.dev catalog; Factory's, compiled in): the list served is
+	// always models as it is now, never the copy, which held a model
+	// listed after it out until the next Refresh (wakaka on Discord:
+	// Claude Haiku 5.5, in Claude Code on the same account, missing from
+	// magpie).
+	magpieList bool
 
 	// auto is set on a Copilot account: the session of Copilot's Auto,
 	// the model it picks for the account (copilot_auto.go).
@@ -175,17 +185,32 @@ func (p Provider) ListedAPIs(model string) []Protocol {
 // Sign authenticates a request to the provider, refreshing what needs it.
 // Plain providers get their key; accounts get the agent's tokens.
 func (p Provider) Sign(ctx context.Context, req *http.Request, proto Protocol, body []byte) error {
+	if p.Account != nil && settings.AccountDiscoveryOff() {
+		return errAccountDiscoveryOff
+	}
 	ctx = p.Via(ctx) // a sign-in refreshed on the way goes through its proxy
 	if p.Account != nil && p.Account.sign != nil {
 		return p.Account.sign(ctx, req, body)
+	}
+	if p.IsVertex() {
+		// a Google token, which goes nowhere but the project's own address
+		if base := p.vertexBase(); base == "" || !strings.HasPrefix(req.URL.String(), base+"/") {
+			return fmt.Errorf("%s is asked only at Vertex AI, at its project's address", p.Name)
+		}
+		tok, err := p.vertexAccessToken(ctx)
+		if err != nil {
+			return err
+		}
+		req.Header.Set("Authorization", "Bearer "+tok)
 	}
 	for k, v := range AuthHeaders(p, proto) {
 		req.Header.Set(k, v)
 	}
 	// The user's own headers ride on plain key+URL providers, after auth so
 	// they can override a default when a gateway insists on a private scheme.
-	// Written to the map directly, not via Set, so the name keeps the exact
-	// case the user typed — some gateways match header names case-sensitively.
+	// Written with the name as the user typed it — some gateways match
+	// header names case-sensitively — in place of the same header in any
+	// other case (PutUserHeader), so it is sent once, theirs.
 	// A list the request has its own of (anthropic-beta) is added to, not
 	// replaced: the user's betas go after those the agent asked.
 	for k, v := range p.Headers {
@@ -193,7 +218,7 @@ func (p Provider) Sign(ctx context.Context, req *http.Request, proto Protocol, b
 			MergeList(req.Header, k, v)
 			continue
 		}
-		req.Header[k] = []string{v}
+		catalog.PutUserHeader(req.Header, k, v)
 	}
 	return nil
 }
@@ -360,12 +385,15 @@ func parseClaudeCredentials(b []byte) (claudeCredentials, bool) {
 	return c, c.OAuth.AccessToken != ""
 }
 
+// marshal writes into copies: c.raw is shared with every copy of c, the
+// cached one included, which other goroutines marshal at the same time.
 func (c claudeCredentials) marshal() ([]byte, error) {
-	raw := c.raw
+	raw := maps.Clone(c.raw)
 	if raw == nil {
 		raw = map[string]any{}
 	}
 	oauth, _ := raw["claudeAiOauth"].(map[string]any)
+	oauth = maps.Clone(oauth)
 	if oauth == nil {
 		oauth = map[string]any{}
 	}
@@ -397,17 +425,15 @@ type claudeCredentialLocation struct {
 // claudeCredentialsPath is Claude Code's credentials file, where it keeps
 // its sign-in off the Mac's keychain.
 func claudeCredentialsPath() string {
-	dir := appdir.Getenv("CLAUDE_CONFIG_DIR")
-	if dir == "" {
-		home, _ := os.UserHomeDir()
-		dir = filepath.Join(home, ".claude")
-	}
-	return filepath.Join(dir, ".credentials.json")
+	return filepath.Join(appdir.ClaudeDir(), ".credentials.json")
 }
 
 func readClaudeCredential() (claudeCredentials, claudeCredentialLocation, bool) {
+	if settings.AccountDiscoveryOff() {
+		return claudeCredentials{}, claudeCredentialLocation{}, false
+	}
 	path := claudeCredentialsPath()
-	if b, err := os.ReadFile(path); err == nil {
+	if b, err := readAccountFile(path); err == nil {
 		if c, ok := parseClaudeCredentials(b); ok {
 			return c, claudeCredentialLocation{path: path}, true
 		}
@@ -477,6 +503,9 @@ func keychainText(out []byte) ([]byte, bool) {
 }
 
 func claudeCredential() (claudeCredentials, claudeCredentialLocation, bool) {
+	if settings.AccountDiscoveryOff() {
+		return claudeCredentials{}, claudeCredentialLocation{}, false
+	}
 	claudeCacheMu.Lock()
 	defer claudeCacheMu.Unlock()
 	if time.Since(claudeCacheAt) < claudeCacheTTL {
@@ -501,6 +530,9 @@ func forgetClaudeCredential() {
 }
 
 func saveClaudeCredential(loc claudeCredentialLocation, c claudeCredentials) error {
+	if discoveryOff() {
+		return errAccountDiscoveryOff
+	}
 	b, err := c.marshal()
 	if err != nil {
 		return err
@@ -534,8 +566,9 @@ func saveClaudeCredential(loc claudeCredentialLocation, c claudeCredentials) err
 }
 
 // claudeExecutable finds the claude CLI (proc.FindTool: claude.exe in
-// ~/.local/bin on Windows too, #839); a var so tests can fake it.
-var claudeExecutable = func() string { return proc.FindTool("claude") }
+// ~/.local/bin on Windows too, #839), else the one magpie downloaded
+// (claudecode.Find); a var so tests can fake it.
+var claudeExecutable = claudecode.Find
 
 // claudeIdentity asks Claude Code itself which account is active. Its credential
 // blob intentionally contains tokens and plan metadata but no display identity;
@@ -577,6 +610,9 @@ func claudeIdentity() (user, plan string, signedOut bool) {
 
 // askClaudeStatus runs `claude auth status`; ok is false when it gave no answer.
 func askClaudeStatus() (user, plan string, signedOut, ok bool) {
+	if settings.AccountDiscoveryOff() {
+		return "", "", false, false
+	}
 	path := claudeExecutable()
 	if path == "" {
 		return "", "", false, false
@@ -657,6 +693,7 @@ func claudeProvider(acct *Account) Provider {
 	// one that would go straight to the API with its sign-in is refused
 	acct.sign = func(context.Context, *http.Request, []byte) error { return errClaudeViaCLI }
 	acct.models = func() []catalog.Model { return catalog.Provider("anthropic") }
+	acct.magpieList = true
 	// Claude's models are the ones magpie knows: listing them would ask
 	// Anthropic with the account's sign-in, which magpie never does
 	acct.fetch = func(context.Context) ([]catalog.Model, error) {
@@ -685,6 +722,9 @@ func refreshFailed(status int, agent, msg string) error {
 
 // Accounts lists the signed-in agents as providers.
 func Accounts() []Provider {
+	if settings.AccountDiscoveryOff() {
+		return nil
+	}
 	rememberLogins(false)
 	home, _ := os.UserHomeDir()
 	cfg := appdir.Getenv("XDG_CONFIG_HOME")
@@ -782,7 +822,7 @@ func placeMoved(out, plugins []Provider) []Provider {
 }
 
 func readJSON(path string, v any) bool {
-	b, err := os.ReadFile(path)
+	b, err := readAccountFile(path)
 	if err != nil {
 		return false
 	}
@@ -828,6 +868,14 @@ const codexClientID = "app_EMoamEEZ73f0CkXaXp7hrann" // Codex CLI's own OAuth cl
 // so tests can point it elsewhere.
 var codexTokenURL = "https://auth.openai.com/oauth/token"
 
+// CodexTokenURLForTest points ChatGPT's token endpoint at a test server,
+// for the CLI's tests; the func it returns puts it back.
+func CodexTokenURLForTest(u string) func() {
+	old := codexTokenURL
+	codexTokenURL = u
+	return func() { codexTokenURL = old }
+}
+
 // CodexBase is where a ChatGPT account's Codex requests go; a var so tests
 // can point it elsewhere.
 var CodexBase = "https://chatgpt.com/backend-api/codex"
@@ -845,9 +893,13 @@ type codexAuth struct {
 }
 
 func codexAccount(home string) (Provider, bool) {
-	path := filepath.Join(home, ".codex", "auth.json")
+	if settings.AccountDiscoveryOff() {
+		return Provider{}, false
+	}
+	path := filepath.Join(appdir.CodexHomeIn(home), "auth.json")
+	b, err := readAccountFile(path)
 	var a codexAuth
-	if !readJSON(path, &a) || a.Tokens.AccessToken == "" || a.AuthMode == "apikey" {
+	if err != nil || json.Unmarshal(b, &a) != nil || a.Tokens.AccessToken == "" || a.AuthMode == "apikey" {
 		return Provider{}, false
 	}
 	id := jwtClaims(a.Tokens.IDToken)
@@ -855,6 +907,10 @@ func codexAccount(home string) (Provider, bool) {
 		User: codexUser(id), Plan: claimString(id, "https://api.openai.com/auth", "chatgpt_plan_type")}
 	if acct.User == "" {
 		acct.User = "ChatGPT"
+	} else {
+		// as it is saved, as liveLogin names it: a second Team seat of
+		// the email is "email · Team · <workspace>" (#1424)
+		acct.User = codexLiveName(acct.User, bytes.TrimSpace(b))
 	}
 	acct.sign = codexSign(func(ctx context.Context) (string, string, error) { return codexToken(ctx, path) })
 	acct.body = codexBody
@@ -866,7 +922,7 @@ func codexAccount(home string) (Provider, bool) {
 		}
 		catalog.SaveLive(accountModels("codex", acct.User), CodexBase, ms)
 		codexFetchSaved(ctx)
-		ms = codexPoolLevels(ms)
+		ms = codexPoolModels(ms)
 		return ms, catalog.SaveLive("codex", CodexBase, ms)
 	}
 	return Provider{ID: "codex", Name: "Codex", Icon: "codex-color", Responses: CodexBase, Website: "https://chatgpt.com/codex", Account: acct}, true

@@ -119,8 +119,11 @@ func (f Filter) computer(r Record) bool {
 }
 
 func (f Filter) keeps(r Record) bool {
-	if f.Day != "" && r.Time.In(time.Local).Format(time.DateOnly) != f.Day {
-		return false
+	if f.Day != "" {
+		var day [len(time.DateOnly)]byte
+		if string(r.Time.In(time.Local).AppendFormat(day[:0], time.DateOnly)) != f.Day {
+			return false
+		}
 	}
 	if f.CallerKey != "" && r.CallerKeyID != f.CallerKey {
 		return false
@@ -159,6 +162,9 @@ func (f Filter) keeps(r Record) bool {
 
 // Since is when the period began, as of now; zero for all.
 func (p Period) Since(now time.Time) time.Time {
+	if first, _, ok := p.days(now.Location()); ok {
+		return first
+	}
 	day := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
 	switch p {
 	case Today:
@@ -167,6 +173,8 @@ func (p Period) Since(now time.Time) time.Time {
 		return day.AddDate(0, 0, -6)
 	case Month:
 		return day.AddDate(0, 0, -29)
+	case heatmapPeriod:
+		return heatmapSince(now)
 	}
 	return time.Time{}
 }
@@ -210,8 +218,19 @@ func LedgerOfAt(p Period, f Filter, now time.Time) Ledgered {
 	if reader == nil {
 		reader = sessions.Calls
 	}
-	rows, sum, agents, providers := ledgerWithShared(since, f, Load(gatewaySince), reader(since), sharedRecords(since))
+	rows, sum, agents, providers := ledgerWithShared(since, p.Until(now), f, gatewayRecords(gatewaySince), reader(since), sharedRecords(since))
 	return Ledgered{rows, sum, agents, providers}
+}
+
+// gatewayRecords is the gateway's calls from since on, as the ledger's index
+// holds them: what Load reads, without parsing usage.jsonl again. The TUI,
+// magpie usage and the CSV export read a period's ledger this way, and over
+// a long history (Vantiboo1ean, ~750k requests) parsing the whole file took
+// seconds for each.
+func gatewayRecords(since time.Time) []Record {
+	var out []Record
+	Visit(since, func(r Record) { out = append(out, r) })
+	return out
 }
 
 // Filtered narrows one snapshot without reloading either log or repricing rows.
@@ -287,7 +306,7 @@ const UnknownProvider = "session-unknown"
 func logRecord(c sessions.Call) Record {
 	r := Record{Time: c.Time, Agent: c.Agent, Provider: UnknownProvider, Model: c.Model, Served: c.Model, Requested: c.Requested,
 		Input: c.Input, Output: c.Output, CacheRead: c.CacheRead, CacheWrite: c.CacheWrite, CacheWrite1h: c.CacheWrite1h, Reasoning: c.Reasoning, Effort: c.Effort,
-		Millis: c.Millis, TTFT: c.TTFT, Session: c.Session, RequestID: c.RequestID, Error: c.ErrorText, ErrType: c.Error}
+		Millis: c.Millis, TTFT: c.TTFT, Session: c.Session, RequestID: c.RequestID, Error: c.ErrorText, ErrType: c.Error, Subagent: sessions.SubagentOf(c.File), ParentAgent: sessions.SubagentParent(c.File)}
 	if c.Agent == "codex" || c.Agent == "opencode" {
 		r.Requested, r.Served = c.Model, ""
 	}
@@ -320,12 +339,19 @@ func gatewayMatches(recs []Record, logs []sessions.Call) map[int]bool {
 }
 
 func ledgerWith(since time.Time, f Filter, recs []Record, logs []sessions.Call) (rows []Row, sum Totals, agents, providers []string) {
-	return ledgerWithShared(since, f, recs, logs, nil)
+	return ledgerWithShared(since, time.Time{}, f, recs, logs, nil)
 }
 
 // ledgerWithShared is ledgerWith with the calls other computers made (#542),
-// priced and judged here as this computer's are.
-func ledgerWithShared(since time.Time, f Filter, recs []Record, logs []sessions.Call, others []SharedCall) (rows []Row, sum Totals, agents, providers []string) {
+// priced and judged here as this computer's are, and none from until on (a
+// picked range's end, #1492; zero for none).
+func ledgerWithShared(since, until time.Time, f Filter, recs []Record, logs []sessions.Call, others []SharedCall) (rows []Row, sum Totals, agents, providers []string) {
+	return ledgerMatched(since, until, f, recs, logs, others, gatewayMatches(recs, logs))
+}
+
+// ledgerMatched is ledgerWithShared with the session files' calls the
+// gateway saw already told (matched, by their index in logs).
+func ledgerMatched(since, until time.Time, f Filter, recs []Record, logs []sessions.Call, others []SharedCall, matched map[int]bool) (rows []Row, sum Totals, agents, providers []string) {
 	renamed := provider.Renamed()
 	// the upstream names in force now, read once for the lot: a row is
 	// judged by the names standing today, which is what Ledger says, and
@@ -334,7 +360,6 @@ func ledgerWithShared(since time.Time, f Filter, recs []Record, logs []sessions.
 	priceOf := pricer()
 	rows = make([]Row, 0, len(recs)+len(logs))
 	agents, providers = []string{}, []string{}
-	matched := gatewayMatches(recs, logs)
 	identities := newSessionResolver(logs)
 	add := func(r Record, pr *catalog.Price, source string) {
 		if a := AgentOf(r.Agent); !slices.Contains(agents, a) {
@@ -362,7 +387,7 @@ func ledgerWithShared(since time.Time, f Filter, recs []Record, logs []sessions.
 	}
 	for i := len(recs) - 1; i >= 0; i-- {
 		r := recs[i]
-		if !since.IsZero() && r.Time.Before(since) {
+		if !since.IsZero() && r.Time.Before(since) || after(until, r.Time) {
 			continue
 		}
 		if id, ok := renamed[r.Provider]; ok {
@@ -371,7 +396,7 @@ func ledgerWithShared(since time.Time, f Filter, recs []Record, logs []sessions.
 		add(r, priceOf(r), "")
 	}
 	for i, c := range logs {
-		if (!since.IsZero() && c.Time.Before(since)) || matched[i] {
+		if (!since.IsZero() && c.Time.Before(since)) || after(until, c.Time) || matched[i] {
 			continue
 		}
 		// Session identity does not establish a billing provider; price the
@@ -384,7 +409,7 @@ func ledgerWithShared(since time.Time, f Filter, recs []Record, logs []sessions.
 	}
 	for _, c := range others {
 		r := c.Record
-		if !since.IsZero() && r.Time.Before(since) {
+		if !since.IsZero() && r.Time.Before(since) || after(until, r.Time) {
 			continue
 		}
 		if id, ok := renamed[r.Provider]; ok {
@@ -402,16 +427,30 @@ func ledgerWithShared(since time.Time, f Filter, recs []Record, logs []sessions.
 // pricer uses the same effective price as the model CLI and session totals:
 // explicit provider/model or provider-wide prices (including zero), then the
 // provider catalog, then the maker catalog. Settings are read once per query.
+//
+// A model no price is known for is priced as the model the vendor's reply
+// said answered (Served), at the same provider, when that one has a price:
+// a relay that sells kimi-k3 as moonshot-kimi-k3 answers as kimi-k3, which
+// is listed (#1498). The model asked for keeps its own price whenever it
+// has one, a zero set by the user included, so a ledger that matched the
+// vendor's bill still does.
 func pricer() func(Record) *catalog.Price {
-	prices := map[[2]string]*catalog.Price{}
+	prices := map[[3]string]*catalog.Price{}
 	s := settings.Load()
 	return func(r Record) *catalog.Price {
-		k := [2]string{r.Provider, r.Model}
+		served := strings.TrimSpace(r.Served)
+		if served == r.Model {
+			served = ""
+		}
+		k := [3]string{r.Provider, r.Model, served}
 		if pr, ok := prices[k]; ok {
 			return pr
 		}
 		var pr *catalog.Price
 		v, ok := provider.EffectivePriceIn(s, r.Provider, r.Model)
+		if !ok && served != "" {
+			v, ok = provider.EffectivePriceIn(s, r.Provider, served)
+		}
 		if ok {
 			pr = &v
 		} else {
@@ -487,7 +526,21 @@ func timeline(p Period, now, first time.Time) (since time.Time, bucket string, p
 	day := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
 	bucket, pts = "day", []Point{}
 	var n int
+	if first, last, ok := p.days(now.Location()); ok {
+		// a picked range: an hour each of a single day, else a day each,
+		// a week each (from a Monday) past 60 days as All has
+		since, n = first, calendarDays(first, last)+1
+		if n == 1 {
+			bucket = "hour"
+		} else if n > 60 {
+			bucket = "week"
+			since = since.AddDate(0, 0, -((int(since.Weekday()) + 6) % 7))
+			n = calendarDays(since, last)/7 + 1
+		}
+		p = ""
+	}
 	switch p {
+	case "":
 	case Today:
 		since, bucket = day, "hour"
 	case Week:
@@ -511,8 +564,8 @@ func timeline(p Period, now, first time.Time) (since time.Time, bucket string, p
 	}
 	switch bucket {
 	case "hour":
-		for h := 0; day.Add(time.Duration(h) * time.Hour).Before(day.AddDate(0, 0, 1)); h++ {
-			t := day.Add(time.Duration(h) * time.Hour)
+		for h := 0; since.Add(time.Duration(h) * time.Hour).Before(since.AddDate(0, 0, 1)); h++ {
+			t := since.Add(time.Duration(h) * time.Hour)
 			pts = append(pts, Point{Label: t.Format("15"), Time: t})
 		}
 	case "day":
@@ -553,7 +606,13 @@ func (t *Totals) addRow(r Row) {
 		if n, w := r.Decode(); w > 0 {
 			t.DecodeMs += w
 			t.DecodeOut += n
+			t.DecodeN++
 		}
+	}
+	if n, ms := r.Floor(); ms > 0 {
+		t.FloorOut += n
+		t.FloorMs += ms
+		t.FloorN++
 	}
 	t.Calls++
 	if r.Failed() {
@@ -571,6 +630,33 @@ func (t *Totals) addRow(r Row) {
 	case r.Input+r.Output > 0:
 		t.Unpriced++
 	}
+}
+
+// FloorAgents are the agents whose session files time a call from the line
+// that asked for it, written before it was sent, to its reply's last
+// (Claude Code's, Claude Desktop's): their calls' tokens over that time are
+// a floor of how fast the reply wrote. A Codex call in a turn of several can
+// be timed from inside the call, and OpenCode's isn't checked against real
+// sessions, so they tell none. app.js's LED_FLOOR_AGENTS has the same.
+var FloorAgents = map[string]bool{"claude": true, "claude-desktop": true}
+
+// Floor is the tokens and ms a row read from a session file tells the least
+// its reply wrote at by, when its speed wasn't measured: its output over its
+// whole time, the wait for the first token in it, for a reply of 1,000
+// tokens or more over a second or more (a shorter one's wait is too much of
+// it to tell anything) and no faster than MaxDecodeSpeed. 0, 0 when it
+// tells none. app.js's ledFloorSpeed is the same rule for one row.
+func (r Row) Floor() (tokens int, ms int64) {
+	if r.Source != "log" || !FloorAgents[r.Agent] || r.Failed() {
+		return 0, 0
+	}
+	if _, w := r.Decode(); w > 0 {
+		return 0, 0
+	}
+	if r.Output < 1000 || r.Millis < 1000 || int64(r.Output)*1000 > MaxDecodeSpeed*r.Millis {
+		return 0, 0
+	}
+	return r.Output, r.Millis
 }
 
 // Dimensions are what calls are told apart by: the provider they went to,

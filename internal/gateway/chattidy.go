@@ -334,6 +334,44 @@ func reasoningText(m map[string]json.RawMessage) string {
 	return b.String()
 }
 
+// noReasoning is the reasoning_content a tool call goes to an upstream
+// that wants it back (chatReplaysReasoning) with, when the client has none
+// for it: a turn another model made, or one whose thinking the client
+// didn't keep. DeepSeek turns the whole request away when a tool call of
+// the turn being continued has none ("The `reasoning_content` in the
+// thinking mode must be passed back to the API", #1462). Its Chat API
+// takes an empty one, but a relay that leaves empty fields out would send
+// none, and its Responses API turns an empty reasoning_text away, so it is
+// a space.
+const noReasoning = " "
+
+// withReasoningOnToolTurns gives each assistant message of a Chat request
+// that has tool calls and no reasoning_content one: the thinking it sent
+// back in another field (reasoning, reasoning_details), else noReasoning.
+// A message with reasoning_content of its own keeps it, a reply without
+// tool calls is left as it is (DeepSeek doesn't ask for its thinking), and
+// a body with no tool calls comes back byte for byte.
+func withReasoningOnToolTurns(body []byte) []byte {
+	return editMessages(body, []string{"tool_calls"}, func(m map[string]json.RawMessage) bool {
+		var role string
+		var calls []json.RawMessage
+		if json.Unmarshal(m["role"], &role) != nil || role != "assistant" ||
+			json.Unmarshal(m["tool_calls"], &calls) != nil || len(calls) == 0 {
+			return false
+		}
+		var own *string
+		if json.Unmarshal(m["reasoning_content"], &own) == nil && own != nil {
+			return false
+		}
+		think := reasoningText(m)
+		if think == "" {
+			think = noReasoning
+		}
+		m["reasoning_content"], _ = marshalPlain(think)
+		return true
+	})
+}
+
 // editMessages hands each message of a Chat request whose JSON names any
 // of fields to edit, and puts back those edit reports it changed; every
 // other message keeps its bytes. The body comes back as it was if nothing

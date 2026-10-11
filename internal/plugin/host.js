@@ -226,6 +226,11 @@ process.stdout.write = (chunk, enc, cb) => process.stderr.write(chunk, enc, cb)
 // MAGPIE_*_PROXY (see below), so `grok login`, which the Grok plugin runs,
 // went out with none and, where x.ai is reached only through one, printed
 // no link to open (𝕏 on Discord). One the plugin set itself is kept.
+// Node's fetch goes past *_PROXY unless NODE_USE_ENV_PROXY=1 says to take
+// them, so a plugin downloading in a Node program it starts went out with
+// none and failed where the vendor is reached only through one (larchsis
+// on 𝕏, Windows 11, a proxy set in magpie only). It is told to, unless
+// the plugin said otherwise.
 const own = (v, fd) => v === "inherit" || v === fd || v === (fd ? process.stdout : process.stdin)
 const PROXY_VARS = ["HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY"]
 function proxied(env) {
@@ -234,11 +239,12 @@ function proxied(env) {
   const mine = via.getStore()
   if (mine === "direct") return env
   const set = mine ? { HTTPS_PROXY: mine, HTTP_PROXY: mine } : { HTTPS_PROXY: globalProxy.https, HTTP_PROXY: globalProxy.http, NO_PROXY: proxyVar("NO_PROXY") }
+  if (set.HTTPS_PROXY || set.HTTP_PROXY) set.NODE_USE_ENV_PROXY = "1"
   for (const [k, v] of Object.entries(set)) {
     if (!v || Object.keys(env).some((e) => e.toUpperCase() === k)) continue
     env[k] = v
     // Windows' names are one whatever their case
-    if (process.platform !== "win32") env[k.toLowerCase()] = v
+    if (process.platform !== "win32" && k.endsWith("_PROXY") && k !== "NODE_USE_ENV_PROXY") env[k.toLowerCase()] = v
   }
   return env
 }
@@ -267,6 +273,9 @@ let modelsDevPath = ""
 let piPath = "" // pi.js, which loads pi's extensions
 let directory = process.cwd()
 let userConfig = {}
+// prefer is the plugin the user picked for a provider id more than one
+// plugin signs in to: id → its spec (plugins.json's prefer)
+let prefer = {}
 const hooks = [] // {spec, hooks}
 const loaded = [] // {spec, id, error}
 const loaders = new Map() // account → options the auth loader returned
@@ -516,41 +525,175 @@ function tunnel(p, host, port) {
 
 // ---- auth.json ---------------------------------------------------------------
 
-function readAuth() {
-  let text
+// A crash can leave plugin-auth.json at its full length with every byte
+// zero (#1505). Such a file is unknown, never "no sign-ins": it is read
+// from its last good generation, plugin-auth.json.bak, which each write
+// keeps first; a write over one that doesn't read copies it aside
+// (plugin-auth.json.bad-<time>) first, and never writes none over it. As
+// internal/lastgood does for magpie's own files.
+
+// parseAuth is the sign-ins in text, null when it isn't one JSON object.
+function parseAuth(text) {
+  try {
+    const v = JSON.parse(text)
+    return v && typeof v === "object" && !Array.isArray(v) ? v : null
+  } catch {
+    return null
+  }
+}
+
+function readFileSteady(p) {
   for (let i = 0; ; i++) {
     try {
-      text = fs.readFileSync(authPath, "utf8")
-      break
+      return fs.readFileSync(p)
     } catch (e) {
-      if (e?.code === "ENOENT") return {}
+      if (e?.code === "ENOENT") return null
       // Windows refuses a file being renamed over for a moment: read as
       // none, the next setAuth would write the others' accounts away
       if (i >= 50) throw e
       pause(10)
     }
   }
+}
+
+// describeBad says what is wrong with a file that doesn't read.
+function describeBad(buf) {
+  if (buf.length > 0 && buf.every((b) => b === 0)) return `${buf.length} bytes, every one zero`
+  if (buf.toString("utf8").trim() === "") return "it is empty"
+  return "it doesn't parse"
+}
+
+let authRecovered = false
+let authUnread = false
+
+// readAuthState is the sign-ins and whether they are known: a file not
+// there is none, known; one that doesn't read is its .bak's, known, or
+// none, unknown.
+function readAuthState() {
+  const buf = readFileSteady(authPath)
+  if (buf === null) return { all: {}, known: true }
+  const v = parseAuth(buf.toString("utf8"))
+  if (v) return { all: v, known: true }
+  const why = describeBad(buf)
+  let bak = null
   try {
-    const v = JSON.parse(text)
-    return v && typeof v === "object" ? v : {}
-  } catch {
-    return {}
+    bak = parseAuth(fs.readFileSync(authPath + ".bak", "utf8"))
+  } catch {}
+  if (bak) {
+    if (!authRecovered) {
+      authRecovered = true
+      toErr(`plugin-auth.json can't be read (${why}); the sign-ins in plugin-auth.json.bak are used`)
+      send({ event: "recovered", said: why })
+    }
+    return { all: bak, known: true }
   }
+  if (!authUnread) {
+    authUnread = true
+    toErr(`plugin-auth.json can't be read (${why}) and has no good backup`)
+  }
+  return { all: {}, known: false }
+}
+
+function readAuth() {
+  return readAuthState().all
+}
+
+// writeDurable replaces p with data through a temp file flushed to the
+// disk before it is renamed over p: a rename reaches the disk on its own
+// schedule, the data behind it later, and a machine that went down between
+// the two left plugin-auth.json all zero (#1505). A write or flush that
+// fails leaves p as it was.
+function writeDurable(p, data) {
+  const tmp = p + ".tmp-" + process.pid
+  try {
+    const f = fs.openSync(tmp, "w", 0o600)
+    try {
+      for (let off = 0; off < data.length; ) off += fs.writeSync(f, data, off, data.length - off)
+      fs.fsyncSync(f)
+    } finally {
+      fs.closeSync(f)
+    }
+    // and a file held open by a reader refuses to be renamed over
+    for (let i = 0; ; i++) {
+      try {
+        return fs.renameSync(tmp, p)
+      } catch (e) {
+        if (i >= 50 || !["EPERM", "EACCES", "EBUSY"].includes(e?.code)) throw e
+        pause(10)
+      }
+    }
+  } catch (e) {
+    try {
+      fs.unlinkSync(tmp)
+    } catch {}
+    throw e
+  }
+}
+
+// badStamp is the time a bad file is kept under, as Go's lastgood names it.
+function badStamp(d = new Date()) {
+  const p = (n) => String(n).padStart(2, "0")
+  return `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}-${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}`
+}
+
+// keepBad copies buf, a plugin-auth.json that doesn't read, aside: two
+// within one second are both kept (-2, …), the same bytes kept already
+// not again.
+function keepBad(buf) {
+  const stamp = authPath + ".bad-" + badStamp()
+  for (let i = 1; i < 1000; i++) {
+    const name = i > 1 ? `${stamp}-${i}` : stamp
+    let f
+    try {
+      f = fs.openSync(name, "wx", 0o600)
+    } catch (e) {
+      if (e?.code !== "EEXIST") throw e
+      let old = null
+      try {
+        old = fs.readFileSync(name)
+      } catch {}
+      if (old && old.equals(buf)) return name
+      continue
+    }
+    try {
+      for (let off = 0; off < buf.length; ) off += fs.writeSync(f, buf, off, buf.length - off)
+      fs.fsyncSync(f)
+    } catch (e) {
+      fs.closeSync(f)
+      try {
+        fs.unlinkSync(name)
+      } catch {}
+      throw e
+    }
+    fs.closeSync(f)
+    toErr(`plugin-auth.json can't be read (${describeBad(buf)}); it is kept as ${path.basename(name)}`)
+    return name
+  }
+  throw new Error("plugin-auth.json can't be read and there is no free name to keep it under")
+}
+
+// keepAuth is called before plugin-auth.json is replaced: the file there
+// now becomes plugin-auth.json.bak when it reads, or is copied aside when
+// it doesn't. A failure stops the write.
+function keepAuth() {
+  const buf = readFileSteady(authPath)
+  if (buf === null) return
+  if (!parseAuth(buf.toString("utf8"))) {
+    keepBad(buf)
+    return
+  }
+  const bak = authPath + ".bak"
+  let old = null
+  try {
+    old = fs.readFileSync(bak)
+  } catch {}
+  if (!old || !old.equals(buf)) writeDurable(bak, buf)
 }
 
 function writeAuth(all) {
   fs.mkdirSync(path.dirname(authPath), { recursive: true })
-  const tmp = authPath + ".tmp-" + process.pid
-  fs.writeFileSync(tmp, JSON.stringify(all, null, 2) + "\n", { mode: 0o600 })
-  // and a file held open by a reader refuses to be renamed over
-  for (let i = 0; ; i++) {
-    try {
-      return fs.renameSync(tmp, authPath)
-    } catch (e) {
-      if (i >= 50 || !["EPERM", "EACCES", "EBUSY"].includes(e?.code)) throw e
-      pause(10)
-    }
-  }
+  keepAuth()
+  writeDurable(authPath, Buffer.from(JSON.stringify(all, null, 2) + "\n"))
 }
 
 function pause(ms) {
@@ -597,9 +740,11 @@ function lockAuth() {
 function changeAuth(change) {
   const unlock = lockAuth()
   try {
-    const all = readAuth()
+    const { all, known } = readAuthState()
     const out = change(all)
-    if (out !== false) writeAuth(all)
+    // sign-ins that don't read are never written over with none: a
+    // sign-out of one of them waits for the file to be put right
+    if (out !== false && (known || Object.keys(all).length > 0)) writeAuth(all)
     return out
   } finally {
     unlock()
@@ -827,7 +972,12 @@ function entries(target) {
     const p = path.join(target, f)
     if (fs.existsSync(p)) out.push(p)
   }
-  if (out.length === 0) throw new Error(`plugin ${target} has no entry (package.json main, exports or index file)`)
+  if (out.length === 0) {
+    // a command alone (bin), an MCP server, is no plugin at all (#1327)
+    const cmd = pkg?.bin ? ", only a command (bin). If it is an MCP server, add it under Library → MCP servers instead" : ""
+    // said without a stack: there is no fault in the host to trace
+    throw Object.assign(new Error(`${pkg?.name || target} isn't an OpenCode or magpie plugin: its package names no file to load (no main or exports in package.json, no index file)${cmd}`), { plain: true })
+  }
   return [...new Set(out)]
 }
 
@@ -890,7 +1040,7 @@ async function loadPlugins(list) {
       for (const fn of fns) hooks.push({ spec: p.spec, target: p.target, hooks: (await fn(input, p.options)) ?? {} })
       loaded.push({ spec: p.spec })
     } catch (e) {
-      loaded.push({ spec: p.spec, error: String(e?.stack ?? e) })
+      loaded.push({ spec: p.spec, error: e?.plain ? e.message : String(e?.stack ?? e) })
     }
   }
   config = { provider: {}, ...structuredClone(userConfig) }
@@ -905,11 +1055,32 @@ async function loadPlugins(list) {
 }
 
 // auths are the auth hooks by provider, the last plugin to name one
-// winning, as in OpenCode.
+// winning, as in OpenCode, unless the user picked one of them for it
+// (prefer): a plugin of their own beside a third party's that signs in to
+// the same provider id is then theirs to choose, not the list's order.
 function auths() {
   const m = new Map()
   for (const h of hooks) if (h.hooks.auth?.provider) m.set(h.hooks.auth.provider, { spec: h.spec, target: h.target, auth: h.hooks.auth })
+  for (const h of hooks) {
+    const id = h.hooks.auth?.provider
+    if (id && prefer[id] === h.spec) m.set(id, { spec: h.spec, target: h.target, auth: h.hooks.auth })
+  }
   return m
+}
+
+// signsIn are the provider ids the plugin spec's auth hooks name.
+const signsIn = (spec) => [...new Set(hooks.filter((h) => h.spec === spec && h.hooks.auth?.provider).map((h) => h.hooks.auth.provider))]
+
+// withProviders is a loaded plugin as init tells magpie of it: the provider
+// ids it signs in to, and for each one another plugin serves (two plugins
+// naming one id: the host runs one), the plugin that does. magpie says so
+// on the plugin's row rather than leave its provider missing.
+function withProviders(l) {
+  const ids = l.error ? [] : signsIn(l.spec)
+  if (!ids.length) return l
+  const a = auths()
+  const servedBy = Object.fromEntries(ids.filter((id) => a.get(id) && a.get(id).spec !== l.spec).map((id) => [id, a.get(id).spec]))
+  return { ...l, provides: ids, ...(Object.keys(servedBy).length ? { servedBy } : {}) }
 }
 
 function authOf(provider) {
@@ -984,6 +1155,9 @@ async function info(id, key, strict) {
     options: { ...(cfg?.options ?? {}) },
     npm: cfg?.npm ?? md?.npm,
     api: cfg?.api ?? md?.api,
+    // magpie's own field: the plugin serves a decision API (System One)
+    // for this provider, asked at its base /systemone through its fetch
+    decide: cfg?.decide === true,
     models: {},
   }
   if (md) for (const m of Object.values(md.models ?? {})) out.models[m.id] = fromModelsDev(md, m)
@@ -1008,11 +1182,17 @@ async function info(id, key, strict) {
         ...(m.modalities?.input ? { input: Object.fromEntries(["text", "image", "audio", "video", "pdf"].map((k) => [k, m.modalities.input.includes(k)])) } : {}),
       },
       variants: m.variants ?? was?.variants ?? {},
+      // magpie's own mark: a decision model, answering System One
+      ...(typeof m.decides === "boolean" ? { decides: m.decides } : was?.decides !== undefined ? { decides: was.decides } : {}),
     }
   }
+  const server = auths().get(id)?.spec
   for (const h of hooks) {
     const ph = h.hooks.provider
     if (ph?.id !== id || typeof ph.models !== "function") continue
+    // a plugin that signs in to id too but doesn't serve it: its list
+    // would be asked with the serving plugin's account
+    if (server && h.spec !== server && signsIn(h.spec).includes(id)) continue
     const k = key ?? accountsOf(readAuth(), id)[0] ?? id
     await fresh(id, k)
     const all = readAuth()
@@ -1132,6 +1312,7 @@ async function providers({ proxies } = {}) {
       icon: iconOf(a),
       usage: typeof a.auth.usage === "function",
       checkin: typeof a.auth.checkin === "function",
+      decide: p.decide === true,
       maxConcurrency: concurrencyOf(a),
       signedIn: keys.length > 0,
       authType: first?.type ?? "",
@@ -1169,6 +1350,11 @@ async function providers({ proxies } = {}) {
           // and before a discount running now (Qoder's price_factor)
           rate: rateOf(m.rate),
           rateWas: rateOf(m.rateWas),
+          // run fast when the request's service_tier is priority (Cursor's)
+          fast: m.fast === true,
+          // a decision model (System One's), hidden from agents and
+          // offered as a routing group's classifier
+          decides: m.decides === true,
         })),
     })
   }
@@ -1423,7 +1609,8 @@ async function load({ provider, account, proxy }) {
 //       count, when it counts in amounts: amount of limit used, in unit,
 //       "credits"), span? (seconds the window runs), model? (a
 //       word in the ids of the only models it counts), models? / notModels?
-//       (the ids it counts, or all but these), aside? (using it up doesn't
+//       (the ids it counts, or all but these; a bare id and its id@size
+//       count as one), aside? (using it up doesn't
 //       stop the account) }],
 //     signIn?: "expired" | "kept" | "renewed" (what the read means for the
 //       account's sign-in, as a model request's X-Magpie-Sign-In says;
@@ -1646,8 +1833,9 @@ const handlers = {
     piPath = p.piPath ?? ""
     directory = p.directory ?? directory
     userConfig = p.config ?? {}
+    prefer = p.prefer ?? {}
     await loadPlugins(p.plugins ?? [])
-    return { plugins: loaded }
+    return { plugins: loaded.map(withProviders) }
   },
   providers: (p) => providers(p ?? {}),
   prompt: async (p) => ({ prompt: await nextPrompt(p.provider, p.method, p.inputs ?? {}) }),

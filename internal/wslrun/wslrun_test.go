@@ -6,6 +6,8 @@ import (
 	"testing"
 	"time"
 	"unicode/utf16"
+
+	"github.com/yetone/magpie/internal/settings"
 )
 
 func TestParseProbe(t *testing.T) {
@@ -21,6 +23,9 @@ func TestParseProbe(t *testing.T) {
 	}
 	if tool.Distro != "Ubuntu" || tool.Path != "/home/me/.local/bin/claude" || tool.Mount != "/mnt/" || tool.Host != "172.20.0.1" {
 		t.Fatalf("tool = %+v", tool)
+	}
+	if tool.Root {
+		t.Fatal("no uid printed, yet Root")
 	}
 	// the interactive shell's PATH wins, and the bin's folder joins it
 	if tool.PATH != "/home/me/.local/bin:/home/me/.nvm/bin:/usr/bin" {
@@ -50,6 +55,18 @@ func TestParseProbe(t *testing.T) {
 		if tool.Host != host {
 			t.Errorf("%q: Host = %q, want %q", out, tool.Host, host)
 		}
+	}
+
+	// a distro whose default user is root: its Claude Code is told so
+	// (the gateway's asRoot)
+	for out, root := range map[string]bool{"uid:0\n": true, "uid:0\r\n": true, "uid:1000\n": false, "uid:\n": false} {
+		tool, _ = parseProbe("d", "bin:/usr/bin/claude\n"+out)
+		if tool.Root != root {
+			t.Errorf("%q: Root = %v, want %v", out, tool.Root, root)
+		}
+	}
+	if s := probeScript("claude"); !strings.Contains(s, `echo "uid:$(id -u)"`) {
+		t.Fatalf("probe doesn't print the user: %s", s)
 	}
 
 	// no claude in the distro (the probe skips Windows' own under /mnt)
@@ -244,5 +261,34 @@ func TestUp(t *testing.T) {
 	On = false
 	if Up("Ubuntu-24.04") {
 		t.Error("Up off Windows")
+	}
+}
+
+// #1264: with Settings' Detect agents in WSL off, Find (Claude Code for a
+// Claude subscription, when Windows has none) asks wsl.exe nothing.
+func TestFindWithDetectionOff(t *testing.T) {
+	oldOn, oldRun := On, Run
+	t.Cleanup(func() { On, Run = oldOn, oldRun; Forget(); settings.Save(settings.Settings{}) })
+	On = true
+	Forget()
+	var asked []string
+	Run = func(_ time.Duration, args ...string) ([]byte, error) {
+		asked = append(asked, strings.Join(args, " "))
+		if strings.Join(args, " ") == "-l --running -q" || strings.Join(args, " ") == "-l -q" {
+			return utf16le("Ubuntu\r\n"), nil
+		}
+		return []byte("bin:/usr/bin/claude\nlpath:/usr/bin\n"), nil
+	}
+	if err := settings.Save(settings.Settings{NoWSLAgents: true}); err != nil {
+		t.Fatal(err)
+	}
+	if tool, ok := Find("claude"); ok || len(asked) != 0 {
+		t.Fatalf("Find with detection off = %+v %v, asked %q", tool, ok, asked)
+	}
+	if err := settings.Save(settings.Settings{}); err != nil {
+		t.Fatal(err)
+	}
+	if tool, ok := Find("claude"); !ok || tool.Distro != "Ubuntu" {
+		t.Fatalf("Find with detection on = %+v %v", tool, ok)
 	}
 }

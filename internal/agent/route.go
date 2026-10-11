@@ -110,6 +110,10 @@ func magpieModels(agent string) []catalog.Model {
 	// a model magpie describes images to takes them (provider.Described)
 	seen := provider.Described != nil && provider.Described()
 	st, find := settings.Load(), provider.GroupFinder()
+	members := func(id string) []provider.Member {
+		_, ms, _ := find(id)
+		return ms
+	}
 	for i, e := range shown {
 		m := catalog.Model{ID: e.ID, Name: labels[i], Provider: firstOf(e.Provider.Catalogs()), Efforts: e.Efforts, Images: e.Images || seen, ImageInput: e.ImageInput, Context: e.Context, Output: e.Output, AgentsV2: e.AgentsV2, Reasoning: e.Reasoning}
 		// where Codex and Claude Code compact it (#876): a threshold the
@@ -117,7 +121,7 @@ func magpieModels(agent string) []catalog.Model {
 		// model, which codexcat answers from the settings it is given
 		m.Compact = provider.CompactSetIn(st, e.ID, find)
 		// what a call costs the user (Pi's cost, #781)
-		if pr, ok := entryPrice(st, find, e); ok {
+		if pr, ok := provider.EntryPriceIn(st, find, e); ok {
 			m.Price = &pr
 		}
 		if seen && !e.Images {
@@ -131,43 +135,20 @@ func magpieModels(agent string) []catalog.Model {
 				m.APIs = []string{string(n)}
 			}
 		}
+		// the service tiers Codex is offered on it, as the gateway's own
+		// lists offer them: Fast in the Codex CLI magpie writes
+		// magpie-models.json for (#1530)
+		provider.CodexTiers(&m, e, members)
 		out = append(out, m)
 	}
 	return out
-}
-
-// entryPrice is what a call to e costs the user, as the usage pages count
-// it: a group's when every member costs the same, none in a fast mode,
-// since which of them answers isn't known beforehand.
-func entryPrice(st settings.Settings, find func(string) (provider.Group, []provider.Member, bool), e provider.Entry) (catalog.Price, bool) {
-	if e.Group == "" {
-		return provider.EffectivePriceIn(st, e.Provider.ID, e.Model)
-	}
-	_, ms, ok := find(e.ID)
-	if !ok || len(ms) == 0 {
-		return catalog.Price{}, false
-	}
-	var first catalog.Price
-	for i, m := range ms {
-		pr, ok := provider.EffectivePriceIn(st, m.Provider.ID, m.Model)
-		if !ok || m.Fast || i > 0 && !pr.Same(first) {
-			return catalog.Price{}, false
-		}
-		first = pr
-	}
-	return first, true
 }
 
 // maxTokens is the output limit an agent is handed for m, kept within the
 // context window it is handed with it: models.dev lists some models' output
 // above their window (deepseek-chat's 384000 against 128000). An unknown
 // window leaves the output as it is.
-func maxTokens(m catalog.Model) int {
-	if m.Context > 0 && m.Output > m.Context {
-		return m.Context
-	}
-	return m.Output
-}
+func maxTokens(m catalog.Model) int { return provider.OutputWithin(m.Context, m.Output) }
 
 // group tags every option with a group name.
 func group(name string, opts []Option) []Option {

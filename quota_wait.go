@@ -276,7 +276,7 @@ func quotaWaitCmd(args []string) error {
 		} else {
 			provider.AskUsage()
 		}
-		rctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		rctx, cancel := context.WithTimeout(provider.Asked(ctx), 30*time.Second)
 		defer cancel()
 		return provider.Allotted(rctx)
 	}

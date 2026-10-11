@@ -38,9 +38,26 @@ func (p Provider) Test(ctx context.Context) []Result {
 	if p.DecideOnly() {
 		return p.testDecide(ctx)
 	}
-	p.Fetch(ctx)
+	_, listErr := p.Fetch(ctx)
+	if client := testClient(ctx); client != "" {
+		// the one endpoint that agent's requests go to
+		proto := clientProto(client, p.Speaks())
+		q, ok := p.keyFor(proto)
+		model := p.testModel(q, proto)
+		if why := p.TestsAs(client); why != "" {
+			return []Result{{Protocol: proto, Model: model, Error: why}}
+		}
+		if !ok {
+			return []Result{{Protocol: proto, Model: model, Error: "no key is on for this endpoint"}}
+		}
+		url, body := tiny(q, proto, UpstreamName(p, model))
+		return []Result{probe(ctx, q, proto, url, q.Prepare([]byte(asClient(client, proto, body))), model, testWait)}
+	}
 	if p.isClaudeAccount() {
 		return []Result{p.testClaude(ctx, p.testModel(p, Anthropic))}
+	}
+	if p.testsTranslated() {
+		return []Result{p.testTranslated(ctx, p.testModel(p, CodeAssist))}
 	}
 	var out []Result
 	for _, proto := range p.Speaks() {
@@ -53,7 +70,12 @@ func (p Provider) Test(ctx context.Context) []Result {
 		url, body := tiny(q, proto, UpstreamName(p, model))
 		out = append(out, probe(ctx, q, proto, url, q.Prepare([]byte(body)), model, testWait))
 	}
-	if p.Decides() {
+	if p.IsRemoteMagpie() {
+		// The model list already checked its key and named its decisions.
+		if model := p.Jev(); listErr == nil && model != "" {
+			out = append(out, Result{Protocol: "decide", Model: model, OK: true, Status: http.StatusOK})
+		}
+	} else if p.Decides() {
 		out = append(out, p.testDecide(ctx)...)
 	}
 	return out
@@ -105,7 +127,9 @@ func clineProbe(body string) string {
 // for them; "own-api" for a sign-in reached
 // through its agent's own API (Cursor, Devin, Kiro, Zed, Qoder, a Google
 // sign-in), which the gateway translates every request for, so a probe
-// has no endpoint to go to.
+// has no endpoint to go to. A Google sign-in's are asked through the
+// gateway's translator (testsTranslated). Vertex AI's generateContent is
+// asked as it is.
 func (p Provider) ModelTest() string {
 	if p.DecideOnly() {
 		if p.AsksDecideModels() {
@@ -113,11 +137,11 @@ func (p Provider) ModelTest() string {
 		}
 		return "decide"
 	}
-	if p.isClaudeAccount() {
+	if p.isClaudeAccount() || p.testsTranslated() || p.IsVertex() {
 		return ""
 	}
 	for _, pr := range p.Speaks() {
-		if pr == Chat || pr == Responses || pr == Anthropic {
+		if pr == Chat || pr == Responses || pr == Anthropic || pr == Gemini && p.Gemini != "" {
 			return ""
 		}
 	}
@@ -148,8 +172,14 @@ func tinyBody(q Provider, proto Protocol, model string) (url, body string) {
 	case Anthropic:
 		return q.Anthropic + "/v1/messages", fmt.Sprintf(`{"model":%q,"max_tokens":16,"messages":[{"role":"user","content":"hi"}]}`, model)
 	case Gemini:
-		// Factory's generate route. droid sends no stream field.
-		return q.Base(Gemini) + "/generate", fmt.Sprintf(`{"model":%q,"contents":[{"role":"user","parts":[{"text":"hi"}]}]}`, model)
+		if q.IsVertex() {
+			return vertexTest(q, model)
+		}
+		if q.FactoryGemini() {
+			// Factory's generate route. droid sends no stream field.
+			return q.Base(Gemini) + "/generate", fmt.Sprintf(`{"model":%q,"contents":[{"role":"user","parts":[{"text":"hi"}]}]}`, model)
+		}
+		return q.Gemini + GeminiPath(model, false), `{"contents":[{"role":"user","parts":[{"text":"hi"}]}],"generationConfig":{"maxOutputTokens":16}}`
 	}
 	return "", ""
 }
@@ -217,8 +247,15 @@ func (p Provider) testOne(ctx context.Context, model string) Result {
 		r.OK, r.Status = true, http.StatusOK
 		return r
 	}
+	client := testClient(ctx)
+	if why := p.TestsAs(client); why != "" {
+		return Result{Protocol: clientProto(client, p.Speaks()), Model: model, Error: why}
+	}
 	if p.isClaudeAccount() {
 		return p.testClaude(ctx, model)
+	}
+	if p.testsTranslated() {
+		return p.testTranslated(ctx, model)
 	}
 	var protos []Protocol
 	for _, pr := range p.Speaks() {
@@ -233,8 +270,11 @@ func (p Provider) testOne(ctx context.Context, model string) Result {
 	// Claude model, else the one it prefers; an image model draws on the
 	// chat endpoint's images API
 	proto := protos[0]
-	draws := p.drawsOnImages(model) && slices.Contains(protos, Chat)
-	if draws {
+	draws := client == "" && p.drawsOnImages(model) && slices.Contains(protos, Chat)
+	if client != "" {
+		// on the API that agent's requests go to (TestAs)
+		proto = clientProto(client, protos)
+	} else if draws {
 		proto = Chat
 	} else if apis := p.APIs(model); apis != nil {
 		if i := slices.IndexFunc(protos, func(pr Protocol) bool { return slices.Contains(apis, pr) }); i >= 0 {
@@ -279,6 +319,9 @@ func (p Provider) testOne(ctx context.Context, model string) Result {
 		return r
 	}
 	url, body := tiny(q, proto, UpstreamName(p, model))
+	if client != "" {
+		body = asClient(client, proto, body)
+	}
 	return probe(ctx, q, proto, url, q.Prepare([]byte(body)), model, testWait)
 }
 
@@ -347,7 +390,8 @@ func isClaude(id string) bool {
 // Azure OpenAI takes a key in api-key alone: a Bearer there is an Entra ID
 // token, and the key sent as one is turned away.
 func AuthHeaders(p Provider, proto Protocol) map[string]string {
-	if p.Key == "" {
+	// Vertex AI's is the Google token Sign sets, which a key would replace
+	if p.Key == "" || p.IsVertex() {
 		return map[string]string{}
 	}
 	if p.IsAzure() {
@@ -355,6 +399,12 @@ func AuthHeaders(p Provider, proto Protocol) map[string]string {
 			return map[string]string{"x-api-key": p.Key}
 		}
 		return map[string]string{"api-key": p.Key}
+	}
+	if proto == Gemini && !p.FactoryGemini() {
+		// Google's Gemini API takes an API key here, and turns one away as
+		// a Bearer token ("Expected OAuth 2 access token"); relays that
+		// answer as it does read it here too
+		return map[string]string{"x-goog-api-key": p.Key}
 	}
 	if proto == Anthropic {
 		if strings.HasSuffix(p.Host(), "anthropic.com") || p.IsBedrock() {
@@ -379,7 +429,9 @@ func probe(ctx context.Context, p Provider, proto Protocol, url string, body []b
 		return r
 	}
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("anthropic-version", "2023-06-01")
+	if proto == Anthropic {
+		req.Header.Set("anthropic-version", "2023-06-01")
+	}
 	if p.IsOpenCode() {
 		OpenCodeClient(req.Header, "")
 	}
@@ -388,6 +440,9 @@ func probe(ctx context.Context, p Provider, proto Protocol, url string, body []b
 	}
 	if p.IsKilo() {
 		KiloClient(req.Header, p.Key, "")
+	}
+	if client := testClient(ctx); client != "" {
+		clientHeaders(client, req.Header)
 	}
 	if err := p.Sign(ctx, req, proto, body); err != nil {
 		r.Error = err.Error()

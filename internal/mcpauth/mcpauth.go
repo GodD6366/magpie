@@ -25,6 +25,7 @@ import (
 	"fmt"
 	"html"
 	"io"
+	"io/fs"
 	"net"
 	"net/http"
 	"net/url"
@@ -35,6 +36,7 @@ import (
 	"time"
 
 	"github.com/yetone/magpie/internal/edit"
+	"github.com/yetone/magpie/internal/lastgood"
 	"github.com/yetone/magpie/internal/netproxy"
 	"github.com/yetone/magpie/internal/settings"
 	"github.com/yetone/magpie/internal/steady"
@@ -98,16 +100,37 @@ var fileMu sync.Mutex
 func path() string { return filepath.Join(settings.Dir(), "mcp-signins.json") }
 
 func load() map[string]*Record {
-	m := map[string]*Record{}
-	if b, err := os.ReadFile(path()); err == nil {
-		_ = json.Unmarshal(b, &m)
-	}
+	m, _ := read()
 	return m
+}
+
+// read is the sign-ins, or their last good generation when a crash left
+// the file all zero (#1505); an error when neither reads, for a change
+// not to write them over as none.
+func read() (map[string]*Record, error) {
+	m := map[string]*Record{}
+	b, err := lastgood.Read(path(), validRecords)
+	if errors.Is(err, fs.ErrNotExist) {
+		return m, nil
+	}
+	if err != nil {
+		return m, err
+	}
+	_ = json.Unmarshal(b, &m)
+	return m, nil
+}
+
+func validRecords(b []byte) bool {
+	var m map[string]*Record
+	return json.Unmarshal(b, &m) == nil
 }
 
 func save(m map[string]*Record) error {
 	b, err := json.MarshalIndent(m, "", "  ")
 	if err != nil {
+		return err
+	}
+	if err := lastgood.Keep(path(), validRecords, 0o600); err != nil {
 		return err
 	}
 	return writePrivate(path(), append(b, '\n'))
@@ -122,30 +145,20 @@ func writePrivate(p string, b []byte) error {
 	if err := os.MkdirAll(filepath.Dir(p), 0o700); err != nil {
 		return err
 	}
-	tmp, err := os.CreateTemp(filepath.Dir(p), "."+filepath.Base(p)+".*")
-	if err != nil {
-		return err
-	}
-	defer os.Remove(tmp.Name())
-	if _, err := tmp.Write(b); err != nil {
-		tmp.Close()
-		return err
-	}
-	if err := tmp.Chmod(0o600); err != nil {
-		tmp.Close()
-		return err
-	}
-	if err := tmp.Close(); err != nil {
-		return err
-	}
-	return steady.Rename(tmp.Name(), p)
+	return steady.WriteFile(p, b, 0o600) // on the disk before it is renamed in
 }
 
 func update(f func(m map[string]*Record) bool) error {
 	fileMu.Lock()
 	defer fileMu.Unlock()
-	m := load()
-	if !f(m) {
+	// sign-ins that don't read are kept aside before a new one is saved
+	// (save), and never written over with none
+	m, err := read()
+	changed := f(m)
+	if err != nil && len(m) == 0 {
+		return err // what to change may be in what doesn't read
+	}
+	if !changed {
 		return nil
 	}
 	return save(m)
@@ -616,12 +629,15 @@ func register(ctx context.Context, m meta, redirect string) (id, secret, method 
 	}
 	method = "none"
 	if len(m.AuthMethods) > 0 && !contains(m.AuthMethods, "none") {
-		method = m.AuthMethods[0]
-		if !contains(m.AuthMethods, "client_secret_post") && !contains(m.AuthMethods, "client_secret_basic") {
-			return "", "", "", fmt.Errorf("the server's token endpoint takes only %s, which magpie can't do", strings.Join(m.AuthMethods, ", "))
-		}
-		if contains(m.AuthMethods, "client_secret_post") {
+		// the metadata's order is no preference: one listing private_key_jwt
+		// first, which magpie can't do, may take a secret too
+		switch {
+		case contains(m.AuthMethods, "client_secret_post"):
 			method = "client_secret_post"
+		case contains(m.AuthMethods, "client_secret_basic"):
+			method = "client_secret_basic"
+		default:
+			return "", "", "", fmt.Errorf("the server's token endpoint takes only %s, which magpie can't do", strings.Join(m.AuthMethods, ", "))
 		}
 	}
 	reg := map[string]any{

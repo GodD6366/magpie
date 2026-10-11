@@ -1,29 +1,44 @@
 /* Library: instructions, MCP servers and skills for every agent. */
 #view-library { gap: 0; }
 /* The tabs stay at the top while the page scrolls under them, on a frosted
-   strip as wide as the view; a hairline shows once something is beneath. */
+   strip as wide as the view; a hairline shows once something is beneath.
+   The strip's own box keeps to the view's content box and its ::before
+   reaches out over the view's padding (--bleed-l/-r): a box that ran past
+   the content's end edge, by a negative margin, was 16px of sideways
+   scroll in macOS 15's WebKit, which leaves a negative margin-end out of
+   a flex scroller's scrollable width (#1236). */
 .lib-head {
   position: sticky; top: 0; z-index: 5;
   display: flex; align-items: center; gap: 8px; flex: none;
-  margin: 0 -12px; padding: 6px 12px 4px;
+  margin: 0; padding: 6px 0 4px;
+  --bleed-l: 12px; --bleed-r: 12px;
+}
+.lib-head::before {
+  content: ""; position: absolute; z-index: -1; pointer-events: none;
+  top: 0; bottom: 0; left: calc(-1 * var(--bleed-l)); right: calc(-1 * var(--bleed-r));
   background: color-mix(in srgb, var(--bg) 92%, transparent);
   -webkit-backdrop-filter: saturate(1.6) blur(16px); backdrop-filter: saturate(1.6) blur(16px);
   box-shadow: 0 1px 0 transparent; transition: box-shadow .18s var(--ease);
 }
 /* the window's view is padded 2px at the top: the strip reaches over it */
-body.window .lib-head { top: -2px; margin: -2px -16px 0; padding: 8px 16px 4px; }
+body.window .lib-head { top: -2px; margin: -2px 0 0; padding: 8px 0 4px; --bleed-l: 16px; --bleed-r: 16px; }
 @media (max-width: 760px), (pointer: coarse) and (max-width: 1024px) {
   body.web .lib-head {
     flex-wrap: wrap;
-    margin: -2px calc(-1 * var(--view-right)) 0 calc(-1 * var(--view-left));
-    padding: 8px var(--view-right) 4px var(--view-left);
+    margin: -2px 0 0; padding: 8px 0 4px;
+    --bleed-l: var(--view-left); --bleed-r: var(--view-right);
   }
   body.web .lib-tabs { max-width: 100%; flex-wrap: wrap; }
-  body.web .lib-more { flex: none; }
+  body.web .lib-more, body.web .lib-discover { flex: none; }
 }
-.lib-head.stuck { box-shadow: 0 1px 0 var(--line-2); }
+/* a window too narrow for the tabs and the buttons beside them (Discover,
+   Library folder) on one line has the buttons on a line of their own, at
+   its end */
+.lib-head { flex-wrap: wrap; row-gap: 4px; }
+.lib-headacts { display: flex; align-items: center; gap: 8px; margin-left: auto; flex-wrap: wrap; justify-content: flex-end; }
+.lib-head.stuck::before { box-shadow: 0 1px 0 var(--line-2); }
 .lib-tabs .opt { height: 24px; padding: 0 12px; font-size: 12.5px; }
-.lib-more { display: inline-flex; align-items: center; gap: 5px; }
+.lib-more, .lib-discover { display: inline-flex; align-items: center; gap: 5px; }
 .lib-mini { display: inline-grid; place-items: center; color: var(--muted); }
 .lib-mini svg { width: 13px; height: 13px; }
 .lib-body { display: flex; flex-direction: column; flex: none; }
@@ -195,6 +210,9 @@ input.lib-setname:focus { border-color: var(--accent); box-shadow: 0 0 0 3px col
 .editor .lib-ag { padding: 0 9px 0 6px; border-color: var(--line); }
 .editor .lib-ag.on { background: var(--accent-soft); border-color: color-mix(in srgb, var(--fg) 30%, transparent); }
 .lib-probefoot .lib-agents { max-width: none; justify-content: flex-start; }
+/* All, ahead of a picker's chips (#1531): a word, set a little apart */
+.lib-agents > .lib-ag.all { padding: 0 8px; margin-right: 4px; font-weight: 500; }
+.lib-agents > .lib-ag.all.on { color: var(--fg); }
 
 /* in a list row they sit stacked like a hand of cards, on one line, and fan
    out when the pointer or focus comes to them */
@@ -287,7 +305,7 @@ input.lib-setname:focus { border-color: var(--accent); box-shadow: 0 0 0 3px col
 /* the page in outline while the library loads: it comes in only after a
    moment, so a quick load goes straight to the page; one sweep of light
    runs across every bar at once */
-.lib-skel { animation: lib-skel-in .3s var(--ease) .18s both; }
+.lib-skel { animation: lib-skel-in .3s var(--ease) .18s backwards; }
 @keyframes lib-skel-in { from { opacity: 0; } }
 .lib-skel .skeleton { background-color: var(--skel, var(--pill)); background-attachment: fixed; background-size: 200vw 100%; background-repeat: no-repeat; background-position: 20vw 0; animation-name: lib-skel-shift; animation-duration: 1.8s; }
 @keyframes lib-skel-shift { from { background-position: 20vw 0; } to { background-position: -100vw 0; } }
@@ -366,7 +384,7 @@ input.lib-setname:focus { border-color: var(--accent); box-shadow: 0 0 0 3px col
   position: relative; display: flex; flex-direction: column; gap: 9px; min-width: 0; padding: 12px 12px 10px; border-radius: 12px;
   background: var(--card); border: 1px solid var(--line); box-shadow: 0 1px 1px rgba(0, 0, 0, .03);
   transition: border-color .16s var(--ease), box-shadow .16s var(--ease), transform .16s var(--ease);
-  animation: content-in .24s var(--ease) both;
+  animation: content-in .24s var(--ease) backwards;
 }
 .mk-card.click:hover { border-color: color-mix(in srgb, var(--fg) 22%, transparent); box-shadow: 0 6px 18px -8px rgba(0, 0, 0, .18); transform: translateY(-1px); }
 .mk-top { display: flex; align-items: center; gap: 10px; min-width: 0; }
@@ -453,6 +471,18 @@ input.lib-setname:focus { border-color: var(--accent); box-shadow: 0 0 0 3px col
 .lib-health.auth::before { background: var(--amber); }
 .lib-health.err { color: var(--red); }
 .lib-health.err::before { background: var(--red); }
+/* a server that listed its tools: its status opens them, a chevron says so */
+.lib-health.has-list::after { content: ""; flex: none; width: 4px; height: 4px; margin: 0 1px 2px 1px; border: solid currentColor; border-width: 0 1.2px 1.2px 0; transform: rotate(45deg); opacity: .7; transition: transform .14s var(--ease); }
+.lib-health.has-list[aria-expanded="true"]::after { transform: rotate(-135deg); margin-bottom: -2px; }
+.lib-tools { margin-top: 6px; min-width: 0; border: 1px solid var(--line-2); border-radius: 8px; background: var(--card-2); cursor: auto; }
+.lib-tools[hidden] { display: none; }
+.lib-toollist { list-style: none; margin: 0; padding: 4px 0; max-height: 320px; overflow-y: auto; overscroll-behavior: contain; }
+.lib-toollist li { display: flex; flex-direction: column; gap: 1px; padding: 4px 10px; min-width: 0; user-select: text; }
+.lib-toolname { font: var(--code-style, normal) 500 11.5px var(--code-font, var(--code)); font-stretch: var(--code-stretch, 100%); color: var(--fg-2); overflow-wrap: anywhere; }
+.lib-tooldesc { font-size: 11.5px; line-height: 1.45; color: var(--muted); overflow-wrap: anywhere; white-space: normal; }
+.lib-toolfoot { display: flex; align-items: center; gap: 8px; padding: 4px 6px 4px 10px; border-top: 1px solid var(--line-2); }
+.lib-toolfoot .note { font-size: 11px; color: var(--faint); }
+.lib-toolfoot button.text { height: 22px; font-size: 11.5px; }
 .lib-health.checking::before { animation: lib-health-pulse 1s ease-in-out infinite alternate; }
 @keyframes lib-health-pulse { to { opacity: .25; } }
 @media (prefers-reduced-motion: reduce) { .lib-health.checking::before { animation: none; } }
@@ -516,7 +546,7 @@ input.lib-setname:focus { border-color: var(--accent); box-shadow: 0 0 0 3px col
 .lib-subhead .lib-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--accent); flex: none; }
 .lib-row.lib-subhead:hover { background: color-mix(in srgb, var(--card-2) 70%, var(--pill)); }
 /* no color-mix() before Safari 16.2 (#220): the sticky head stays opaque */
-@supports not (color: color-mix(in srgb, red 50%, blue)) { .lib-head { background: var(--bg); } }
+@supports not (color: color-mix(in srgb, red 50%, blue)) { .lib-head::before { background: var(--bg); } }
 /* skills picked to turn on or off together (#791): a box on each row and
    heading, and a bar that stays in view under the list while it's long */
 .lib-pickbox { margin: 0; flex: none; }

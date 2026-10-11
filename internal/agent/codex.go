@@ -22,6 +22,8 @@ import (
 	"github.com/yetone/magpie/internal/edit"
 	"github.com/yetone/magpie/internal/gateway"
 	"github.com/yetone/magpie/internal/provider"
+	"github.com/yetone/magpie/internal/sessions"
+	"github.com/yetone/magpie/internal/settings"
 )
 
 // Codex talks the OpenAI Responses API. Signed in to ChatGPT, it is
@@ -79,8 +81,27 @@ func codex(home string) *Agent { return codexIn(here(home)) }
 
 // codexIn is Codex as it lives at a place: this machine's home, or a WSL
 // distro's (see wsl.go).
+// codexRunning is whether a Codex runs here, whose list a change reaches
+// only once it restarts; a var so tests can say.
+var codexRunning = func() bool { return Running(`(^|/)codex( |$)`) }
+
+// codexEfforts are the effort control's choices for a model among ms:
+// Default first, with the level Codex takes for it when none is set, as
+// the catalog entry it reads says it, then the model's levels.
+func codexEfforts(ms []catalog.Model, model string) []Option {
+	e := catalog.Efforts(ms, model)
+	if len(e) == 0 {
+		return static("low", "medium", "high", "xhigh")
+	}
+	d := Option{Value: "", Note: "Codex's default for the model", Takes: codexcat.TakesEffort(ms, model)}
+	if d.Takes != "" {
+		d.Note += ": " + d.Takes
+	}
+	return append([]Option{d}, static(e...)...)
+}
+
 func codexIn(at place) *Agent {
-	dir := filepath.Join(at.home, ".codex")
+	dir := at.codexHome()
 	path := filepath.Join(dir, "config.toml")
 	catalogPath := filepath.Join(dir, "magpie-models.json")
 	get := func(k string) string { v, _ := edit.GetTOMLTop(path, k); return v }
@@ -110,6 +131,27 @@ func codexIn(at place) *Agent {
 		}
 		return at.spell == nil && !filepath.IsAbs(c) && filepath.Clean(filepath.Join(dir, c)) == filepath.Clean(catalogPath)
 	}
+	// ownList is magpie's model list for Codex as written to catalogPath:
+	// what the user added by hand to the list there (a key magpie doesn't
+	// write, supports_reasoning_summaries on a model magpie gave none) is
+	// kept, not written over by the next model switch or sync (#1450)
+	ownList := func() []byte {
+		cur, _ := edit.Read(catalogPath)
+		return codexcat.Keep(cur, codexcat.Catalog(magpieModels("codex")))
+	}
+	// dropList takes the list away as magpie steps out as Codex's
+	// provider; one holding what the user added stays, which the config
+	// no longer names, for ownList to keep when magpie is back
+	dropList := func() {
+		cur, err := edit.Read(catalogPath)
+		if err != nil {
+			return
+		}
+		b := codexcat.Catalog(magpieModels("codex"))
+		if string(codexcat.Keep(cur, b)) == string(b) {
+			os.Remove(catalogPath)
+		}
+	}
 	asProvider := func() bool { return get("model_provider") == magpieID }
 	viaBase := func() bool { return isCodexGatewayOn(get("openai_base_url"), at.host()) }
 	routed := func() bool { return asProvider() || viaBase() }
@@ -123,6 +165,16 @@ func codexIn(at place) *Agent {
 	// (#940: it read as not connected), the change told as drift. One
 	// picked on the Agents page still takes magpie out (set).
 	beside := func() bool { return viaBase() && stashLoad()[at.key("codex.beside")] == "1" }
+	// chatGPT is whether Codex is signed in to ChatGPT. With account
+	// discovery off (#1535) auth.json stays unread, and Codex is taken to be
+	// as magpie last wired it, beside a ChatGPT sign-in or not, so turning
+	// discovery off never rewires Codex by itself.
+	chatGPT := func() bool {
+		if settings.AccountDiscoveryOff() {
+			return joined() || beside()
+		}
+		return codexChatGPT(dir)
+	}
 	// magpie is in Codex's config: on one of magpie's models, or joined;
 	// or, routed, on the model of the group magpie set it to as Codex
 	// spells it (gpt-6.1-sol for group/auto-gpt-6-1-sol, #750), which the
@@ -141,7 +193,10 @@ func codexIn(at place) *Agent {
 		return catalog.Codex()
 	}
 	var dropSubEffort func() error
-	// keep the effort valid for the model; a fresh model gets its default.
+	// keep the effort valid for the model: one set that the model doesn't
+	// take becomes its default. One left unset stays unset — Codex then
+	// takes the model's own default, which is what Default on the effort
+	// control asked for (lgtm: Default turned into medium on its own).
 	// Routed, the Codex app offers magpie's models' efforts too (#310).
 	settle := func() error {
 		if routed() {
@@ -151,7 +206,7 @@ func codexIn(at place) *Agent {
 		}
 		ms := models()
 		model, effort := get("model"), get("model_reasoning_effort")
-		if e := catalog.Efforts(ms, model); len(e) > 0 && !contains(e, effort) {
+		if e := catalog.Efforts(ms, model); len(e) > 0 && effort != "" && !contains(e, effort) {
 			if err := edit.SetTOMLTop(path, edit.KV{Path: "model_reasoning_effort", Value: codexcat.DefaultEffort(e)}); err != nil {
 				return err
 			}
@@ -172,7 +227,12 @@ func codexIn(at place) *Agent {
 			// model is never given the tool, so a Codex on magpie can't draw
 			// (the request that names model/draws never happens at all).
 			// uses_openai_actor_authorization() is exactly this check.
-			edit.KV{Path: "http_headers", Value: edit.Raw(`{ "x-openai-actor-authorization" = "magpie" }`)},
+			// An Inline table: a config that holds the headers as their own
+			// [model_providers.magpie.http_headers] table, or as dotted keys,
+			// gets the header set there, the user's others kept; written
+			// inline beside that table it defined http_headers twice and
+			// every model switch failed (wztlink1013 on Discord).
+			edit.KV{Path: "http_headers", Value: edit.Inline{{Path: "x-openai-actor-authorization", Value: "magpie"}}},
 		)
 	}
 	hasProvider := func() bool {
@@ -213,7 +273,7 @@ func codexIn(at place) *Agent {
 		if err := edit.DelTOMLTop(path, "model_provider", "model_catalog_json"); err != nil {
 			return err
 		}
-		os.Remove(catalogPath)
+		dropList()
 		return nil
 	}
 	// isCCSwitchMirror reports whether a model_providers table is CC Switch's
@@ -259,10 +319,50 @@ func codexIn(at place) *Agent {
 		}
 		return out
 	}
+	// putThreadTables writes a table for each provider a Codex thread was
+	// started on that config.toml has none of, pointed at magpie. The
+	// Codex app resumes a thread on its own provider, and without that
+	// table it loads no config for it: "Model provider `custom` not found",
+	// a thread started through CC Switch reopened after CC Switch rewrote
+	// config.toml without its table (#1372). Codex's built-in providers
+	// need none, and magpie's own is putProvider's. A table written so
+	// stays, as magpie's own does, for the threads that name it.
+	putThreadTables := func() error {
+		// the providers config.toml has, however spelled (a table, inline,
+		// dotted keys); one that doesn't parse is left alone
+		raw, err := edit.Read(path)
+		if err != nil {
+			return nil
+		}
+		var cfg struct {
+			Providers map[string]any `toml:"model_providers"`
+		}
+		if toml.Unmarshal(raw, &cfg) != nil {
+			return nil
+		}
+		for _, id := range sessions.CodexThreadProviders(dir) {
+			if _, ok := cfg.Providers[id]; ok || id == magpieID || codexBuiltinProvider[id] {
+				continue
+			}
+			if err := edit.SetTOMLTable(path, "model_providers."+id,
+				edit.KV{Path: "name", Value: id},
+				edit.KV{Path: "base_url", Value: at.v1()},
+				edit.KV{Path: "wire_api", Value: "responses"},
+				edit.KV{Path: "experimental_bearer_token", Value: at.gwKey()},
+			); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
 	// takeTables points CC Switch's tables at magpie, each one's own base
 	// URL kept in the stash for giveTables (a table already on magpie's
-	// keeps the one kept for it)
+	// keeps the one kept for it), and writes the tables threads name that
+	// are gone (putThreadTables)
 	takeTables := func() error {
+		if err := putThreadTables(); err != nil {
+			return err
+		}
 		was := map[string]string{}
 		json.Unmarshal([]byte(stashLoad()[at.key("codex.tables")]), &was)
 		for id, u := range ccSwitchTables() {
@@ -391,9 +491,14 @@ func codexIn(at place) *Agent {
 		}
 		return nil
 	}
+	// the user disconnected Codex and hasn't connected it since: magpie
+	// writes nothing of its own back (paynezhuang on Discord: the base URL
+	// was back after every update)
+	disconnected := func() bool { return stashLoad()[at.key("codex"+disconnectedKey)] == "1" }
 	// Codex on one of its own models goes through magpie too while more of
 	// its ChatGPT accounts are on there, so one out of its allowance hands
-	// the turn to the next; with none, it goes straight to OpenAI again
+	// the turn to the next; with none, or once the user disconnected Codex,
+	// it goes straight to OpenAI again
 	failover := func() error {
 		if wired() || asProvider() {
 			return nil
@@ -406,7 +511,7 @@ func codexIn(at place) *Agent {
 		if p != "" && p != "openai" && !mirror {
 			return nil
 		}
-		on := codexFailover()
+		on := !disconnected() && codexFailover()
 		if mirror {
 			t, _ := edit.GetTOMLTable(path, "model_providers."+p)
 			hasGateway := t["base_url"] == at.codexURL()
@@ -444,6 +549,22 @@ func codexIn(at place) *Agent {
 		}
 		return nil
 	}
+	// failingOver: Codex reaches magpie for account failover alone, by the
+	// base URL failover wrote (codex.failover) or by CC Switch's OpenAI
+	// mirror pointed at magpie for it (codex.mirror_failover), with nothing
+	// of magpie's connected. It read as not connected while every request
+	// went through magpie, magpie's models in its list (#1385).
+	failingOver := func() bool {
+		if wired() || asProvider() {
+			return false
+		}
+		s := stashLoad()
+		if p := get("model_provider"); p != "" && p != "openai" {
+			t, _ := edit.GetTOMLTable(path, "model_providers."+p)
+			return s[at.key("codex.mirror_failover")] == p && t["base_url"] == at.codexURL()
+		}
+		return viaBase() && s[at.key("codex.failover")] == "1"
+	}
 	modelOptions := func(withMagpie bool) []Option {
 		var own []Option
 		// each of Codex's own says which way it goes, as Claude Code's do:
@@ -472,12 +593,18 @@ func codexIn(at place) *Agent {
 			own = say(group(p, options(catalog.Codex(), "")))
 		} else {
 			own = say(group("OpenAI", options(ownCodex(), "")))
-			// on magpie API, Codex's own models are reached through magpie,
-			// on its ChatGPT account there: picked so, set so (#701)
-			if api() {
+			// with magpie Codex's provider (magpie API, or a magpie model
+			// picked with no ChatGPT sign-in beside it), Codex's own models
+			// are reached through magpie on a ChatGPT account there: picked
+			// so, set so (#701). One magpie doesn't serve is picked off
+			// magpie, straight to OpenAI, and says so: it said via magpie,
+			// and picking it took Codex off magpie at once (#1269)
+			if api() || asProvider() {
 				for i, o := range own {
 					if id := codexOwnViaMagpie(o.Value); id != "" {
 						own[i].Label, own[i].Value, own[i].Ref = o.Value, id, id
+					} else if !api() {
+						own[i].Via, own[i].Direct = false, "OpenAI"
 					}
 				}
 			}
@@ -544,7 +671,7 @@ func codexIn(at place) *Agent {
 			if err := edit.DelTOMLTop(path, "model", "model_provider", "model_catalog_json"); err != nil {
 				return err
 			}
-			os.Remove(catalogPath)
+			dropList()
 			forget(at.key("codex.model"), at.key("codex.effort"), at.key("codex.provider"), at.key("codex.catalog"), at.key("codex.out"), at.key("codex.joined"), at.key("codex.beside"))
 			return nil
 		}
@@ -573,7 +700,7 @@ func codexIn(at place) *Agent {
 			// that. Wired so for that alone, it is marked (codex.out), for
 			// Sync to put it back beside the sign-in once the account has
 			// room again.
-			chatgpt := !api() && codexChatGPT(dir)
+			chatgpt := !api() && chatGPT()
 			if chatgpt && !out() {
 				forget(at.key("codex.out"))
 				if err := dropProvider(); err != nil {
@@ -610,7 +737,7 @@ func codexIn(at place) *Agent {
 			if err := putProvider(); err != nil {
 				return err
 			}
-			if err := edit.WriteAtomic(catalogPath, codexcat.Catalog(magpieModels("codex"))); err != nil {
+			if err := edit.WriteAtomic(catalogPath, ownList()); err != nil {
 				return err
 			}
 			// a thread started on Codex's built-in provider stays on it when
@@ -636,7 +763,7 @@ func codexIn(at place) *Agent {
 		}
 		// joined, a model of Codex's own is picked beside magpie's, as in
 		// Codex's /model: it stays connected
-		if joined() && !api() && codexChatGPT(dir) {
+		if joined() && !api() && chatGPT() {
 			if err := edit.SetTOMLTop(path, edit.KV{Path: "model", Value: v}); err != nil {
 				return err
 			}
@@ -681,7 +808,7 @@ func codexIn(at place) *Agent {
 			if err != nil {
 				return err
 			}
-			os.Remove(catalogPath)
+			dropList()
 			forget(at.key("codex.model"), at.key("codex.effort"), at.key("codex.provider"), at.key("codex.catalog"))
 			return settle()
 		},
@@ -690,7 +817,7 @@ func codexIn(at place) *Agent {
 		// was on, the one last picked in its /model (the owner: 让 Codex 记住
 		// 上次的选择), and magpie's models join its list
 		Join: func() (bool, error) {
-			if api() || !codexChatGPT(dir) || out() || isMagpie(get("model")) {
+			if api() || !chatGPT() || out() || isMagpie(get("model")) {
 				return false, nil
 			}
 			if p := get("model_provider"); p != "" && p != "openai" && !isCCSwitchMirror(p) {
@@ -726,10 +853,11 @@ func codexIn(at place) *Agent {
 			}
 			return true, settle()
 		},
-		Joined: joined,
-		Beside: beside,
-		Routed: routed,
-		OwnVia: codexOwnViaMagpie,
+		Joined:      joined,
+		Beside:      beside,
+		Routed:      routed,
+		FailingOver: failingOver,
+		OwnVia:      codexOwnViaMagpie,
 		Sync: func() error {
 			// model_provider = "magpie" left with its table gone (taken by
 			// another tool, or a hand edit), which keeps Codex from loading
@@ -744,14 +872,15 @@ func codexIn(at place) *Agent {
 				return err
 			}
 			// magpie API on one of Codex's own models, as an older magpie
-			// left it unwired: wired again, as picking it does now (#701)
-			if m := get("model"); api() && !isMagpie(m) && !asProvider() && codexOwnViaMagpie(m) != "" {
+			// left it unwired: wired again, as picking it does now (#701);
+			// not one the user disconnected, which this left the same
+			if m := get("model"); api() && !disconnected() && !isMagpie(m) && !asProvider() && codexOwnViaMagpie(m) != "" {
 				return set(m)
 			}
 			// on a magpie model by the base URL alone with no ChatGPT
 			// sign-in, as an older magpie left a Codex signed in with an
 			// API key: its picker never had magpie's models (#322)
-			if m := get("model"); isMagpie(m) && viaBase() && get("model_provider") == "" && !codexChatGPT(dir) {
+			if m := get("model"); isMagpie(m) && viaBase() && get("model_provider") == "" && !chatGPT() {
 				return set(m)
 			}
 			// the ChatGPT account ran out (of its allowance and its
@@ -761,7 +890,7 @@ func codexIn(at place) *Agent {
 			// becomes Codex's provider as set does for an account already
 			// out; and once the account has room again (or Codex is on
 			// one with room), Codex's own models join magpie's again
-			if m := get("model"); isMagpie(m) && !api() && codexChatGPT(dir) {
+			if m := get("model"); isMagpie(m) && !api() && chatGPT() {
 				switch {
 				case viaBase() && !asProvider() && out():
 					return set(m)
@@ -791,12 +920,16 @@ func codexIn(at place) *Agent {
 						return err
 					}
 				}
-				b := codexcat.Catalog(magpieModels("codex"))
+				b := ownList()
 				if cur, _ := edit.Read(catalogPath); string(cur) != string(b) {
 					if err := edit.WriteAtomic(catalogPath, b); err != nil {
 						return err
 					}
 				}
+			case failingOver():
+				// the list the gateway hands a Codex there for failover
+				// alone: its own models, without magpie's (#1385)
+				return codexStaleCache(filepath.Join(dir, "models_cache.json"), provider.CodexOwnListTag())
 			case viaBase():
 				if err := codexStaleCache(filepath.Join(dir, "models_cache.json"), provider.CodexListTag()); err != nil {
 					return err
@@ -865,10 +998,22 @@ func codexIn(at place) *Agent {
 		// model request they open
 		Reached: func(since time.Time) (time.Time, string, bool) { return codexReached(dir, since) },
 		// the app-server behind the Codex app (and every codex TUI) builds
-		// its model list once, at start-up.
+		// its model list once, at start-up. Codex 0.162's TUI attaches to a
+		// background app-server it starts once and leaves running (its
+		// daemon_auto_start, on by default on every OS), so closing every
+		// codex session keeps the old list: a new one shows Codex's own
+		// models until that daemon is restarted, while the desktop app's
+		// own app-server, restarted with the app, has magpie's (TJHHHH,
+		// luci). With no codex session on it magpie restarts it itself
+		// (codexDaemonNotice); with one, the user says when.
 		Notice: func() string {
-			if Running(`(^|/)codex( |$)`) {
-				return "Codex builds its model list at start-up — restart the Codex app (and open codex sessions) to see this."
+			if at.spell == nil {
+				if n, ok := codexDaemonNotice(path); ok {
+					return n
+				}
+			}
+			if codexRunning() {
+				return codexRestartAll
 			}
 			return ""
 		},
@@ -881,37 +1026,29 @@ func codexIn(at place) *Agent {
 			},
 			{
 				Key: "effort", Label: "effort",
-				// unset, Codex takes the model's default, as the catalog
-				// magpie wrote says it — shown as such rather than as none
-				Get: func() string {
-					if e := get("model_reasoning_effort"); e != "" {
-						return e
-					}
-					if m := get("model"); isMagpie(m) {
-						if e := catalog.Efforts(models(), m); len(e) > 0 {
-							return codexcat.DefaultEffort(e)
-						}
-					}
-					return ""
-				},
+				// unset reads as Default, which it is; the level Codex then
+				// takes is on the Default option (Takes), not the value, so
+				// picking Default doesn't read back as medium (lgtm)
+				Get: func() string { return get("model_reasoning_effort") },
 				Set: func(v string) error {
 					if v == "" {
 						return edit.DelTOMLTop(path, "model_reasoning_effort")
 					}
 					return edit.SetTOMLTop(path, edit.KV{Path: "model_reasoning_effort", Value: v})
 				},
-				Options: func(cur map[string]string) []Option {
-					if e := catalog.Efforts(models(), cur["model"]); len(e) > 0 {
-						return static(e...)
-					}
-					return static("low", "medium", "high", "xhigh")
-				},
+				// Default first, with the level Codex takes for the model
+				// when none is set, as the catalog entry it reads says it
+				Options: func(cur map[string]string) []Option { return codexEfforts(models(), cur["model"]) },
 			},
 			{
 				// Codex lists only the first few models in the spawn_agent
 				// tool it gives the model, its own ahead of magpie's, so a
 				// subagent is put on one of magpie's here, where it can't be
-				// by the model unless asked by name
+				// by the model unless asked by name. It is only the model a
+				// spawn that names none starts on: unset, the lead's own,
+				// but a lead naming another in spawn_agent gets that one
+				// (core/src/agent/child_config.rs), so the GUI says the
+				// lead picks rather than "same as model" (willz on Discord)
 				Key: "subagent", Label: "subagents", Quiet: true,
 				Get: func() string { v, _ := subagent(); return v },
 				Set: func(v string) error {
@@ -927,6 +1064,28 @@ func codexIn(at place) *Agent {
 					return dropSubEffort()
 				},
 				Options: func(map[string]string) []Option { return modelOptions(routed()) },
+			},
+			{
+				// the model magpie puts every subagent on, whatever the
+				// lead asked for in spawn_agent (willz on Discord): kept in
+				// magpie's settings, not Codex's config, since the gateway
+				// rewrites the subagent's request. Only a ChatGPT account's
+				// models are offered: a subagent's task is sealed for them
+				Key: "subagent_model", Label: "subagent model", Quiet: true,
+				Get: provider.CodexSubagentModel,
+				Set: provider.SetCodexSubagentModel,
+				Options: func(map[string]string) []Option {
+					var out []Option
+					for _, e := range provider.CodexSubagentModels() {
+						note := e.Provider.Name + " · via magpie"
+						if a := e.Provider.Account; a != nil && a.User != "" {
+							note = a.User + " · via magpie"
+						}
+						out = append(out, Option{Value: e.ID, Label: e.Name, Note: note, Icon: e.Provider.Icon,
+							Group: e.Provider.Name, Ref: e.ID, Context: e.Context})
+					}
+					return out
+				},
 			},
 			{
 				// [agents] default_subagent_reasoning_effort: unset, a
@@ -1023,6 +1182,15 @@ func codexIn(at place) *Agent {
 // into Codex's config: "custom", and "cc-switch", "cc-switch-2"… from its
 // older versions. Its "cc-switch-official" is its own proxy to OpenAI.
 var ccSwitchProvider = regexp.MustCompile(`^(custom|cc-switch(-[0-9]+)?)$`)
+
+// codexBuiltinProvider is the providers Codex has built in, which a thread
+// can name with no table in config.toml (codex-rs model-provider-info:
+// built_in_model_providers); "ollama-chat" is one it no longer has, and
+// tells the user how to fix itself.
+var codexBuiltinProvider = map[string]bool{
+	"openai": true, "amazon-bedrock": true, "amazon-bedrock-runtime": true,
+	"ollama": true, "lmstudio": true, "ollama-chat": true,
+}
 
 func contains(xs []string, x string) bool {
 	for _, v := range xs {
@@ -1263,10 +1431,42 @@ func codexFailover() bool {
 	return false
 }
 
+// CodexOwnOnly reports whether the Codex that asks the gateway for its
+// model list there (/backend-api/codex/models) reaches magpie for account
+// failover alone (FailingOver), to be handed only its own models (#1385).
+// That is this machine's Codex; a request doesn't say whether it came from
+// a Codex in a WSL distro instead, so one there connected to magpie (what
+// magpie set on it, or its joined/beside mark in the stash) keeps magpie's
+// models in the list. No distro is probed for it.
+func CodexOwnOnly() bool {
+	home, err := os.UserHomeDir()
+	if err != nil || !codex(home).FailingOver() {
+		return false
+	}
+	appliedMu.Lock()
+	set := appliedLoad()
+	appliedMu.Unlock()
+	for id := range set {
+		if strings.HasPrefix(id, "codex@wsl:") {
+			return false
+		}
+	}
+	// a distro's name may have dots of its own (Ubuntu-24.04)
+	for k, v := range stashLoad() {
+		if strings.HasPrefix(k, "codex@wsl:") && v == "1" && (strings.HasSuffix(k, ".joined") || strings.HasSuffix(k, ".beside")) {
+			return false
+		}
+	}
+	return true
+}
+
 // codexChatGPT reports whether Codex is signed in to a ChatGPT account:
 // its built-in provider then runs and asks for the model list at
 // openai_base_url. Signed in with an API key alone, it asks for none.
 func codexChatGPT(dir string) bool {
+	if settings.AccountDiscoveryOff() {
+		return false
+	}
 	var a struct {
 		Tokens struct {
 			Access string `json:"access_token"`

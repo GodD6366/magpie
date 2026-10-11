@@ -119,19 +119,33 @@ func gatewayKeysTo(out io.Writer, args []string) error {
 //
 //	magpie gateway-key limit <id>                       what it has used of its limit
 //	magpie gateway-key limit <id> off                   no limit
-//	magpie gateway-key limit <id> day|week|month [--tokens N] [--cost USD] [--cache-reads]
+//	magpie gateway-key limit <id> day|week|month|<N>d [--tokens N] [--cost USD] [--cache-reads]
+//	magpie gateway-key limit <id> reset                 count from 0 again, a new N-day cycle from now (#1509)
 func gatewayKeyLimit(out io.Writer, args []string) error {
-	usage := fmt.Errorf("usage: magpie gateway-key limit <id> [off | day|week|month [--tokens N] [--cost USD] [--cache-reads]]")
+	usage := fmt.Errorf("usage: magpie gateway-key limit <id> [off | reset | day|week|month|<N>d [--tokens N] [--cost USD] [--cache-reads]]")
 	if len(args) == 0 {
 		return usage
 	}
 	id := args[0]
 	if len(args) > 1 {
 		var lim *access.Limit
-		if args[1] != "off" {
+		if args[1] == "reset" {
+			if len(args) > 2 {
+				return usage
+			}
+			if _, err := access.Update("reset-limit-key", access.Change{Key: id}); err != nil {
+				return err
+			}
+		} else if args[1] != "off" {
 			lim = &access.Limit{Period: args[1]}
-			if !slices.Contains(access.Periods, lim.Period) {
-				return fmt.Errorf("a limit's period is day, week or month, not %q", lim.Period)
+			if n, ok := strings.CutSuffix(args[1], "d"); ok {
+				days, err := strconv.Atoi(n)
+				if err != nil || days < 1 || days > access.MaxDays {
+					return fmt.Errorf("an N-day cycle is a whole number of days from 1 to %d, like 10d: %q", access.MaxDays, args[1])
+				}
+				lim = &access.Limit{Period: "days", Days: days}
+			} else if !slices.Contains(access.Periods, lim.Period) || lim.Period == "days" {
+				return fmt.Errorf("a limit's period is day, week, month or <N>d (every N days), not %q", lim.Period)
 			}
 			rest := args[2:]
 			for i := 0; i < len(rest); i++ {
@@ -177,8 +191,10 @@ func gatewayKeyLimit(out io.Writer, args []string) error {
 		} else if len(args) > 2 {
 			return usage
 		}
-		if _, err := access.Update("limit-key", access.Change{Key: id, Limit: lim}); err != nil {
-			return err
+		if args[1] != "reset" {
+			if _, err := access.Update("limit-key", access.Change{Key: id, Limit: lim}); err != nil {
+				return err
+			}
 		}
 	}
 	keys, err := access.List()
@@ -197,7 +213,7 @@ func gatewayKeyLimit(out io.Writer, args []string) error {
 	}
 	w := tabwriter.NewWriter(out, 0, 4, 2, ' ', 0)
 	fmt.Fprintf(w, "Key\t%s (%s)\n", k.Name, k.ID)
-	fmt.Fprintf(w, "Window\tthis %s, %s – %s (local time)\n", st.Period, st.Start.Format("2006-01-02 15:04"), st.Reset.Format("2006-01-02 15:04"))
+	fmt.Fprintf(w, "Window\tthis %s, %s – %s (local time)\n", (&access.Limit{Period: st.Period, Days: st.Days}).Per(), st.Start.Format("2006-01-02 15:04"), st.Reset.Format("2006-01-02 15:04"))
 	if st.TokenLimit > 0 {
 		counted := "input, output and cache writes"
 		if st.CacheReads {
@@ -274,7 +290,11 @@ func limitWords(k access.Key, now time.Time) string {
 	if st.CostLimit > 0 {
 		parts = append(parts, fmt.Sprintf("$%.2f/$%.2f", st.Cost, st.CostLimit))
 	}
-	s := strings.Join(parts, " ") + " per " + st.Period
+	per := " per " + st.Period
+	if st.Period == "days" {
+		per = fmt.Sprintf(" every %d days", st.Days)
+	}
+	s := strings.Join(parts, " ") + per
 	if st.Spent {
 		s += " (spent until " + st.Reset.Format("01-02 15:04") + ")"
 	}

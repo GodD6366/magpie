@@ -45,6 +45,13 @@ literal custom names and narrow layouts in Chinese and English on both engines.
 Sharing off keeps the original API-key field and hides the gateway-key picker;
 sharing on names the arbitrary local option separately from the Magpie key.
 
+`connect-address-kept.test.cjs` checks that the address and gateway key
+picked in Connect, and the address picked under Share on local network, are
+kept across a reload (a restart or an update opens the page again; coeo91 on
+Discord). With no local network address yet, this computer's is shown, and
+the pick comes back once the address does. It runs on both engines, at 1100
+and 420 wide, in every language.
+
 `gateway-takeover.test.cjs` checks the Gateway card's button: with an older
 magpie serving the gateway it reads "Quit magpie {v} and take over" and posts
 `/api/gateway/take-over`; once this magpie serves it is "Restart gateway" and
@@ -101,7 +108,12 @@ English and Chinese on Chromium and WebKit. It covers title aliases, literal
 unknown names, unmarked records, pagination and totals, combined failure
 filters and CSV export, route navigation, session grouping, historical days
 and the narrow layout. Routing also covers keyboard dismissal and clearing
-the purpose while keeping the selected day and session grouping. It uses
+the purpose while keeping the selected day and session grouping. Checkbox
+selection also covers combining purposes, immediate updates without closing
+or scrolling, keyboard toggling, restoring all purposes and returning focus
+to the purpose button when All purposes closes the menu, and retaining the
+union through history, session grouping and matching route navigation, in
+English, Simplified/Traditional Chinese, Japanese and German at narrow widths. It uses
 isolated API fixtures. Run with
 `node --test internal/gui/tests/purpose-filter.test.cjs` and the Playwright
 environment described below.
@@ -340,6 +352,18 @@ level picked is posted for `subagent_effort` alone and lights the square.
 Claude Code's subagents (#468) get no square until it runs through magpie
 (nothing to pick), and one that says "same as model" once it does.
 
+`codex-subagents-lead.test.cjs` draws Codex's subagents square (willz on
+Discord) in Chromium and WebKit, in English, Chinese, Traditional Chinese,
+Japanese and German, at 1100px and 560px. Codex's lead may name a model in
+spawn_agent, and that overrides `default_subagent_model`. So the unset square
+reads "the lead's pick, else same as model" (「由主代理自选，未指定时同主模型」)
+and its title says how to make every subagent use one model. This holds on
+the local row and on a WSL row. The picker opens on "Lead's pick", with the
+model and "unless the lead names another" beside it. Picking a model posts
+`subagent`, and the square still carries the hint. Clicking the first entry
+unsets it again. A click doesn't scroll the page. Claude Code's subagents
+still say "same as model".
+
 `tier-effort.test.cjs` draws Claude Code's per-tier effort (#536) in Chromium
 and WebKit, English and Chinese: no tier's effort is a field of its own; the
 tiers' square lists each tier's model and then its effort (the bars, and "the
@@ -530,12 +554,23 @@ each language), with the story telling whose share went first, while keys
 under Smart keep Smart's chip and the keys' own mode line. It runs in
 English, Chinese, Japanese and German on Chromium and WebKit.
 
+`routing-mode-goes.test.cjs` checks where the stage's routing chip leads
+(xczzhh on X: it always said Smart and nothing changed it). With one key
+on, the chip and the Accounts and keys heading name no routing and the mode
+paragraph says how to get one. With a provider over two keys, the chip and
+the heading are a way to its row under Several accounts or keys: a click
+or Enter brings it into view, marks it and focuses its routing. It runs in
+every language on Chromium and WebKit, at 1100px and 420px.
+
 `balance-fix.test.cjs` opens a custom provider whose balance token sits
 beside new-api's `/api/usage/token` (and a new one with a token and no
 Balance URL): the editor says so, one click moves it to `/api/user/self`
 with the quota as its field, the New-Api-User header is asked for until it
 is typed, Check balance asks as the form has it and says the fix plainly,
-and the Usage page's card does too.
+and the Usage page's card does too. It also holds the card's own words for
+a ZCode account with nothing left to spend (#1001): a Start Plan that has
+ended is said as that, while one that couldn't be read stays "Allowance
+unavailable" — the two are not the same thing.
 
 `balance-field-default.test.cjs` leaves a custom provider's Balance field
 empty (#881): its placeholder is the field magpie reads from a Balance URL
@@ -611,7 +646,8 @@ session opened draws its latest request's window in 400 cells without moving
 the page, a cell hovered names its part and what is largest in it, and the
 Tools tab of the contents lists only tools; nothing scrolls sideways — in
 Chromium and WebKit, in English, Chinese, Japanese and German, at 1100px and
-420px.
+420px. With the state answering after the history, the cards drawn by the
+agents' ids take their names once it is in, though the history is the same.
 
 `tray-usages.test.cjs` picks several of the Usage page's cards for the menu
 bar in Settings: the menu keeps open as Codex and Claude Code are ticked
@@ -1038,6 +1074,15 @@ request is asked for by its session and the span it took, a call of a session fi
 at its own time; a request the files can't tell says why (no session, an agent whose
 files aren't read, no such call); a row opened again, or the list read anew, asks no
 more; the details fit the table's box at 560; in English and Chinese.
+
+`usage-ledger-abort.test.cjs` narrows the Requests tab three times while
+each read is still on its way (Vantiboo1ean, ~750k requests): the reads of the
+page and of the heatmap no longer wanted are cancelled, not left holding the
+browser's connections; Refresh pressed while the page is read sends no second
+read and turns until that one answers; the newest answer is drawn and a
+cancelled read is never said as an error; a refresh afterwards reads afresh.
+Chromium and WebKit, at 1180 and 560. `MAGPIE_ASSETS` points it at an older
+assets directory to see it fail there.
 
 `shared-skills.test.cjs` opens the Library's Skills tab with skills found in
 the user-wide `~/.agents/skills` (#227): one row for a skill there that
@@ -1734,6 +1779,14 @@ about the gateway: loopback, open to the network (listening beyond loopback
 with nothing shared), and a network address that needs an enabled gateway
 key. English and Chinese, Chromium and WebKit, with `/api/plugins` faked.
 
+`public-url-default.test.cjs` checks that Connect starts at MAGPIE_PUBLIC_URL,
+labelled Public address, with the snippets on it, until an address is
+picked, and that a pick (this computer's) is kept after a reload (#1551).
+About shows the public URL beside the local one; magpie web shows it as the
+gateway's address and the MCP server's, the app keeps those local. Without
+MAGPIE_PUBLIC_URL Connect starts at this computer's. Every language,
+Chromium and WebKit, at 1100 and 420 wide.
+
 `provider-picks-stay.test.cjs` checks that the models picked in one
 provider's editor never go to another's (#464): a Refresh or a Forget whose
 list comes back after the editor was left for another provider's leaves that
@@ -1901,6 +1954,20 @@ control where it was on the screen. It runs in Chromium and WebKit, in
 English and Chinese:
 node --test internal/gui/tests/list-sort.test.cjs
 
+`quota-name-translated.test.cjs` holds the rule that a window's name is
+what magpie translates while its display is shown as it came (#1001): a
+plugin that puts its sentence in the display keeps the card English in
+every language, as the ZCode plugin's claim line did. The fixture is that
+line with its name a sentence magpie knows and a display of the plugin's
+own ("1 · ZCode Trust Build"); the name reads in the language and the
+count and plan name do not. It covers every language magpie has (en, zh,
+zh-TW, ja, de), and each is rendered at 440, 560 and 1000px in Chromium
+and WebKit — a translated name is a sentence, and `.quota-labels > span`
+is nowrap with no ellipsis, so one wider than its `.quota` is cut off
+mid-word in silence. 440 is the narrowest the card is seen at and 560 the
+window minimum; 1000 alone could never catch a name that is too wide:
+node --test internal/gui/tests/quota-name-translated.test.cjs
+
 `quota-pools.test.cjs` checks Antigravity's allowance a row a pool of
 models, each with its 5-hour and its weekly window (a user on Discord: the
 three models read the same, show the 5 hours and the week left): windows
@@ -1994,6 +2061,18 @@ aligned list bottoms, account model labels, and no horizontal overflow at
 node --test internal/gui/tests/routing-columns.test.cjs
 ```
 
+`routing-scroll-end.test.cjs` wheels the Routing page to its end while the
+trace redraws it, at 440x620, 600x700, 900x500, 1200x600 and 1400x700, and
+checks that it stays there (#1249: in WebKit, container queries pulled it
+back). It also checks the stage, request and column layouts that those
+widths select. `context-scroll-end.test.cjs` does the same on Usage's
+Context tab, with a session open, across its timed reads. Both run in
+English and Chinese, on Chromium and WebKit.
+
+```sh
+node --test internal/gui/tests/routing-scroll-end.test.cjs internal/gui/tests/context-scroll-end.test.cjs
+```
+
 ## Automatic Codex title grouping
 
 `routing-sessions.test.cjs` checks automatic grouping after a Codex title write,
@@ -2025,6 +2104,16 @@ of its own (Cindy) on the Agents page: a line under its name says whether
 magpie is added (green once it is), its button stands where the other rows'
 model picker does, as wide and lined up with it at 960 and 700px, and a click
 opens the app's link. English and Chinese, Chromium and WebKit.
+
+`omp-profile-connect.test.cjs` checks an omp named profile's switch (#1187):
+clicking **omp · work** posts `/api/agents/connect/omp%23work`, not a path the
+browser cuts at `#`. A query string on the same page (`/api/usage?period=today`)
+stays a query. English, Chromium and WebKit. The API is faked. Without the `#`
+encoding in `api()` the posted path is `/api/agents/connect/omp`.
+
+```sh
+node --test internal/gui/tests/omp-profile-connect.test.cjs
+```
 
 `privacy-hides-accounts.test.cjs` checks that Privacy's Mask personal data
 hides the accounts on screen too (inaction on Discord): until Hide accounts is
@@ -2135,3 +2224,20 @@ keys it matches, the routing header in the other language after
 `setLocale`, the plugins listings arriving while the reader types. In
 English, Chinese, Japanese and German, at 1100px and 440px. `MAGPIE_FILTER_ASSETS` points it
 at another assets folder, to see it fail on the old code.
+
+## Volcengine Ark access key
+
+`volc-access-key.test.cjs` covers #1427: an Ark provider's editor (saved or
+being added) asks for the account's AccessKey ID and Secret Access Key, which
+the Usage page reads the Coding or Agent Plan's windows with. The saved Secret
+is never in the page: only that one is saved, as the placeholder. Save posts
+the ID and a Secret only when a new one was typed; Remove posts
+`clearAccessKey`; an ID with no Secret is refused before anything is posted.
+A relay and DeepSeek have neither field and post none. Every string is in
+zh, zh-TW, ja and de. English and Chinese, Chromium and WebKit.
+`TestProviderSaveKeepsVolcengineSecret` checks the server side.
+
+```sh
+node --test internal/gui/tests/volc-access-key.test.cjs
+go test -tags nogui ./internal/gui -run TestProviderSaveKeepsVolcengineSecret
+```

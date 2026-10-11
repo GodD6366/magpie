@@ -77,7 +77,7 @@ func webSearchOf(e provider.Entry, magpie bool) string {
 			}
 		}
 	}
-	if magpie || provider.KimiCodeSearch(p) != "" || googleAccount(p) && searcherModel(p) != "" {
+	if magpie || searchesOwn(p) {
 		return searchMagpie
 	}
 	return ""

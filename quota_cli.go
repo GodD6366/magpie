@@ -98,7 +98,9 @@ func quotaCmd(args []string) error {
 			only = append(only, strings.ToLower(a))
 		}
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	// magpie quota is the user asking: read even when allowances are read
+	// only when asked (#1518)
+	ctx, cancel := context.WithTimeout(provider.Asked(context.Background()), 15*time.Second)
 	defer cancel()
 	qs := []provider.Quota{}
 	provider.AskClaudeUsage()
@@ -191,7 +193,7 @@ func quotaResetCmd(args []string) error {
 			user = a
 		}
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	ctx, cancel := context.WithTimeout(provider.Asked(context.Background()), 20*time.Second)
 	defer cancel()
 	// what the account holds, and whose it is when none was named
 	var held *provider.SubscriptionQuota
@@ -431,7 +433,12 @@ func quotaTitle(q provider.Quota) string {
 	if s := provider.PlanTerm(q.Until, q.Renew); s != "" {
 		t += " · " + s
 	}
-	if q.User != "" {
+	switch {
+	case q.Alias != "" && q.User != "":
+		t += " · " + q.Alias + " (" + q.User + ")"
+	case q.Alias != "":
+		t += " · " + q.Alias
+	case q.User != "":
 		t += " · " + q.User
 	}
 	return t
@@ -439,7 +446,7 @@ func quotaTitle(q provider.Quota) string {
 
 func quotaMatches(q provider.Quota, only []string) bool {
 	for _, o := range only {
-		if strings.EqualFold(q.Provider, o) || strings.EqualFold(q.Name, o) || strings.EqualFold(q.Kind, o) {
+		if strings.EqualFold(q.Provider, o) || strings.EqualFold(q.Name, o) || strings.EqualFold(q.Kind, o) || (q.Alias != "" && strings.EqualFold(q.Alias, o)) {
 			return true
 		}
 		// a remote magpie's card: by the remote ("office", or its name)

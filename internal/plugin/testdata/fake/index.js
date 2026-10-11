@@ -79,11 +79,23 @@ export const FakePlugin = async ({ client }) => ({
       },
     }
     // $FAKE_RESPONSES: one model more, on OpenAI's Responses (Grok's)
-    // $FAKE_FAST: fake-1 has a fast one, as a Cursor model has its -fast
-    if (process.env.FAKE_FAST) cfg.provider[ID].models["fake-1-fast"] = { name: "Fake One Fast", limit: { context: 1000, output: 100 } }
+    // $FAKE_FAST=1: fake-1 has a fast one, as Cursor's plugin 0.1.x lists
+    // a model's -fast (=tier: see the models hook)
+    if (process.env.FAKE_FAST === "1") cfg.provider[ID].models["fake-1-fast"] = { name: "Fake One Fast", limit: { context: 1000, output: 100 } }
     if (process.env.FAKE_RESPONSES) cfg.provider[ID].models["fake-resp"] = { name: "Fake Responses", provider: { npm: "@ai-sdk/openai" }, limit: { context: 4000, output: 400 } }
+    // $FAKE_GROK: a Grok model on Responses, as Grok's plugin serves it
+    if (process.env.FAKE_GROK) cfg.provider[ID].models["grok-4.7"] = { name: "Grok 4.7", provider: { npm: "@ai-sdk/openai" }, limit: { context: 4000, output: 400 } }
     // $FAKE_DEEPSEEK: a DeepSeek model, as Cline's cline-pass/deepseek-v4-pro
     if (process.env.FAKE_DEEPSEEK) cfg.provider[ID].models["deepseek-v4-pro"] = { name: "DeepSeek V4 Pro", limit: { context: 1000, output: 100 } }
+    // $FAKE_DECIDE: the provider serves a decision API too (#1514), asked
+    // at its base /systemone through the loader's fetch: fake-clef is a
+    // decision model it marks, jev-9 one magpie knows by its name.
+    // "models" marks them without saying decide.
+    if (process.env.FAKE_DECIDE) {
+      if (process.env.FAKE_DECIDE !== "models") cfg.provider[ID].decide = true
+      cfg.provider[ID].models["fake-clef"] = { name: "Fake Clef", decides: true, limit: { context: 1000, output: 0 } }
+      cfg.provider[ID].models["jev-9"] = { name: "Jev 9", limit: { context: 1000, output: 0 } }
+    }
     // $FAKE_OFF: a model that stops thinking at none and one that can't,
     // as Factory's plugin has Kimi K3 and GLM-5.3 (#899)
     if (process.env.FAKE_OFF) {
@@ -226,6 +238,17 @@ export const FakePlugin = async ({ client }) => ({
       if (p.models["fake-claude"]) Object.assign(p.models["fake-claude"], { rate: 0.5, rateWas: 1 })
       if (p.models["fake-gemini"]) p.models["fake-gemini"].rate = "x0.03"
       if (auth?.key === "few") return { "fake-1": p.models["fake-1"] }
+      // $FAKE_DECIDE: one more decision model, marked on the list the hook
+      // gives, as a plugin that reads its vendor's list marks one
+      if (process.env.FAKE_DECIDE) p.models["fake-judge"] = { ...p.models["fake-1"], id: "fake-judge", name: "Fake Judge", api: { ...p.models["fake-1"].api, id: "fake-judge" }, free: false, decides: true }
+      // $FAKE_FAST=tier: as Cursor's plugin 0.2.x lists a model, once per
+      // context size, and from 0.2.2 says fast on the sizes Cursor has a
+      // fast variant at (Opus 5.5's 300k, not its 1m); no -fast model
+      if (process.env.FAKE_FAST === "tier") {
+        const sized = (id, name) => ({ ...p.models["fake-1"], id, name, api: { ...p.models["fake-1"].api, id } })
+        p.models["fake-opus@300k"] = { ...sized("fake-opus@300k", "Fake Opus @ 300k"), fast: true }
+        p.models["fake-opus@1m"] = sized("fake-opus@1m", "Fake Opus @ 1m")
+      }
       // $FAKE_MODELS: the vendor's list, whose answer names one more model
       if (process.env.FAKE_MODELS && auth) {
         const r = await fetch(process.env.FAKE_MODELS).then((r) => r.text()).catch((e) => {

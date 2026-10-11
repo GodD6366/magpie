@@ -16,10 +16,13 @@ const ruleUsage = `usage:
   magpie group rule <group>               the group's rules
   magpie group rule add <group> use=<model> [tokens=<n>] [images] [effort=on|low|medium|high|xhigh|max] [agents=a,b…]
                         [intent="<what the message asks for>"] [compact] [time=HH:MM-HH:MM] [days=mon-fri]
-                        [classifier=<model>] [at=<n>]
+                        [folders=<folder>,…] [classifier=<model>] [at=<n>]
                                           a rule: a turn that matches it goes to <model>, one of the group's
                                           (or group/<id>, a group in it), first; a model in the group at an
                                           effort of its own is named with it (use=glm/glm-5.3-flash:high)
+  magpie group rule add <group> pause=<model> [time=HH:MM-HH:MM] [days=mon-fri] [agents=a,b…] [at=<n>]
+                                          a pause: while it holds, <model> is left out of the group — sent
+                                          nothing, not even when the others fail or a conversation was on it
   magpie group rule rm <group> <n>        remove rule n
   magpie group rule mv <group> <n> <to>   move rule n to place <to>
   magpie group rule classifier <group> <model>
@@ -28,6 +31,8 @@ const ruleUsage = `usage:
 
   Rules are looked at top first when you send a message (a new turn); the first that
   matches puts its model first, and the group's others stay behind it if it fails.
+  A pause is looked at on every request and leaves its model out while it holds; its
+  conditions are time, days and agents only.
   The agent's tool results within the turn stay with the model the turn began on.
   Every condition given must hold:
   tokens   the request is at least this long (200000, 200k, 1m): estimated from its size, or
@@ -47,12 +52,19 @@ const ruleUsage = `usage:
            runs past midnight) — a provider's peak-price hours sent to another, say
   days     only on these days (mon-fri, sat,sun); with time, a window past midnight is of the day it
            begins on. Days alone hold all day
+  folders  the agent works in one of these folders, or a folder inside one (~/work/acme, ~/oss;
+           C:\work, which is /mnt/c/work in WSL): a project, or every project under a folder. The
+           folder is the one the agent tells its model in the request (Claude Code, Codex, OpenCode,
+           Pi); a request that doesn't tell it matches no folder. Quote a folder with a space:
+           folders="~/My Project,~/oss"
 
   e.g. magpie group rule add opus-anywhere use=openrouter/google/gemini-3-pro tokens=200k
        magpie group rule add opus-anywhere use=a/vision-model images
        magpie group rule add fast use=codex/gpt-5.6-sol:xhigh effort=high
        magpie group rule add opus-anywhere use=deepseek/deepseek-v4-flash compact
        magpie group rule add cheap use=glm/glm-5.3 time=14:00-18:00 days=mon-fri
+       magpie group rule add cheap pause=glm/glm-5.3 time=14:00-18:00 days=mon-fri
+       magpie group rule add opus-anywhere use=kimi/kimi-k2.6 folders=~/oss
        magpie group rule add opus-anywhere use=deepseek/deepseek-v4-flash intent="a quick question" classifier=groq/llama-3.1-8b-instant`
 
 // parseTokens reads 200000, 200k, 1.5m.
@@ -167,6 +179,9 @@ func ruleCmd(args []string) error {
 
 // ruleLine is a rule as magpie group shows it.
 func ruleLine(r provider.Rule) string {
+	if r.Pause {
+		return strings.Join(r.Conditions(), " · ") + muted.Render(" → pause ") + r.Use
+	}
 	return strings.Join(r.Conditions(), " · ") + muted.Render(" → ") + r.Use
 }
 

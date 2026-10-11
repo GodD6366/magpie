@@ -611,6 +611,15 @@ func siwcBody(body []byte) []byte {
 			}
 		}
 	}
+	// the conversation is named, as on a Codex account: OpenAI keeps a
+	// ChatGPT sign-in's cached prompt by it (#933)
+	if k, _ := m["prompt_cache_key"].(string); k == "" {
+		own, _ := m["instructions"].(string)
+		input, _ := m["input"].([]any)
+		if k = conversationKey(own, input); k != "" {
+			m["prompt_cache_key"] = k
+		}
+	}
 	if tools, ok := m["tools"].([]any); ok {
 		if tools = siwcOwnTools(tools); len(tools) == 0 {
 			delete(m, "tools")
@@ -701,12 +710,15 @@ func siwcExplain(status int, body []byte) string {
 func siwcProvider(l Login) Provider {
 	user := l.User
 	a := &Account{Agent: ChatGPTAPIID, User: user, Plan: l.Plan, Stream: true}
-	a.sign = func(ctx context.Context, req *http.Request, _ []byte) error {
+	a.sign = func(ctx context.Context, req *http.Request, body []byte) error {
 		c, err := siwcFresh(ctx, user, false)
 		if err != nil {
 			return err
 		}
 		req.Header.Set("Authorization", "Bearer "+c.Access)
+		if body != nil {
+			sessionHeaders(req.Header, body)
+		}
 		return nil
 	}
 	a.body = siwcBody

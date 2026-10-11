@@ -9,6 +9,7 @@ package gateway
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"fmt"
 	"net/http"
 	"slices"
 	"strings"
@@ -39,6 +40,9 @@ type RuleHit struct {
 	Tokens int    `json:"tokens"`           // how long the request was taken to be
 	Images bool   `json:"images,omitempty"` // it carries an image
 	Effort string `json:"effort,omitempty"` // the reasoning asked for: a level, or "on"
+	// Folder: the working folder the agent said, looked at when a rule
+	// is by folder; "" when it said none
+	Folder string `json:"folder,omitempty"`
 	// Unready: the member the rule names has nobody to take it now, and
 	// the group routes the request as it would without the rule.
 	Unready bool `json:"unready,omitempty"`
@@ -163,7 +167,10 @@ func ruleFor(key string, g provider.Group, ms []provider.Member, req *Request, a
 	if had && tr.input > q.Tokens {
 		q.Tokens = tr.input // what the vendor counted last, a floor: the conversation only grew since
 	}
-	hit := &RuleHit{Turn: turn, Tokens: q.Tokens, Images: q.Images, Effort: q.Effort, Bare: len(g.Rules) == 0}
+	if slices.ContainsFunc(g.Rules, func(r provider.Rule) bool { return len(r.Folders) > 0 }) {
+		q.Folder = workDir(req)
+	}
+	hit := &RuleHit{Turn: turn, Tokens: q.Tokens, Images: q.Images, Effort: q.Effort, Folder: q.Folder, Bare: len(g.Rules) == 0}
 	defer func() {
 		// whatever put a member first, the rules after it that match too
 		// say who comes next
@@ -589,4 +596,18 @@ func anyImageInput(a, b *bool) *bool {
 		return a
 	}
 	return nil
+}
+
+// pausedError tells an agent that every model of the group it asked for
+// is paused now, by which rules and when.
+func pausedError(asked string, paused []provider.Paused) string {
+	var bits []string
+	for _, p := range paused {
+		by := fmt.Sprintf("rule %d", p.Rule)
+		if p.Group != "" {
+			by = fmt.Sprintf("rule %d of %s", p.Rule, p.Group)
+		}
+		bits = append(bits, fmt.Sprintf("%s (%s: %s)", p.Member, by, strings.Join(p.When, " · ")))
+	}
+	return fmt.Sprintf("every model of %s is paused now by its rules: %s; change the rules on Magpie's Routing page, or ask again when they end", asked, strings.Join(bits, ", "))
 }

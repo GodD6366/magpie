@@ -43,6 +43,9 @@ var Vars = []string{
 	// Pi and its forks (OmO, Senpi), whose profile and config are apart
 	"PI_CODING_AGENT_DIR", "PI_CODING_AGENT_SESSION_DIR", "PI_CONFIG_DIR", "PI_PROFILE",
 	"OMO_CODING_AGENT_DIR", "SENPI_CODING_AGENT_DIR",
+	"PRIME_AGENT_CODING_AGENT_DIR",
+	// StepCode: config root resolution and folder overrides
+	"STEP_CODING_AGENT_DIR", "STEPCODE_CONFIG_DIR",
 	// omp
 	"OMP_PROFILE",
 	// Qoder's two builds, the global site's and China's
@@ -51,9 +54,19 @@ var Vars = []string{
 	"GROK_HOME", "GROK_BIN_DIR",
 	// Kimi Code and its shared folder
 	"KIMI_CODE_HOME", "KIMI_SHARE_DIR",
+	// Qwen Code's home, ~/.qwen without it
+	"QWEN_HOME",
+	// Ante
+	"ANTE_HOME",
+	// AstrBot's root, the folder holding its data/ (else ~/.astrbot, the desktop app's)
+	"ASTRBOT_ROOT",
+	// jcode's folder, ~/.jcode without it
+	"JCODE_HOME",
 	// MiMo Code, MiniMax Code, OpenHanako, Hermes, dsh, WorkBuddy, CodeBuddy Code
 	"MIMOCODE_HOME", "MINIMAX_DATA_DIR", "HANA_HOME", "HERMES_HOME", "DSH_HOME",
 	"WORKBUDDY_CONFIG_DIR", "CODEBUDDY_CONFIG_DIR",
+	// alma-server's data folder (Alma without a desktop, on Linux)
+	"ALMA_DATA_DIR",
 	// Reasonix Studio and its native CLI share this config home
 	"REASONIX_HOME",
 	// Mister Morph's config file
@@ -62,6 +75,8 @@ var Vars = []string{
 	"T3CODE_HOME",
 	// AtomCode's config folder
 	"ATOMCODE_HOME",
+	// Snow CLI's config folder, ~/.snow without it
+	"SNOW_CONFIG_DIR",
 	// Cursor's CLI: its config folder (its chats) and its data folder
 	"CURSOR_CONFIG_DIR", "CURSOR_DATA_DIR",
 	// OpenClaw's home, state folder, config file and read-only policy
@@ -72,6 +87,12 @@ var Vars = []string{
 	// Droid's home, Windsurf's API server, ZCode's credential seed: what
 	// makes an account or an installation visible that the test didn't make
 	"FACTORY_HOME_OVERRIDE", "WINDSURF_API_SERVER_URL", "ZCODE_CREDENTIAL_SECRET",
+	// nvm's and fnm's folders, which hold the Node versions an agent's CLI
+	// is installed under, and which of them a terminal uses
+	"NVM_DIR", "FNM_DIR",
+	// Google Cloud's credentials file and gcloud's folder, which Vertex AI's
+	// tokens are minted from (and Gemini CLI's own, on Vertex AI)
+	"GOOGLE_APPLICATION_CREDENTIALS", "CLOUDSDK_CONFIG",
 }
 
 // NotPaths are the Vars that name no folder or file under the working
@@ -83,6 +104,7 @@ var NotPaths = map[string]bool{
 	"PI_PROFILE": true, "OMP_PROFILE": true,
 	"WINDSURF_API_SERVER_URL": true, "ZCODE_CREDENTIAL_SECRET": true,
 	"PI_CONFIG_DIR": true, "OPENCODE_DB": true,
-	"MAGPIE_ZED_BIN": true, "MAGPIE_ZED_PROCESS_NAMES": true,
+	"STEPCODE_CONFIG_DIR": true,
+	"MAGPIE_ZED_BIN":      true, "MAGPIE_ZED_PROCESS_NAMES": true,
 	"OPENCLAW_CONFIG_READONLY": true, "OPENCLAW_NIX_MODE": true,
 }

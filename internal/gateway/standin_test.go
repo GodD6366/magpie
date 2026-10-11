@@ -58,6 +58,83 @@ func TestCodexAutoReviewStandIn(t *testing.T) {
 	}
 }
 
+// Adam on Discord: Codex's auto-review was answered 404 magpie knows no
+// model "codex-auto-review". Codex's config may name its model as a routing
+// group's bare name (or Codex's spelling of a group's model, #750), which
+// its turns reach; the review stood in for by that name reaches the group
+// too. And a Codex whose config magpie doesn't read as on magpie (another
+// provider table, a profile, its own CODEX_HOME, another computer) has its
+// review go to the model its turns went to, as Codex reviews on the
+// conversation's model; before any turn it is still turned away.
+func TestCodexAutoReviewReachesItsTurnsModel(t *testing.T) {
+	setHome(t, t.TempDir())
+	f := &fake{t: t}
+	setup(t, provider.Chat, f)
+	p, _ := provider.Find("fake")
+	p.Models = []string{"m1", "m2"}
+	if err := provider.Save(*p); err != nil {
+		t.Fatal(err)
+	}
+	if err := provider.SaveGroup(provider.Group{ID: "my-group", Name: "Mine", Members: []string{"fake/m2"}, Routing: provider.Ordered}); err != nil {
+		t.Fatal(err)
+	}
+	ask := func(s *Server, model string, review bool) *httptest.ResponseRecorder {
+		f.got = nil
+		f.reply = sse(
+			`data: {"id":"c1","choices":[{"index":0,"delta":{"content":"ok"}}]}`,
+			`data: {"id":"c1","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":1}}`,
+			`data: [DONE]`)
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest("POST", "/v1/responses", strings.NewReader(`{"model":"`+model+`","input":"review this","stream":true}`))
+		req.Header.Set("User-Agent", "codex_cli_rs/0.162.0 (Mac OS 26.2.0; arm64) Apple_Terminal/455")
+		// Codex, known here by its token, as the agents package isn't
+		// there to name its User-Agent
+		req.Header.Set("Authorization", "Bearer "+TokenFor("codex"))
+		if review {
+			req.Header.Set("x-openai-subagent", "guardian")
+		}
+		s.Handler().ServeHTTP(rec, req)
+		return rec
+	}
+	t.Cleanup(func() { StandIn = nil })
+
+	// a config magpie doesn't read as Codex's on magpie: no stand-in
+	StandIn = func(string, string) string { return "" }
+	s := New()
+	if rec := ask(s, "codex-auto-review", true); rec.Code != 404 {
+		t.Fatalf("a review before any turn: %d %s", rec.Code, rec.Body.String())
+	}
+	if rec := ask(s, "fake/m1", false); rec.Code != 200 {
+		t.Fatalf("a turn: %d %s", rec.Code, rec.Body.String())
+	}
+	if rec := ask(s, "codex-auto-review", true); rec.Code != 200 || modelOf(f.got) != "m1" {
+		t.Fatalf("the review after a turn: %d %s, upstream %s", rec.Code, rec.Body.String(), f.got)
+	}
+	// another unknown name, not a review, is still turned away
+	if rec := ask(s, "gpt-nope", false); rec.Code != 404 {
+		t.Fatalf("an unknown turn model: %d", rec.Code)
+	}
+
+	// config.toml: model = "my-group" (and "Mine", the group's name), a
+	// group of fake/m2: the review goes to the group, not to the last
+	// turn's fake/m1
+	for _, name := range []string{"my-group", "Mine"} {
+		StandIn = func(agent, model string) string {
+			if agent == "codex" {
+				return name
+			}
+			return ""
+		}
+		s := New()
+		if rec := ask(s, "codex-auto-review", true); rec.Code != 200 || modelOf(f.got) != "m2" {
+			t.Fatalf("%s: the review %d %s, upstream %s", name, rec.Code, rec.Body.String(), f.got)
+		}
+		if rec := ask(s, name, false); rec.Code != 200 || modelOf(f.got) != "m2" {
+			t.Fatalf("%s: a turn %d %s", name, rec.Code, rec.Body.String())
+		}
+	}
+}
+
 // Claude Code (here as T3 Code runs it) names each of Anthropic's models by
 // its full id; every id of a family goes to the model Claude Code's tier for
 // that family is set to, whether or not a provider of the user's serves the

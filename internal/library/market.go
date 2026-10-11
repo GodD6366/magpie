@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"github.com/yetone/magpie/internal/appdir"
+	"github.com/yetone/magpie/internal/iconproxy"
 )
 
 // The market is where the page finds MCP servers and skills to add in one
@@ -152,7 +153,8 @@ var featured = []MarketServer{
 }
 
 // magpieCommand stands for this magpie's own binary in a featured server's
-// command, which InstallServer puts in when it is added.
+// command, which InstallServer puts in when it is added, and in a library
+// carried to another computer, which reads it as its own (self_here.go).
 const magpieCommand = "magpie"
 
 // selfServerName is the name magpie's own image generation server is written
@@ -165,7 +167,7 @@ const selfServerName = "magpie-image"
 // agents picked for it.
 func selfServer() MarketServer {
 	m := localServer(selfServerName, "Magpie Image", "Magpie", "https://usemagpie.ai/favicon.png", "https://usemagpie.ai",
-		"Generate and edit images with the image model set in Magpie (Settings → Images), and make short videos with a Grok subscription, saved in the project.", magpieCommand, []string{"mcp", "image"})
+		"Generate and edit images with the image model set in Magpie (Settings → Images), and make short videos with a video model set up in Magpie (Grok Imagine, Seedance), saved in the project.", magpieCommand, []string{"mcp", "image"})
 	m.OptIn = true
 	return m
 }
@@ -176,10 +178,7 @@ func selfCommand(s *Server) {
 	if s.Command != magpieCommand {
 		return
 	}
-	if exe, err := os.Executable(); err == nil {
-		if r, err := filepath.EvalSymlinks(exe); err == nil {
-			exe = r
-		}
+	if exe, err := selfExe(); err == nil {
 		s.Command = exe
 	}
 	if a := os.Getenv("MAGPIE_ADDR"); a != "" {
@@ -1114,8 +1113,10 @@ func offered(u string) bool {
 	return false
 }
 
+// fetchImage downloads an icon through usemagpie.ai's icon proxy, so the
+// host a server's author picked never sees the user's IP.
 func fetchImage(u string) ([]byte, string, error) {
-	b, err := get(u, "image/*", 1<<20)
+	b, err := get(iconproxy.URL(u), "image/*", 1<<20)
 	if err != nil {
 		return nil, "", err
 	}

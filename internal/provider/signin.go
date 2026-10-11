@@ -26,6 +26,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/yetone/magpie/internal/settings"
 )
 
 // The vendors' sign-in pages; vars so tests can point them elsewhere.
@@ -122,6 +124,9 @@ func StartSignIn(agent string) (SignInState, error) {
 // StartSignInAt is StartSignIn on one of the sites an agent signs in on:
 // ZCode's "zai" (the default) or "bigmodel".
 func StartSignInAt(agent, site string) (SignInState, error) {
+	if settings.AccountDiscoveryOff() {
+		return SignInState{}, errAccountDiscoveryOff
+	}
 	// one moved onto its plugin signs in there: an account signed in to
 	// here would be the built-in's, which nothing serves now
 	if Moved(agent) {
@@ -695,12 +700,21 @@ func (s *signInFlow) exchange(ctx context.Context, code string) (savedLogin, err
 }
 
 func postToken(ctx context.Context, tokenURL, ctype string, body []byte, out any) error {
+	return postTokenAs(ctx, tokenURL, ctype, "", body, out)
+}
+
+// postTokenAs is postToken asked with bearer, a token already had, when it
+// isn't "" (Google's IAM Credentials, which trades one for another).
+func postTokenAs(ctx context.Context, tokenURL, ctype, bearer string, body []byte, out any) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, tokenURL, bytes.NewReader(body))
 	if err != nil {
 		return err
 	}
 	req.Header.Set("Content-Type", ctype)
 	req.Header.Set("Accept", "application/json")
+	if bearer != "" {
+		req.Header.Set("Authorization", "Bearer "+bearer)
+	}
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return err
@@ -732,9 +746,19 @@ func postToken(ctx context.Context, tokenURL, ctype string, body []byte, out any
 		if msg == "" {
 			msg = http.StatusText(resp.StatusCode)
 		}
-		return fmt.Errorf("the sign-in was refused (%d): %s", resp.StatusCode, msg)
+		return &tokenRefused{resp.StatusCode, msg}
 	}
 	return json.Unmarshal(b, out)
+}
+
+// tokenRefused is a token endpoint's refusal, as postToken answers it.
+type tokenRefused struct {
+	status int
+	msg    string
+}
+
+func (e *tokenRefused) Error() string {
+	return fmt.Sprintf("the sign-in was refused (%d): %s", e.status, e.msg)
 }
 
 // claudeLogin is a Claude sign-in as magpie keeps it.
@@ -794,8 +818,15 @@ func codexLogin(idToken, accessToken, refreshToken, accountID string) (savedLogi
 
 // addLogin keeps a freshly signed-in account. The agent is signed in to it
 // too when it has no account yet, or had this one: the new tokens replace
-// the old, so one refresh token stays in one place.
+// the old, so one refresh token stays in one place. Its kept usage
+// reading goes (StaleAllowance): it was read under the old sign-in, and
+// for a minute it would answer for the new one, a refusal and all.
 func addLogin(l savedLogin) (using bool, err error) {
+	defer func() { // under the name it is kept by (codexName), once loginsMu is let go
+		if err == nil {
+			StaleAllowance(l.Agent, l.User)
+		}
+	}()
 	loginsMu.Lock()
 	defer loginsMu.Unlock()
 	l.Seen = time.Now().UTC().Truncate(time.Second)

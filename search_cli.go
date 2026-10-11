@@ -13,6 +13,7 @@ import (
 const searchUsage = `usage:
   magpie search                              the search APIs a model's web search goes to
   magpie search add <api> <key> [url=<address>]   add one, or give one a new key
+                                             (several keys as k1,k2: the next is tried when one is refused)
   magpie search add searxng url=<address> [<key>]
   magpie search rm <api>                     take one away
 
@@ -35,7 +36,7 @@ func searchCmd(args []string) error {
 			return nil
 		}
 		for i, a := range as {
-			what := provider.Mask(a.Key)
+			what := a.MaskedKey()
 			if a.Key == "" {
 				what = "no key"
 			}

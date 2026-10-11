@@ -10,6 +10,7 @@ import (
 
 	"github.com/yetone/magpie/internal/access"
 	"github.com/yetone/magpie/internal/provider"
+	"github.com/yetone/magpie/internal/sessions"
 	"github.com/yetone/magpie/internal/settings"
 )
 
@@ -141,12 +142,17 @@ func TestCORSKeyThroughTheServer(t *testing.T) {
 	if err := settings.Save(s); err != nil {
 		t.Fatal(err)
 	}
+	if err := sessions.SetGatewayRecording(true, false); err != nil {
+		t.Fatal(err)
+	}
 	srv := lanGuard(New().Handler())
 	for _, key := range []string{secret, ""} {
 		r := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(chatReq))
 		r.RemoteAddr = "127.0.0.1:50123"
+		r.Host = "127.0.0.1:3425"
 		r.Header.Set("Origin", "http://localhost:3000")
 		r.Header.Set("Content-Type", "application/json")
+		r.Header.Set(SessionHeader, "browser-chat")
 		if key != "" {
 			r.Header.Set("Authorization", "Bearer "+key)
 		}
@@ -158,6 +164,9 @@ func TestCORSKeyThroughTheServer(t *testing.T) {
 		}
 		if w.Code != want || w.Header().Get("Access-Control-Allow-Origin") != "http://localhost:3000" {
 			t.Errorf("key %q: %d %v %s", key, w.Code, w.Header(), w.Body)
+		}
+		if key != "" && (w.Header().Get(SessionHeader) != "browser-chat" || w.Header().Get("Access-Control-Expose-Headers") != SessionHeader) {
+			t.Error("browser client cannot read the session its conversation is recorded under")
 		}
 	}
 }
@@ -263,7 +272,7 @@ func TestForeignPagesRefused(t *testing.T) {
 		{"http://tauri.localhost", "127.0.0.1:3425", loop, ""},                       // Tauri's webview on Windows
 		{"https://app.example.com", "127.0.0.1:3425", loop, secret},                  // listed, with its key
 		{"http://192.168.1.5:3425", "192.168.1.5:3425", "192.168.1.9:50123", secret}, // the gateway's own origin, shared on the LAN
-		{"https://magpie.example.com", "magpie.example.com", loop, ""},               // its own origin behind a port-443 name
+		{"https://magpie.example.com", "magpie.example.com", loop, secret},           // its own origin behind a port-443 name, with a key (without one, a rebound page: TestReboundPageRefused)
 		{"null", "127.0.0.1:3425", loop, ""},                                         // a sandboxed frame, a file:// page
 		{"app://cherry", "127.0.0.1:3425", loop, ""},                                 // an Electron renderer
 		{"file://", "127.0.0.1:3425", loop, ""},

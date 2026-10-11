@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"net"
+	"net/url"
 	"os"
 	"strings"
 
@@ -45,10 +46,9 @@ func webCmd(args []string) error {
 		return err
 	}
 	fmt.Println(green.Render("●"), "magpie web on", bold.Render(w.Link))
-	host, _, _ := net.SplitHostPort(w.Addr)
+	host, port, _ := net.SplitHostPort(w.Addr)
+	key := w.Link[strings.Index(w.Link, "/?k="):]
 	if ip := net.ParseIP(host); ip != nil && !ip.IsLoopback() {
-		_, port, _ := net.SplitHostPort(w.Addr)
-		key := w.Link[strings.Index(w.Link, "/?k="):]
 		for _, l := range gui.NetworkLinks(port, key) {
 			fmt.Println(muted.Render("  on the network"), l)
 		}
@@ -56,6 +56,8 @@ func webCmd(args []string) error {
 			fmt.Println(muted.Render("  " + containerNote))
 		}
 		fmt.Println(amber.Render("!"), "anyone with the link can change magpie and see its keys, and the network carries it unencrypted")
+	} else if l := proxyLink(key); l != "" {
+		fmt.Println(muted.Render("  through your proxy"), l)
 	}
 	carries := "this run's key (MAGPIE_WEB_KEY keeps one across runs)"
 	if os.Getenv("MAGPIE_WEB_KEY") != "" {
@@ -66,4 +68,28 @@ func webCmd(args []string) error {
 		openInBrowser(w.Link)
 	}
 	return w.Wait()
+}
+
+// proxyLink is the page's link through a reverse proxy in front of a page
+// served on loopback (#1479), with the key: MAGPIE_WEB_URL, the page's own
+// address there (https://magpie.example.com), or else MAGPIE_PUBLIC_URL
+// with no port of its own, as NetworkLinks takes it (#372). One with a
+// port names a host whose ports are published, not a proxy. "" with
+// neither, or a MAGPIE_WEB_URL that isn't a plain http(s) address.
+func proxyLink(key string) string {
+	if v := strings.TrimSpace(os.Getenv("MAGPIE_WEB_URL")); v != "" {
+		if !strings.Contains(v, "://") {
+			v = "https://" + v
+		}
+		u, err := url.Parse(v)
+		if err != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") || u.RawQuery != "" || u.Fragment != "" || u.User != nil {
+			return ""
+		}
+		return strings.TrimRight(u.String(), "/") + key
+	}
+	u, err := url.Parse(gateway.PublicURL())
+	if err != nil || u.Host == "" || u.Port() != "" {
+		return ""
+	}
+	return strings.TrimRight(u.String(), "/") + key
 }

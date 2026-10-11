@@ -187,15 +187,29 @@ type pickMsg struct{ group, newGroup string }
 // memberOptions is every model and group magpie has, but those in skip.
 func memberOptions(skip []string, self string) []agent.Option {
 	var out []agent.Option
-	for _, e := range provider.Catalog() {
-		if slices.Contains(skip, e.ID) || e.ID == provider.GroupPrefix+self {
-			continue
+	// a group is of decision models alone, asked at /v1/systemone, or of
+	// models that hold conversations (provider.cleanDecisionGroup): one
+	// holding either is offered more of the same, a new one both
+	g, _ := findGroup(self)
+	decides := self != "" && g.Decides()
+	if !decides {
+		for _, e := range provider.Catalog() {
+			if slices.Contains(skip, e.ID) || e.ID == provider.GroupPrefix+self {
+				continue
+			}
+			note := e.Name
+			if e.Group != "" {
+				note = "group · " + e.Name
+			}
+			out = append(out, agent.Option{Value: e.ID, Note: note})
 		}
-		note := e.Name
-		if e.Group != "" {
-			note = "group · " + e.Name
+	}
+	if self == "" || decides {
+		for _, e := range provider.Deciders() {
+			if !slices.Contains(skip, e.ID) {
+				out = append(out, agent.Option{Value: e.ID, Note: e.Name + " · decision model"})
+			}
 		}
-		out = append(out, agent.Option{Value: e.ID, Note: note})
 	}
 	return out
 }
@@ -268,7 +282,8 @@ func (m *model) openClassifier(g provider.Group) {
 // ruleHint is what a rule is typed as.
 const ruleHint = `use=<model>, and any of: tokens=200k · images · effort=on|low|medium|high|xhigh|max · agents=codex,claude
 intent="a quick question" (the group's classifier=<model> tells it) · compact
-time=09:00-18:00 (local; 22:00-08:00 runs past midnight) · days=mon-fri · at=<n> for its place`
+time=09:00-18:00 (local; 22:00-08:00 runs past midnight) · days=mon-fri · folders=~/work/acme,~/oss · at=<n> for its place
+or pause=<model> time=… days=… agents=…: the model is left out of the group then, not even a fallback`
 
 // openRule asks for a rule: a new one, or rule i (from 0) typed again.
 func (m *model) openRule(g provider.Group, i int) {
@@ -625,7 +640,7 @@ func (m model) viewGroup() string {
 			b.WriteString(pad + "     " + sText.Render(h.Pattern) + n + "\n")
 		}
 	}
-	b.WriteString("\n" + pad + "  " + sFaint.Render("rules · as a turn begins, the first that matches sends it to its model first") + "\n")
+	b.WriteString("\n" + pad + "  " + sFaint.Render("rules · as a turn begins, the first that matches sends it to its model first; a pause leaves its model out while it holds") + "\n")
 	if len(g.Rules) == 0 {
 		b.WriteString(pad + "  " + sMuted.Render("none · n adds one") + "\n")
 	}
@@ -634,7 +649,11 @@ func (m model) viewGroup() string {
 		if len(g.Members)+i == m.gsel {
 			marker, use = sCursor.Render("▸ "), sNameOn.Render(r.Use)
 		}
-		b.WriteString(pad + marker + sFaint.Render(fmt.Sprintf("%d  ", i+1)) + sMuted.Render(strings.Join(r.Conditions(), " · ")+" → ") + use + "\n")
+		arrow := " → "
+		if r.Pause {
+			arrow = " → pause "
+		}
+		b.WriteString(pad + marker + sFaint.Render(fmt.Sprintf("%d  ", i+1)) + sMuted.Render(strings.Join(r.Conditions(), " · ")+arrow) + use + "\n")
 	}
 	if slices.ContainsFunc(g.Rules, func(r provider.Rule) bool { return r.Intent != "" }) {
 		b.WriteString("\n" + pad + "  " + sFaint.Render("classifier ") + sText.Render(dash(g.Classifier)) + sFaint.Render(" · tells which intent a message is") + "\n")

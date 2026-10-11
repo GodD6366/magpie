@@ -20,6 +20,7 @@ import (
 	"github.com/tidwall/gjson"
 
 	"github.com/yetone/magpie/internal/settings"
+	"github.com/yetone/magpie/internal/steady"
 )
 
 // Codex lists, in its history and its resume picker, only the sessions made
@@ -301,6 +302,38 @@ func MoveCodexProvider(id, to string) (CodexMove, error) {
 	return mv, nil
 }
 
+// CodexThreadProviders is every provider the threads of a Codex folder
+// were started on, as its state databases keep them: the Codex app resumes
+// a thread on that one, whatever config.toml's model_provider is now, and
+// fails to load its config for it when config.toml has no table of that
+// id (#1372). A database without the threads table, or one that can't be
+// read, says nothing.
+func CodexThreadProviders(home string) []string {
+	var out []string
+	for _, p := range codexStateDBs(home) {
+		u := url.URL{Scheme: "file", Path: filepath.ToSlash(p), RawQuery: "mode=ro&_pragma=busy_timeout(2000)"}
+		if len(u.Path) >= 2 && u.Path[1] == ':' {
+			u.Path = "/" + u.Path
+		}
+		db, err := sql.Open("sqlite", u.String())
+		if err != nil {
+			continue
+		}
+		rows, err := db.Query(`SELECT DISTINCT model_provider FROM threads`)
+		if err == nil {
+			for rows.Next() {
+				var s sql.NullString
+				if rows.Scan(&s) == nil && codexProviderRe.MatchString(s.String) && !contains(out, s.String) {
+					out = append(out, s.String)
+				}
+			}
+			rows.Close()
+		}
+		db.Close()
+	}
+	return out
+}
+
 func contains(list []string, s string) bool {
 	for _, x := range list {
 		if x == s {
@@ -416,6 +449,11 @@ func rewriteCodexProvider(path, to string) (bool, error) {
 		}
 	}
 	if err := tmp.Chmod(fi.Mode().Perm()); err != nil {
+		return false, err
+	}
+	// the user's session on the disk before it is renamed over the old
+	// one: a machine that goes down between can leave it all zero (#1505)
+	if err := steady.Sync(tmp); err != nil {
 		return false, err
 	}
 	if err := tmp.Close(); err != nil {

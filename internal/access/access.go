@@ -16,6 +16,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"time"
 	"unicode/utf8"
 
 	"github.com/yetone/magpie/internal/edit"
@@ -250,6 +251,9 @@ type Change struct {
 	Secret string `json:"secret,omitempty"`
 }
 
+// Now is when Update sets or resets a limit. A variable for the tests.
+var Now = time.Now
+
 // Update writes the named key store atomically.
 func Update(action string, in Change) (string, error) {
 	mu.Lock()
@@ -307,7 +311,20 @@ func Update(action string, in Change) (string, error) {
 			if err != nil {
 				return "", err
 			}
+			if lim != nil {
+				lim.Since = sinceOf(keys[i].Limit, lim, Now().Round(0))
+			}
 			keys[i].Limit = lim
+		case "reset-limit-key":
+			// what the key has used is counted again from now (#1509),
+			// its tokens and cost together: a "days" cycle starts anew,
+			// a calendar window keeps its end
+			if !keys[i].Limit.Limited() {
+				return "", errors.New("This key has no limit to reset")
+			}
+			l := *keys[i].Limit
+			l.Since = Now().Round(0)
+			keys[i].Limit = &l
 		case "models-key":
 			ms, err := CleanModels(in.Models)
 			if err != nil {
@@ -334,7 +351,7 @@ func Update(action string, in Change) (string, error) {
 		default:
 			return "", fmt.Errorf("unknown key action %q", action)
 		}
-		if defaultKey && action != "remove-key" && action != "rename-key" && action != "limit-key" && action != "models-key" && action != "accounts-key" {
+		if defaultKey && action != "remove-key" && action != "rename-key" && action != "limit-key" && action != "reset-limit-key" && action != "models-key" && action != "accounts-key" {
 			mirror = &keys[i]
 		}
 	}
@@ -442,9 +459,22 @@ func migrateLegacyLANKey() error {
 	return settings.Save(s)
 }
 
+// LANChanged is called after sharing is turned on or off, or its key made
+// anew: what was given the key goes on with the one there is now (the
+// library's MCP servers relayed to an agent in a WSL distro under NAT).
+var LANChanged = func() {}
+
 // ConfigureLAN starts sharing with a named key. Rotation preserves the key's
 // identity, name and enabled state.
 func ConfigureLAN(on, rotate bool) error {
+	if err := configureLAN(on, rotate); err != nil {
+		return err
+	}
+	LANChanged()
+	return nil
+}
+
+func configureLAN(on, rotate bool) error {
 	mu.Lock()
 	defer mu.Unlock()
 	if err := migrateLegacyLANKey(); err != nil {

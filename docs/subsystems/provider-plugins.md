@@ -40,6 +40,43 @@ The hook returns `{outcome, credit?, streak?, message?}`. `outcome` is one of `c
 
 The switch is off by default. For a provider whose vendor magpie checked in through the plugin's fetch before (WorkBuddy, Trae CN, MiniMax Code, Qoder), it follows that vendor's existing switch until set on its own, and magpie's own check-in leaves that provider's accounts to the plugin (`pluginChecksIn`), so an account is never checked in twice.
 
+Trae CN plugins without `auth.checkin` use [`trae_checkin.go`](../../internal/provider/trae_checkin.go) through the plugin's fetch: `/status`, then `/claim` while the check-in is on and today's isn't in. A claim answered 9074 (当前参与用户太多，请稍后再试) is saved as `own-app`, settled for the Beijing day like any answer other than `failed`: Trae CN pays check-in credits only to a device its own app registered, so neither the loop nor Check in now claims again that day, and the card, Settings, TUI and CLI say to check in in the Trae CN app (#808). 9074 on `/status`, and every other code, keep their previous handling. `own-app` is not a plugin hook outcome.
+
+WorkBuddy's check-in ([`workbuddy_checkin.go`](../../internal/provider/workbuddy_checkin.go), built-in or through the plugin's fetch) tells a 401 apart. WorkBuddy's gateway answers a token it refuses with a bare HTML 401, which the card said only as "Unauthorized" and retried every 30 minutes. On a 401 from `/v2/billing/meter/checkin-activity-status` or `/daily-checkin`, the account's credits (`/billing/meter/get-user-resource-summary`) are read with the same headers: when they read, the sign-in is good and the check-in alone refuses magpie (WorkBuddy's own app sends its check-in, and only that, with an `X-Device-Token` from its security SDK), so it is saved as `own-app` for the day; when they don't, it is `failed` with "sign in to it again".
+
+Qoder plugins without `auth.checkin` still use [`qoder_checkin.go`](../../internal/provider/qoder_checkin.go) through the plugin's fetch. The server's `CLAIMABLE` status decides whether to claim; the local `[startAt, endAt)` check only recognizes an already-claimed campaign and its expiry, including one that crosses Beijing midnight. Successful results keep the active campaign's end in the optional `until` field of `qoder-checkin.json`. Scheduled checks reuse results from the same Beijing day for at most 30 minutes and never past that end, so a long campaign cannot hide new or reset campaigns indefinitely. The existing loop looks every 30 minutes and on a Beijing day change; a midnight refresh saves today's result for the Usage card and TUI. An `inactive` result is now asked again after 30 minutes rather than settled for the day; failures retain their existing retry schedule. A manual check-in always asks immediately. Saved results without `until` remain readable and use the same 30-minute refresh, with no migration needed. Other vendors and plugins with their own check-in retain their daily settlement.
+
+## A plugin's decision API
+
+A plugin can serve TypeSafe's System One for its provider (#1514). Its `config` hook sets `decide: true` on the provider, and `decides: true` on a model that answers questions rather than a conversation, in the `config` hook or on the `models` hook's list. The host passes both through (`plugin.Provider.Decide`, `plugin.Model.Decides`). [`pluginProvider`](../../internal/provider/plugins.go) then sets the provider's `Decide` to `plugin://<id>/v1`, its own base: `pluginFetch` sends nowhere but the loader's host, so a decision address of the plugin's own couldn't be reached. `AskSystemOne` and the gateway's classifier post `/v1/systemone` with `Provider.Do`, which reaches the loader's `fetch` as `{baseURL}/systemone` with the account's sign-in.
+
+In [`decide.go`](../../internal/provider/decide.go) a plugin provider's decision models are the ones it marks (`pluginMarks`, read from the plugin's current listing) and Jev's by name (`jev-*`). They are kept from agents (`isDecision` in `buildEntries`), refused for chat ("only decides"), refused as a member of a group beside models that hold a conversation (a group of decision models alone answers `/v1/systemone`: [gateway-routing](gateway-routing.md#remote-magpie-apis)), and offered as a group's classifier (`Deciders`, `DecisionModels`). A mark counts only when the provider says `decide`; without it every model stays one to chat with. A plugin provider's editor (the account editor) has no address fields, so this address is never typed; the GUI marks the decision models from `deciders`.
+
+## Two plugins for one provider id
+
+The host runs one plugin per provider id. When two installed plugins have `auth` hooks for the same id, such as a third-party plugin and the user's own copy added by its folder, `auths()` in `host.js` takes the one picked for that id in `plugins.json`'s `prefer` map (provider id → spec). Without a pick it takes the last one in the list, as OpenCode does. Only the serving plugin's `provider.models` hook runs for that id. Every plugin's `config` hook still runs, so another plugin can still add models or a name to `config.provider[id]`.
+
+Before this, the plugin that lost the id disappeared silently: its row read "Signs in to nothing magpie can use", and `keepUnloaded` could list the id twice, once from the old `plugin-providers.json` (neiko on Discord). Now:
+
+- `init` returns each plugin's `provides` (the ids its auth hooks name) and `servedBy` (id → the other spec, for each id it doesn't serve).
+- `plugin.Clashes` turns these into `{id, by, with}` per spec.
+- `/api/plugins` gives each row its `clashes`, along with the provider's listed name.
+- `keepUnloaded` doesn't keep a provider from before when another plugin serves its id now.
+
+Both rows stay visible on the Plugins page:
+
+- The serving row says "{other} signs in to {name} too; this one serves it".
+- The other row says, in amber, "{name} is served by {other}, which signs in to it too". It has a **Use for {name}** button, which calls `POST /api/plugins/prefer {spec, provider}` (`plugin.Prefer`) and restarts the host.
+
+In the CLI, `magpie plugin list` prints the same two lines, and `magpie plugin use <name> <provider>` makes the pick.
+
+How the store handles picks and names:
+
+- Removing a plugin drops its picks.
+- Switching a plugin off hands the id to the other plugin until it is switched on again.
+- Re-adding a plugin under a new version or spec keeps its picks.
+- Remove, off, options and prefer find a plugin by its exact spec first, then by package name (`indexOf` in `store.go`). This way, acting on one plugin never reaches another plugin that has the same package name.
+
 ## How ownership changes
 
 Migration records use four states:
@@ -73,6 +110,12 @@ Keep the migration, host, and upstream behavior separate when investigating fail
 
 The host gets magpie's proxy only as `MAGPIE_*_PROXY` and applies it to each fetch itself. A program a plugin starts, such as the Grok plugin's `grok login`, gets it back as `HTTPS_PROXY`/`HTTP_PROXY` from the spawn wrapper in `host.js`, unless the plugin set one. A sign-in that works in the built-in and fails through the plugin may be a host difference like this one, not a plugin bug.
 
+Bun takes only http:// and https:// proxies. A SOCKS5 one, such as a Mac's system SOCKS proxy, is given to every bun magpie starts as a loopback HTTP proxy in front of it (`netproxy.Bridge`): to the host through `hostEnv`, and to `bun add`, `bun update` and `bun remove` through `bunCommand` (`netproxy.EnvForBun`). Before, an install with only a SOCKS system proxy failed as `UnsupportedProxyProtocol` (#1409). An agent CLI that bun installed is updated through the bridge too (`updateEnv` in `internal/agent/cliupdate.go`).
+
+The host reads its proxy once, when it starts. When the proxy magpie would give a new host differs from the one the running host got (the system proxy set after magpie started, as at login before Clash is up, or Settings changed), the next call to the host replaces it (`proxyMoved` in [`host.go`](../../internal/plugin/host.go), looked at no more than every 15s, or every 2s while the host has no proxy: `proxyLookNone`, #1518). A call made for a read nobody asked for, while allowances are read only when asked (`netproxy.Held`), never reaches the host. Before this, a host started without a proxy kept none, so the Grok plugin's `grok models` couldn't renew its token and the account read as signed out after each restart (#1363).
+
+A plugin's account whose sign-in its vendor refused (`lapsed`, or an allowance read saying so) keeps Sign in again and Remove on its row, whether it is in use or the agent's own (`signedOut` in `renderAccounts`, `app.js`).
+
 The GUI's plugin integration includes `subOf`, `pluginSubs`, and `startPluginSignIn`. A change to sign-in or provider presentation must follow these paths as well as the built-in paths it affects.
 
 ## Verification
@@ -81,7 +124,18 @@ The GUI's plugin integration includes `subOf`, `pluginSubs`, and `startPluginSig
 
 Gateway parity tests in [`plugin_parity_test.go`](../../internal/gateway/plugin_parity_test.go) and other `plugin_*_test.go` files compare or exercise plugin paths. A built-in test alone does not establish moved-user behavior. Inspect each test's fixture to confirm that it covers the provider and operation being changed.
 
+[`plugin_decide_test.go`](../../internal/gateway/plugin_decide_test.go) runs the fake plugin (`FAKE_DECIDE`) with a decision API: its marked and `jev-*` models are classifiers and not offered to agents, chat to one is refused, a group saves one as classifier, not beside a chat model, and a group of decision models alone, and each classifier's question reaches the fake vendor at `/v1/systemone` through the plugin's fetch. With `FAKE_DECIDE=models` the marks without `decide` change nothing.
+
 [`plugin_checkin_test.go`](../../internal/provider/plugin_checkin_test.go) runs the fake plugin's `auth.checkin` (`FAKE_CHECKIN`) through the schedule: off, each outcome, no second press the same day, failures only after the retry window, the next day, cards and Settings, and the vendor check-in stepping aside. `plugin-checkin.test.cjs` covers the card row and the Settings tab.
+
+[`plugin_cliproxy_test.go`](../../internal/plugin/plugin_cliproxy_test.go)'s `TestPluginHostTakesANewProxy` starts a real host without a proxy, sets one, and checks that a program the plugin starts gets it. `plugin-signed-out-account.test.cjs` covers a moved Grok account signed out while in use and as the agent's own, in Chromium and WebKit, en and zh, 420 and 1100 wide.
+
+These tests cover two plugins on one provider id:
+
+- [`plugin_clash_test.go`](../../internal/plugin/plugin_clash_test.go)'s `TestTwoPluginsOneProvider` loads two copies of the fake plugin in a real host. It checks `provides`/`servedBy`, `Clashes`, that the id is listed only once, and that the pick survives Prefer, a restart, off/on and Remove.
+- `TestPluginNamedExactlyFirst` and `TestKeepUnloadedLeavesAServedID` cover the store and the providers cache.
+- `TestPluginsClashRows` (`internal/gui`) and `TestPluginListSaysClash` (the CLI) check what the user sees.
+- `plugin-clash.test.cjs` covers both rows and Use for, in Chromium and WebKit, in en, zh, zh-TW, ja and de, at 1100 and 560 wide.
 
 [`quotas_dedupe_test.go`](../../internal/provider/quotas_dedupe_test.go) checks unrelated reset collisions and ZCode deduplication, including plugin usage window conversion for both plugin ids. [`TestPlanQuotas`](../../internal/provider/planquota_test.go) checks the custom GLM endpoint, cached cards, and fallback readings restored from disk. These fixtures do not contact the live vendors or run the community ZCode plugin.
 

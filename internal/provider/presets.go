@@ -82,9 +82,14 @@ type Region struct {
 	// than the preset's (Tencent Cloud's pay as you go, beside its plan's
 	// none), is that entry's id.
 	Catalog string `json:"catalog,omitempty"`
-	// Models are a plan's, for a region that is one beside pay as you go
-	// (PresetDef.Models, for the region alone).
-	Models []string `json:"models,omitempty"`
+	// Models are a plan's text models, for a region that is one beside
+	// another plan or pay as you go (PresetDef.Models, for the region alone).
+	// Embeddings, Drawers and Videos are its non-chat models, kept apart from
+	// agents' model pickers.
+	Models     []string `json:"models,omitempty"`
+	Embeddings []string `json:"embeddings,omitempty"`
+	Drawers    []string `json:"drawers,omitempty"`
+	Videos     []string `json:"videos,omitempty"`
 	// Decide is the region's decision API, for a preset that routes groups
 	Decide string `json:"decide,omitempty"`
 }
@@ -97,6 +102,11 @@ const WorkspaceID = "{WorkspaceId}"
 func bailianWorkspace(region string) string {
 	return "https://" + WorkspaceID + "." + region + ".maas.aliyuncs.com/compatible-mode/v1"
 }
+
+// alibabaPlanModels are the text models of Alibaba's Token Plan, the same
+// on the Qwen AI platform's and on Bailian's, as their overviews list them.
+var alibabaPlanModels = []string{"auto", "qwen3.8-max", "qwen3.8-flash", "qwen3.7-max", "qwen3.7-plus", "qwen3.6-flash",
+	"deepseek-v4.1-flash", "deepseek-v4-pro", "deepseek-v4-pro-0813", "deepseek-v4-flash-0731", "glm-5.3", "glm-5.2"}
 
 // presets are ordered as they appear in the picker.
 var presets = []PresetDef{
@@ -112,6 +122,20 @@ var presets = []PresetDef{
 		Chat:    "https://generativelanguage.googleapis.com/v1beta/openai",
 		Note:    "Gemini Developer API",
 		Website: "https://aistudio.google.com", KeysURL: "https://aistudio.google.com/apikey"},
+	// Google's Gemini models in the user's own Google Cloud project
+	// (vertex.go): generateContent, signed with their Google credentials
+	// rather than a key. It has no list to ask that says which models a
+	// location serves, so they are given: these, every one global serves;
+	// vertexModels has the others'. Its Priority PayGo and Flex PayGo are
+	// asked for with the two headers.
+	{ID: VertexPreset, Name: "Google Vertex AI", Short: "Vertex AI", Icon: "vertexai-color", Kind: KindVendor,
+		Note:    "your Google Cloud project, with gcloud's sign-in",
+		Website: "https://docs.cloud.google.com/gemini-enterprise-agent-platform/models",
+		NoList:  true,
+		Models: []string{"gemini-3.8-flash", "gemini-3.7-flash", "gemini-3.6-flash", "gemini-3.5-flash", "gemini-3.5-flash-lite",
+			"gemini-3.1-pro-preview", "gemini-3.1-pro-preview-customtools", "gemini-3.1-flash-lite", "gemini-3-flash-preview",
+			"gemini-2.5-pro", "gemini-2.5-flash", "gemini-2.5-flash-lite"},
+		HeaderHints: []string{"X-Vertex-AI-LLM-Request-Type", "X-Vertex-AI-LLM-Shared-Request-Type"}},
 	{ID: "deepseek", Name: "DeepSeek", Icon: "deepseek-color", Kind: KindVendor, Catalog: "deepseek",
 		Chat: "https://api.deepseek.com/v1", Responses: "https://api.deepseek.com/v1", Anthropic: "https://api.deepseek.com/anthropic",
 		Website: "https://platform.deepseek.com", KeysURL: "https://platform.deepseek.com/api_keys"},
@@ -266,16 +290,21 @@ var presets = []PresetDef{
 		Note:    "火山方舟 · Coding / Agent Plan",
 		Website: "https://www.volcengine.com/docs/82379/1925114", KeysURL: "https://ark.volcengine.com/region:cn-beijing/apikey",
 		RegionLabel: "Plan", Regions: []Region{
-			{ID: "coding", Name: "Coding Plan", Chat: "https://ark.cn-beijing.volces.com/api/coding/v3", Responses: "https://ark.cn-beijing.volces.com/api/coding/v3", Anthropic: "https://ark.cn-beijing.volces.com/api/coding"},
-			{ID: "agent", Name: "Agent Plan", Chat: "https://ark.cn-beijing.volces.com/api/plan/v3", Responses: "https://ark.cn-beijing.volces.com/api/plan/v3", Anthropic: "https://ark.cn-beijing.volces.com/api/plan"},
+			{ID: "coding", Name: "Coding Plan", Chat: "https://ark.cn-beijing.volces.com/api/coding/v3", Responses: "https://ark.cn-beijing.volces.com/api/coding/v3", Anthropic: "https://ark.cn-beijing.volces.com/api/coding",
+				Models: []string{"ark-code-latest", "doubao-seed-evolving", "doubao-seed-2.1-pro", "doubao-seed-2.1-lite", "doubao-seed-2.1-turbo",
+					"doubao-seed-2.0-mini", "minimax-m3", "glm-5.3", "glm-5.3-flash", "deepseek-v4.1-flash", "deepseek-v4-flash", "deepseek-v4-pro",
+					"kimi-k2.7-code", "kimi-k2.8-preview", "kimi-k3"},
+				Embeddings: []string{"doubao-embedding-vision"}},
+			{ID: "agent", Name: "Agent Plan", Chat: "https://ark.cn-beijing.volces.com/api/plan/v3", Responses: "https://ark.cn-beijing.volces.com/api/plan/v3", Anthropic: "https://ark.cn-beijing.volces.com/api/plan",
+				Models: []string{"ark-code-latest", "doubao-seed-evolving", "doubao-seed-2.1-pro", "doubao-seed-2.1-lite", "doubao-seed-2.1-turbo",
+					"doubao-seed-2.0-mini", "minimax-m3", "glm-5.3", "glm-5.3-flash", "deepseek-v4.1-flash", "deepseek-v4-flash", "deepseek-v4-pro",
+					"kimi-k2.7-code", "kimi-k2.8-preview", "kimi-k3"},
+				Embeddings: []string{"doubao-embedding-vision"},
+				Drawers:    []string{"doubao-seedream-5-0-pro"},
+				Videos:     []string{"doubao-seedance-2.0", "doubao-seedance-2.0-fast", "doubao-seedance-2.0-mini", "doubao-seedance-2.5"}},
 			{ID: "api", Name: "Pay as you go", Chat: "https://ark.cn-beijing.volces.com/api/v3", Responses: "https://ark.cn-beijing.volces.com/api/v3", Lists: true},
 		},
-		NoList: true,
-		// the plans' model names, lowercase as their quick-start pages list
-		// them; ark-code-latest is whichever the console has picked
-		Models: []string{"ark-code-latest", "doubao-seed-evolving", "doubao-seed-2.1-pro", "doubao-seed-2.1-lite", "doubao-seed-2.0-mini",
-			"minimax-m3", "glm-5.3", "glm-5.3-flash", "deepseek-v4.1-flash", "deepseek-v4-flash", "deepseek-v4-pro",
-			"kimi-k2.7-code", "kimi-k2.8-preview", "kimi-k3"}},
+		NoList: true},
 	{ID: "qwen", Name: "Qwen", Icon: "qwen-color", Kind: KindVendor, Catalog: "alibaba",
 		Chat: "https://dashscope-intl.aliyuncs.com/compatible-mode/v1", Anthropic: "https://dashscope-intl.aliyuncs.com/apps/anthropic",
 		Note:    "DashScope · intl",
@@ -284,17 +313,29 @@ var presets = []PresetDef{
 		Chat: "https://dashscope.aliyuncs.com/compatible-mode/v1", Anthropic: "https://dashscope.aliyuncs.com/apps/anthropic",
 		Note:    "DashScope · China",
 		Website: "https://bailian.console.aliyun.com", KeysURL: "https://bailian.console.aliyun.com/?tab=model#/api-key"},
-	// Alibaba Cloud Bailian's Token Plan (personal and team), a subscription
-	// on a key of its own (sk-sp-) that only its own host takes, serving
-	// chat completions and Anthropic messages. The models given are the
-	// plan's text models as its overview lists them, for when it gives no
-	// list.
+	// Alibaba's Token Plan is sold twice, each on a key of its own (sk-sp-)
+	// that only its own host takes, serving chat completions and Anthropic
+	// messages: on the Qwen AI platform (platform.qianwenai.com) at
+	// token-plan.maas.qianwenaiapi.com, and on Alibaba Cloud Bailian
+	// (bailian.console.aliyun.com) at token-plan.cn-beijing.maas.aliyuncs.com
+	// (#1506). The models given are the plans' text models as their
+	// overviews list them, for when the host gives no list. Neither has an
+	// API for the plan's credits: its console's subscription page shows them.
 	{ID: "qwen-token-plan", Name: "Qwen Token Plan", Short: "Qwen Plan", Icon: "qwen-color", Kind: KindVendor,
 		Chat: "https://token-plan.maas.qianwenaiapi.com/compatible-mode/v1", Anthropic: "https://token-plan.maas.qianwenaiapi.com/apps/anthropic",
-		Note:    "Bailian · subscription",
+		Note:    "Qwen AI platform · subscription",
+		Website: "https://platform.qianwenai.com/docs/token-plan/overview", KeysURL: "https://platform.qianwenai.com/home/analytics/token-plan/individual",
+		Models: alibabaPlanModels},
+	// Bailian's also answers its decision model, decision-model-preview, on
+	// System One at /compatible-mode/v1/systemone with the same key
+	// (token-plan-decision-model; the personal plan only), so a routing
+	// group can be classified by it
+	{ID: "bailian-token-plan", Name: "Bailian Token Plan", Short: "Bailian Plan", Icon: "bailian-color", Kind: KindVendor,
+		Chat: "https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1", Anthropic: "https://token-plan.cn-beijing.maas.aliyuncs.com/apps/anthropic",
+		Decide:  "https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1",
+		Note:    "Alibaba Cloud Bailian · subscription",
 		Website: "https://help.aliyun.com/zh/model-studio/token-plan-overview", KeysURL: "https://bailian.console.aliyun.com/cn-beijing/subscription/token-plan/personal",
-		Models: []string{"auto", "qwen3.8-max", "qwen3.8-flash", "qwen3.7-max", "qwen3.7-plus", "qwen3.6-flash",
-			"deepseek-v4.1-flash", "deepseek-v4-pro", "deepseek-v4-pro-0813", "deepseek-v4-flash-0731", "glm-5.3", "glm-5.2"}},
+		Models: alibabaPlanModels},
 	{ID: "mistral", Name: "Mistral", Icon: "mistral-color", Kind: KindVendor, Catalog: "mistral",
 		Chat:    "https://api.mistral.ai/v1",
 		Website: "https://console.mistral.ai", KeysURL: "https://console.mistral.ai/api-keys"},
@@ -463,7 +504,7 @@ var presets = []PresetDef{
 	// Alibaba Cloud Bailian's decision model (#647), on Jev's System One
 	// API: at the host of the key's workspace (Beijing or Singapore), or
 	// the Token Plan's for its sk-sp- keys
-	{ID: "bailian-decision", Name: "Bailian Decision Model", Short: "Bailian Decision", Icon: "qwen-color", Kind: KindVendor,
+	{ID: "bailian-decision", Name: "Bailian Decision Model", Short: "Bailian Decision", Icon: "bailian-color", Kind: KindVendor,
 		Decide:      bailianWorkspace("cn-beijing"),
 		Note:        "routes groups · picks model and effort",
 		RegionLabel: "Plan", Regions: []Region{
@@ -474,6 +515,12 @@ var presets = []PresetDef{
 				KeysURL: "https://bailian.console.aliyun.com/cn-beijing/subscription/token-plan/personal"},
 		},
 		Website: "https://help.aliyun.com/zh/model-studio/decision-model-preview", KeysURL: "https://bailian.console.aliyun.com/?tab=model#/api-key"},
+	// the same decision model on the Qwen AI platform's pay as you go
+	// (#1506), at maas.qianwenaiapi.com with a key of that platform's
+	{ID: "qwen-decision", Name: "Qwen Decision Model", Short: "Qwen Decision", Icon: "qwen-color", Kind: KindVendor,
+		Decide:  "https://maas.qianwenaiapi.com/compatible-mode/v1",
+		Note:    "routes groups · picks model and effort",
+		Website: "https://www.qianwenai.com/models/decision-model-preview", KeysURL: "https://platform.qianwenai.com/home/api-keys"},
 	{ID: "ollama", Name: "Ollama", Icon: "ollama", Kind: KindLocal, NoKey: true,
 		Chat: "http://localhost:11434/v1", Anthropic: "http://localhost:11434",
 		Note: "your local models", Website: "https://ollama.com"},
@@ -483,6 +530,9 @@ var presets = []PresetDef{
 	{ID: "omlx", Name: "oMLX", Icon: "omlx", Kind: KindLocal, NoKey: true,
 		Chat: "http://localhost:8000/v1", Responses: "http://localhost:8000/v1", Anthropic: "http://localhost:8000",
 		Note: "local server on :8000", Website: "https://omlx.ai"},
+	{ID: "mlx-serve", Name: "MLX-Serve", Icon: "mlx-serve", Kind: KindLocal, NoKey: true,
+		Chat: "http://localhost:11234/v1", Responses: "http://localhost:11234/v1", Anthropic: "http://localhost:11234",
+		Note: "local server on :11234", Website: "https://github.com/ddalcu/mlx-serve"},
 }
 
 func bedrockChat(region string) string {
@@ -533,8 +583,17 @@ var presetAliases = map[string]struct{ preset, region string }{
 }
 
 // Preset finds a preset by id, or by an id it carried before
-// (presetAliases).
+// (presetAliases), or a partner listed now or before (partners.go).
 func Preset(id string) *PresetDef {
+	if pr := builtinPreset(id); pr != nil {
+		return pr
+	}
+	return partnerPreset(id)
+}
+
+// builtinPreset is the preset of that id built into magpie, partners'
+// aside.
+func builtinPreset(id string) *PresetDef {
 	if a, ok := presetAliases[id]; ok {
 		id = a.preset
 	}

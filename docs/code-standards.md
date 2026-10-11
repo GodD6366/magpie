@@ -25,6 +25,8 @@ describe and review a change to a subsystem is in the
 | Tests check behavior, not implementation. | Assert what the user or caller needs. Formatting changes and internal refactors shouldn't break a test, unless exact bytes are the requirement. |
 | A test that fails on `main` is a bug to fix now. | "Fails the same on origin/main" is not a baseline, and neither is "fails under the full run, passes alone". Fix it at its cause, or open an issue naming the cause, in a commit of its own, before shipping on top of it. From 10-05 to 10-07 dozens of commits shipped past red tests. Some were real bugs: a data race (a45b3e09), test order (bfe8bcaf), and click-scroll red since 5d871723 while dcbae2ef, 76d82528 and b2345078 shipped past it. Run `go test -race -count=20 -run X` before calling a Go test a flake. |
 | Tests stay out of the real machine. | Run them under a temp HOME with Go's caches pinned (see the snippet in [provider-plugins.md](subsystems/provider-plugins.md)). Never touch a real agent's config or `~/.config/magpie`. An agent's variable goes in `agentenv.Vars`, so the sandbox clears it. |
+| Whatever a test starts ends when the test does. | A fake process, a goroutine or an async refresh a test sets going is stopped or waited for before the test returns, or it writes into the next test's folder ("directory not empty") or spins for days. A package that isolates itself in its own `TestMain` instead of `testenv.Run` sets what testenv sets, `testenv.Marker` included. TestClaudeSignInByPaste's fake polled for 2 days (38a0f470). On 10-11 a CLI-identity ask outliving its test broke the next one (#1524): 4ee3a76b fixed it in internal/gateway only, 9c377231 for every package through the marker, which the gateway never set (a349de82). |
+| A timing test leaves room on both sides. | Never bound a test by wall-clock time a loaded runner can exceed, and keep a threshold classifier's fixture far from every threshold it has. Reproduce a timing failure by injecting the delay (a held write, a late first arrival), not by rerunning until it fails, and list every timing assumption in the test when fixing one. 319b72c7 fixed one of two loops sharing a 2000-line bound and the other went red 9h later (229ce19a). On 10-11 TestMaxRPM's flake was a real gap: a first request that reached the vendor late let the vendor see one too many in its minute (ce1ecaa4), and the queued-stream tests timed the client's clock under CPU starvation (3f4287e6). |
 
 ## Acceptance criteria
 
@@ -45,9 +47,14 @@ listed as not run, never left out.
    HOME. A test never reads or writes a live agent config (`~/.codex`,
    `~/.claude`, `~/.claude.json`, `~/.gemini` and the rest) or
    `~/.config/magpie`. Packages set this up in their `TestMain`, most with `testenv`.
-3. **The build and the suite.** Run `go vet ./...`, `go build`,
+3. **The build and the suite.** Run `gofmt -l` on the changed files (it
+   prints nothing), `go vet ./...`, `GOOS=linux go vet -tags nogui ./...`,
+   `GOOS=windows go vet ./...`, `go build`,
    `GOOS=linux go build -tags nogui`, `GOOS=windows go build` and
-   `go test -tags nogui ./...`. In a chain of commands, set
+   `go test -tags nogui ./...`. A cross-OS build doesn't compile
+   `_test.go` files; vet does. On 10-08 bbf99143's test called
+   `syscall.Getsid`, which Linux's syscall package doesn't have, and
+   bb8a3e30 and e7de897f shipped unformatted. In a chain of commands, set
    `set -o pipefail`, so that `go test | tail && git push` stops on a
    failure.
 4. **GUI tests in both engines.** A change to `internal/gui/assets` runs the
@@ -59,12 +66,28 @@ listed as not run, never left out.
    change adds an API the GUI calls, a selector or class other pages share,
    a CSS feature older WebKit lacks (`:has()`), or a layout breakpoint. On
    10-07, 479865bc, 134d388b, 61838f7c and 51626258 cleared four tests left
-   red by commits that had run only their own page's tests.
+   red by commits that had run only their own page's tests. On 10-08
+   aff4f9f2's zh-TW was built before 685fa5dc's and 9dc0121f's strings
+   (b1e795e5 added four 10 minutes later), and usage-ledger was red for
+   about 7 hours after 586f2bce. When you reword a string, `git grep` the
+   old text under `internal/gui/tests`, and test the empty case (a model
+   with no list price, an account with no usage).
 5. **Real use where possible.** A change to a provider, subscription or
    agent is also checked against the real thing: a real account or key, the
    agent's real config format, the vendor's real reply. Do this in a sandbox
    HOME with copies of the credentials. Never touch the live gateway or a
-   running magpie. If a real check isn't possible, say so.
+   running magpie. If a real check isn't possible, say so. What wasn't
+   tried with the real thing isn't built on and isn't told to users as
+   working. A platform report (Windows, WSL, Linux) is checked on that
+   platform; the Windows box and its WSL2 distro are there, and a GOOS
+   build is not a test. A test of a gateway guard goes through the real
+   server stack or the built binary (b2345078 called Handler without
+   lanGuard, and every such call got 401). When the guesses about a vendor
+   differ, design the check that tells them apart, or ask the reporter to
+   run it. On 10-08 bbf99143 said "not tried on Linux" and
+   broke Linux vet; #1185's Linux-only reap failure was reviewed on macOS
+   only. a24458ca (#1063), 5d0c1dca (MSIX not tried, said plainly) and
+   #1328 (on the Windows box, six break checks) are the model.
 6. **The UI rules** under [GUI](#gui) hold: `t()` strings, the app's own
    menu instead of `<select>`, no scroll on click, no colored left-border
    stripes.

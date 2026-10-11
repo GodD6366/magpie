@@ -1,11 +1,13 @@
 package main
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
 	"maps"
 	"os"
+	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
@@ -29,27 +31,36 @@ const providerUsage = `usage:
   magpie provider <id>                    show one provider and its models
   magpie provider add <preset> <key>      add a preset vendor   e.g. magpie provider add deepseek sk-…
                                           again, it adds another (deepseek-2); k=v pairs too: id, name, header.X-Foo
-  magpie provider add <name> k=v…         add a custom vendor   k: url, anthropic, responses, decide, key, models, catalog, icon, header.X-Foo, balance, balance.path, balance.token, models.url, search
+  magpie provider add <name> k=v…         add a custom vendor   k: url, anthropic, responses, gemini, decide, key, models, catalog, icon, header.X-Foo, balance, balance.path, balance.token, models.url, search,
+                                          access.key, access.secret (a Volcengine account's access key, for its plan's windows)
   magpie provider set <id> k=v…           change a provider's settings, with the same k=v pairs as add
   magpie provider key <id> <key>          change the API key
   magpie provider icon <id> <file|name>   give a custom provider a picture (PNG, JPEG, SVG…) or a built-in icon
   magpie provider fallback <id> <provider/model>…   where requests go when it's out of quota or down (none clears)
-  magpie provider models <id> [ids…]      fetch the vendor's model list, or choose which models to expose
-  magpie provider refresh <id>            fetch the vendor's model list again (as the app's Refresh)
+  magpie provider models <id> [ids…]      fetch the vendor's model list, or choose which models to expose:
+                                          ids… replace the list, +id adds one, -id takes one out, all: the default
+  magpie provider refresh <id>            fetch the vendor's model list again (as the app's Fetch models)
   magpie provider account-models <id> [account|key [ids…|all]]
                                           the models one account or key alone serves; all: every model the provider has
   magpie provider account-cap <id> [account [percent|off]]
                                           use a subscription account up to a share of each usage window (e.g. 70):
                                           at it, routing takes the account for used up until the window renews
+  magpie provider account-cap <id> <account> --window <name> [percent|none|default]
+                                          a share for one window alone (e.g. "5 hours" 50): none is no cap on it,
+                                          default has it follow the account's cap
   magpie provider account-concurrency <id> [account|key [n|off|default]]
                                           how many requests one account or key has out at once, over every model,
                                           routing group and agent: its own, off for none, default for the provider's
   magpie provider queue <id> [length [seconds]]
                                           how many may wait for each account or key past its limit, and how long;
                                           past either a request is turned away with a 429 (0: no bound)
+  magpie provider rpm <id> [n|off]        how many requests each account or key sends the vendor in any minute;
+                                          one more waits for room, up to 2 minutes, then is turned away with a 429
   magpie provider listed <id> yes|no      no: its models serve only through routing groups, not in the list
   magpie provider off|on <id>             switch it off (kept, but no agent or request uses it), or on again
-  magpie provider test <id> [model…]      send a tiny request through each endpoint, or to each model
+  magpie provider test <id> [--as codex|claude-code] [model…]
+                                          send a tiny request through each endpoint, or to each model;
+                                          --as asks it as that agent does, for a relay that serves only it
   magpie provider rm <id>                 remove a provider
 
   e.g. magpie provider add "My Relay" url=https://relay.example.com/v1 key=sk-…
@@ -59,6 +70,14 @@ const providerUsage = `usage:
                                    (another computer's magpie, shared on its network: its models and routing
                                     groups as office/…, each request sent on in the API the agent spoke)
        magpie provider add bailian-decision sk-… workspace=<workspace id>   (or region=ap-southeast-1, or region=token-plan with an sk-sp- key)
+       magpie provider add bailian-token-plan sk-sp-…   (Bailian's Token Plan: its chat models, and its decision model for routing groups;
+                                    qwen-token-plan is the Qwen AI platform's, qwen-decision its pay-as-you-go decision model)
+       magpie provider add google-vertex project=my-project impersonate=vertex@my-project.iam.gserviceaccount.com
+                                   (Google Vertex AI in your Google Cloud project, with no key: signed with gcloud's
+                                    Application Default Credentials (gcloud auth application-default login) unless
+                                    credentials=<file> names another, a service account key too; impersonate= needs
+                                    roles/iam.serviceAccountTokenCreator on that account; location= global (the
+                                    default), us, eu or a region such as us-central1; set changes them, empty clears)
        magpie provider add "My Decider" decide=https://decide.example.com/v1 key=sk-… models=my-decision-model
                                    (a System One API, POST …/systemone: it routes groups, its models are never an agent's)
        magpie provider add anthropic sk-… id=anthropic-ws2 name="Anthropic WS2" header.anthropic-workspace-id=wrkspc_…
@@ -110,6 +129,18 @@ func providers() error {
 			r.key = faint.Render("○ switched off")
 		case p.Account != nil:
 			r.key = green.Render("●") + " " + muted.Render("signed in as "+p.Account.User)
+		case p.IsVertex() && !p.Ready():
+			// no project an address can be made of (providers.json edited
+			// by hand): nothing is asked, as the app's row says
+			r.key = amber.Render("○ needs a project")
+		case p.IsVertex():
+			// no key: a token minted from the user's Google credentials,
+			// traded for a service account's when it impersonates one
+			who := "Google credentials"
+			if p.Vertex != nil && p.Vertex.Impersonate != "" {
+				who += " as " + p.Vertex.Impersonate
+			}
+			r.key = green.Render("●") + " " + muted.Render(who)
 		case p.Key != "":
 			r.key = green.Render("●") + " " + muted.Render(provider.Mask(p.Key))
 		case p.Ready():
@@ -187,18 +218,30 @@ func presets() error {
 		have[p.ID], have[p.Preset] = true, true
 	}
 	kind := provider.Kind("")
-	for _, pr := range provider.Presets() {
+	// partners first, as the app lists them: their heading says they pay
+	all := []provider.PresetDef{}
+	var shown []string
+	for _, pa := range provider.PartnersNow(3 * time.Second) {
+		all = append(all, pa.PresetDef)
+		shown = append(shown, pa.ID)
+	}
+	provider.CountPartner(provider.PartnerShown, shown...)
+	provider.NoticePartners(shown...)
+	for _, pr := range append(all, provider.Presets()...) {
 		if pr.Kind != kind {
 			kind = pr.Kind
-			fmt.Println(faint.Render("  " + map[provider.Kind]string{provider.KindVendor: "vendors", provider.KindRelay: "relays", provider.KindLocal: "local"}[kind]))
+			fmt.Println(faint.Render("  " + map[provider.Kind]string{provider.KindPartner: "partners (sponsors)", provider.KindVendor: "vendors", provider.KindRelay: "relays", provider.KindLocal: "local"}[kind]))
 		}
 		name := bold.Render(pr.Name)
-		if pr.Sponsored {
+		if pr.Sponsored && pr.Kind != provider.KindPartner {
 			name += " " + faint.Render("sponsored")
 		}
 		state := muted.Render("magpie provider add " + pr.ID + " <key>")
 		if pr.NoKey {
 			state = muted.Render("magpie provider add " + pr.ID)
+		}
+		if pr.ID == provider.VertexPreset {
+			state = muted.Render("magpie provider add " + pr.ID + " project=<project id>")
 		}
 		if have[pr.ID] {
 			state = green.Render("✓ added")
@@ -225,7 +268,9 @@ func models(args []string) error {
 		}
 		entries, hidden = provider.CatalogFor(agentID)
 	}
-	if len(entries) == 0 && agentID != "" {
+	if _, only := provider.PickedModels(agentID); len(entries) == 0 && agentID != "" && only {
+		fmt.Println(amber.Render("!"), agentID, "is shown none of them: it is shown only the models picked for it, and none is", muted.Render("· tick some in its list on the Agents page, or magpie visible "+agentID+" --show-new"))
+	} else if len(entries) == 0 && agentID != "" {
 		names, _ := provider.VisibleTo(agentID)
 		fmt.Println(amber.Render("!"), agentID, "is shown none of them: nothing is in", strings.Join(names, ", "), muted.Render("· magpie visible "+agentID+" all shows it every model"))
 	} else if len(entries) == 0 && bad != nil {
@@ -260,8 +305,48 @@ func models(args []string) error {
 	if agentID != "" {
 		explainHidden(agentID, hidden)
 	}
+	// the models a provider's list has that it doesn't expose, which a
+	// group naming one finds "not served" (MOMO on Discord: 35 of 37)
+	for _, p := range provider.All() {
+		if !p.On() || p.Unlisted {
+			continue
+		}
+		if ids, why := notExposed(p); len(ids) > 0 {
+			fmt.Println(faint.Render("  "+p.Name+": "+plural(len(ids), "more model")+" in its list, not exposed ("+why+"): ") + muted.Render(listSome(ids, 6)))
+			fmt.Println(faint.Render("    magpie provider models " + p.ID + " +<model> exposes one"))
+		}
+	}
 	fmt.Println(faint.Render("  " + advertisedURL() + "/v1"))
 	return bad
+}
+
+// notExposed are the models p's list has that it doesn't expose, and why:
+// the user picked others, or no picks and the list is longer than magpie
+// exposes by default.
+func notExposed(p provider.Provider) ([]string, string) {
+	shown := map[string]bool{}
+	for _, m := range p.Exposed() {
+		shown[m.ID] = true
+	}
+	var out []string
+	for _, m := range p.Available() {
+		if !shown[m.ID] {
+			out = append(out, m.ID)
+		}
+	}
+	why := "not picked"
+	if len(p.Models) == 0 {
+		why = fmt.Sprintf("none picked, so only the first %d", len(shown))
+	}
+	return out, why
+}
+
+// listSome is ids joined, the first n of them and how many more.
+func listSome(ids []string, n int) string {
+	if len(ids) > n {
+		return strings.Join(ids[:n], ", ") + fmt.Sprintf(" … %d more", len(ids)-n)
+	}
+	return strings.Join(ids, ", ")
 }
 
 // providerCmd: `magpie provider <verb> …`
@@ -285,6 +370,7 @@ func providerCmd(args []string) error {
 		// id= renames it: the rest is saved under the id it has, then the
 		// groups and agents on its models move to the new one
 		from := p.ID
+		before := *p
 		if err := applyPairs(p, rest[1:]); err != nil {
 			return err
 		}
@@ -304,6 +390,10 @@ func providerCmd(args []string) error {
 			}
 		}
 		fmt.Println(green.Render("✓"), "saved", p.Name, muted.Render("("+p.ID+")"))
+		if !slices.Equal(before.Models, p.Models) {
+			// models= replaces the picks, as provider models does
+			printPicksChange(before, *p, nil)
+		}
 		return nil
 	case "key":
 		if len(rest) != 2 {
@@ -312,6 +402,9 @@ func providerCmd(args []string) error {
 		p, err := provider.Find(rest[0])
 		if err != nil {
 			return err
+		}
+		if p.IsVertex() {
+			return fmt.Errorf("%s is asked with your Google credentials, not an API key · magpie provider set %s credentials=<file> impersonate=<service account> changes them", p.Name, p.ID)
 		}
 		p.Key = rest[1]
 		if err := provider.Save(*p); err != nil {
@@ -393,8 +486,19 @@ func providerCmd(args []string) error {
 		return nil
 	case "test":
 		// with models named, a request to each of them; else one per endpoint
+		// --as codex|claude-code, anywhere after test: asked as that agent asks
+		as := ""
+		for i := 0; i < len(rest); i++ {
+			if v, ok := strings.CutPrefix(rest[i], "--as="); ok {
+				as, rest = v, slices.Delete(slices.Clone(rest), i, i+1)
+				i--
+			} else if rest[i] == "--as" && i+1 < len(rest) {
+				as, rest = rest[i+1], slices.Delete(slices.Clone(rest), i, i+2)
+				i--
+			}
+		}
 		if len(rest) < 1 {
-			return fmt.Errorf("magpie provider test <id> [model…]")
+			return fmt.Errorf("magpie provider test <id> [--as codex|claude-code] [model…]")
 		}
 		p, err := provider.Find(rest[0])
 		if err != nil {
@@ -404,7 +508,7 @@ func providerCmd(args []string) error {
 		if models := rest[1:]; len(models) > 0 {
 			res, wait = func(ctx context.Context) []provider.Result { return p.TestModels(ctx, models) }, 90*time.Second
 		}
-		ctx, cancel := context.WithTimeout(context.Background(), wait)
+		ctx, cancel := context.WithTimeout(provider.TestAs(context.Background(), as), wait)
 		defer cancel()
 		ok := true
 		for _, r := range res(ctx) {
@@ -434,6 +538,8 @@ func providerCmd(args []string) error {
 		return accountConcurrencyCmd(rest)
 	case "queue":
 		return queueCmd(rest)
+	case "rpm":
+		return rpmCmd(rest)
 	case "listed":
 		// no: the provider's models leave the list agents see and serve
 		// only through the routing groups they are in
@@ -487,13 +593,16 @@ func providerCmd(args []string) error {
 			return fmt.Errorf("magpie provider %s <id> fetches its list · magpie provider models <id> <ids…> picks from it", verb)
 		}
 		if len(rest) > 1 {
-			p.Models = rest[1:]
-			if len(rest) == 2 && (rest[1] == "-" || rest[1] == "all") {
-				p.Models = nil
+			before := *p
+			picks, err := editPicks(*p, rest[1:])
+			if err != nil {
+				return err
 			}
+			p.Models = picks
 			if err := provider.Save(*p); err != nil {
 				return err
 			}
+			printPicksChange(before, *p, rest[1:])
 			return showProvider(*p)
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -535,6 +644,9 @@ func addProvider(rest []string) error {
 	if pr, err := provider.FromPreset(strings.ToLower(rest[0])); err == nil {
 		p = pr
 		if len(rest) > 1 && !strings.Contains(rest[1], "=") {
+			if p.IsVertex() {
+				return fmt.Errorf("%s is asked with your Google credentials, not an API key · magpie provider add %s project=<your Google Cloud project's id>", p.Name, p.ID)
+			}
 			p.Key = rest[1]
 			rest = rest[2:]
 		} else {
@@ -550,6 +662,10 @@ func addProvider(rest []string) error {
 	// adding a preset that is already here adds another of it (deepseek-2),
 	// for another key or another header, rather than replacing the first
 	id, err := provider.Add(p)
+	if err != nil && p.IsVertex() && (p.Vertex == nil || strings.TrimSpace(p.Vertex.Project) == "") {
+		// the pair that gives the project, which Save's words don't name
+		return fmt.Errorf("%w · magpie provider add %s project=<your Google Cloud project's id>", err, p.Preset)
+	}
 	if err != nil {
 		return err
 	}
@@ -580,12 +696,12 @@ func announce(id string) error {
 	defer cancel()
 	if ms, err := saved.Fetch(ctx); err == nil {
 		fmt.Println(green.Render("✓"), len(ms), "models from", fetchedFrom(*saved))
-	} else if !saved.Decides() {
+	} else if !saved.DecideOnly() {
 		// the URLs asked and what they said; the base stays as given
 		fmt.Println(amber.Render("!"), muted.Render(err.Error()))
 	}
 	n := len(saved.Exposed())
-	if saved.Decides() {
+	if saved.DecideOnly() {
 		fmt.Println("  it routes groups: magpie group set <id> effort=auto classifier="+saved.ID+"/"+saved.Jev(),
 			muted.Render("· or a rule's intent=…"))
 		return nil
@@ -613,6 +729,7 @@ func showProvider(p provider.Provider) error {
 	kv("chat", p.Chat)
 	kv("responses", p.Responses)
 	kv("anthropic", p.Anthropic)
+	kv("gemini", p.Gemini)
 	if p.Searches {
 		kv("search", "by itself"+muted.Render("  a client's web search goes to it as sent"))
 	}
@@ -637,6 +754,25 @@ func showProvider(p provider.Provider) error {
 			}
 		}
 		kv("account", who+muted.Render("  from "+from))
+	case p.IsVertex():
+		// no key: where its requests go, and the Google credentials that
+		// sign them
+		v := provider.Vertex{}
+		if p.Vertex != nil {
+			v = *p.Vertex
+		}
+		project := v.Project
+		if !p.Ready() {
+			project = amber.Render(cmp.Or(project, "not set")) + muted.Render("  magpie provider set "+p.ID+" project=…")
+		}
+		kv("project", project)
+		kv("location", v.Location)
+		creds := v.Credentials
+		if creds == "" {
+			creds = "gcloud's Application Default Credentials" + muted.Render("  gcloud auth application-default login")
+		}
+		kv("signs with", creds)
+		kv("as", v.Impersonate)
 	case p.Key != "":
 		kv("key", muted.Render(provider.Mask(p.Key)))
 	case p.Ready():
@@ -669,6 +805,9 @@ func showProvider(p provider.Provider) error {
 		src = fetchedFrom(p) + " · fetched " + ago(t)
 	}
 	kv("models", fmt.Sprintf("%d exposed of %d %s", len(ms), len(p.Available()), muted.Render("from "+src)))
+	if ids, why := notExposed(p); len(ids) > 0 {
+		kv("not shown", fmt.Sprintf("%s %s", listSome(ids, 8), muted.Render("· "+why+" · magpie provider models "+p.ID+" +<model> exposes one")))
+	}
 	names := p.ModelNames()
 	for i, m := range ms {
 		if i == 12 {
@@ -697,6 +836,12 @@ func applyPairs(p *provider.Provider, pairs []string) error {
 		if !ok {
 			return fmt.Errorf("expected key=value, got %q\n\n%s", kv, providerUsage)
 		}
+		if p.IsVertex() && slices.Contains([]string{"url", "chat", "openai", "responses", "anthropic", "decide"}, strings.ToLower(k)) {
+			// asked only at the address its project and location make, so
+			// that its Google token goes nowhere else: one given here would
+			// be dropped without a word
+			return fmt.Errorf("%s is asked at its Google Cloud project's own address: project= and location= say where", p.Name)
+		}
 		switch strings.ToLower(k) {
 		case "id":
 			p.ID = v
@@ -708,14 +853,51 @@ func applyPairs(p *provider.Provider, pairs []string) error {
 			p.Responses = v
 		case "anthropic":
 			p.Anthropic = v
+		case "gemini":
+			// a Gemini API's base (…/v1beta), Google's or one that
+			// answers as it does (#1346)
+			p.Gemini = v
 		case "decide":
 			// a System One root (…/systemone is asked under it): the
 			// provider routes groups, its models any name (#647)
 			p.Decide = v
 		case "workspace":
 			workspace = strings.TrimSpace(v)
+		case "project", "location", "credentials", "impersonate":
+			// Google Vertex AI's project and location, and the Google
+			// credentials that sign its requests in place of a key; empty
+			// clears one, and location= is global again
+			if !p.IsVertex() {
+				return fmt.Errorf("%s= is Google Vertex AI's, and %s isn't Vertex AI", strings.ToLower(k), p.Name)
+			}
+			x := provider.Vertex{}
+			if p.Vertex != nil {
+				x = *p.Vertex
+			}
+			switch v = strings.TrimSpace(v); strings.ToLower(k) {
+			case "project":
+				x.Project = v
+			case "location":
+				x.Location = v
+			case "credentials":
+				// a file named from where the command runs: the gateway,
+				// which runs nowhere in particular, needs its full path
+				if v != "" && !filepath.IsAbs(v) && !strings.HasPrefix(v, "~") {
+					if abs, err := filepath.Abs(v); err == nil {
+						v = abs
+					}
+				}
+				x.Credentials = v
+			default:
+				x.Impersonate = v
+			}
+			p.Vertex = &x
 		case "region", "plan":
 			pr := provider.Preset(p.Preset)
+			if p.IsVertex() {
+				// what Google Cloud calls a region is Vertex AI's location
+				return fmt.Errorf("%s has no regions or plans to pick: location= says where it is asked (global, us, eu or a region such as us-central1)", p.Name)
+			}
 			if pr == nil || len(pr.Regions) == 0 {
 				return fmt.Errorf("%s has no regions or plans to pick", p.Name)
 			}
@@ -748,6 +930,12 @@ func applyPairs(p *provider.Provider, pairs []string) error {
 			p.BalancePath = v
 		case "balance.token":
 			p.BalanceToken = v
+		case "access.key":
+			// a Volcengine account's access key, which Ark tells its
+			// Coding or Agent Plan's windows to (#1427)
+			p.AccessKeyID = v
+		case "access.secret":
+			p.SecretAccessKey = v
 		case "models.url":
 			p.ModelsURL = v
 		case "search":
@@ -878,15 +1066,16 @@ func refreshLive(ctx context.Context) {
 	}
 }
 
-// keyNote says who the gateway takes any key from: this machine alone,
-// unless MAGPIE_ADDR puts it on the network (a server, a Docker image)
-// without sharing it from Settings, when it is anyone who reaches it.
+// keyNote says who the gateway takes any key from: this machine (in a
+// container, the container) alone. Shared from Settings, or put on the
+// network by MAGPIE_ADDR (a server, a Docker image), it takes others with
+// an enabled gateway key.
 func keyNote() string {
-	if s := settings.Load(); s.LAN {
+	if settings.Load().LAN || gateway.OnNetwork() {
+		if gateway.InContainer() {
+			return "(anything works inside the container; from its host and other machines, an enabled gateway key — magpie gateway-key add <name>)"
+		}
 		return "(anything works from this machine; from others, an enabled gateway key — magpie gateway-key add <name>)"
-	}
-	if gateway.OpenToAnyone() {
-		return "(anything works, from anyone who reaches it — share it from Settings to require a key)"
 	}
 	return "(anything works; the gateway only listens on localhost)"
 }
@@ -926,6 +1115,9 @@ func serve() error {
 	s := gateway.New()
 	go stats.Run(version, "serve")
 	go catalog.KeepFresh() // new models' prices, in a gateway left running
+	// Codex's background app-server, restarted when it has the list from
+	// before a change and no codex session is on it
+	go agent.KeepCodexDaemonCurrent(context.Background())
 	public := advertisedURL()
 	fmt.Println(green.Render("●"), "magpie gateway on", bold.Render(gateway.URL()))
 	fmt.Println(muted.Render("  OpenAI  "), public+"/v1/chat/completions", muted.Render("·"), public+"/v1/responses")
@@ -1061,10 +1253,30 @@ func accountModelsCmd(rest []string) error {
 
 // accountCapCmd shows, or sets with a share or off, the usage cap of a
 // subscription's accounts: the share of each window one is used to at most
-// (provider.AccountCaps).
+// (provider.AccountCaps); with --window <name>, the share of that window
+// alone (provider.AccountWindowCaps).
 func accountCapCmd(rest []string) error {
-	if len(rest) < 1 {
-		return fmt.Errorf("magpie provider account-cap <id> [account [percent|off]]")
+	usage := fmt.Errorf("magpie provider account-cap <id> [account [percent|off]]\n       magpie provider account-cap <id> <account> --window <name> [percent|none|default]")
+	window, windowSet := "", false
+	for i := 0; i < len(rest); i++ {
+		a := rest[i]
+		if v, ok := strings.CutPrefix(a, "--window="); ok {
+			window, windowSet = v, true
+			rest = slices.Delete(slices.Clone(rest), i, i+1)
+			i--
+			continue
+		}
+		if a == "--window" {
+			if i+1 >= len(rest) {
+				return usage
+			}
+			window, windowSet = rest[i+1], true
+			rest = slices.Delete(slices.Clone(rest), i, i+2)
+			i--
+		}
+	}
+	if len(rest) < 1 || windowSet && (len(rest) < 2 || strings.TrimSpace(window) == "") {
+		return usage
 	}
 	p, err := provider.Find(rest[0])
 	if err != nil {
@@ -1074,12 +1286,23 @@ func accountCapCmd(rest []string) error {
 		return fmt.Errorf("%s has keys, not subscription accounts with usage windows to cap", p.Name)
 	}
 	if len(rest) > 2 {
-		cap, err := provider.ParseCap(rest[2])
-		if err != nil {
-			return err
-		}
-		if err := provider.SetAccountCap(p.ID, rest[1], cap); err != nil {
-			return err
+		if windowSet {
+			cap, err := parseWindowCap(rest[2])
+			if err != nil {
+				return err
+			}
+			err = provider.SetWindowCap(p.ID, rest[1], window, cap)
+			if err != nil {
+				return err
+			}
+		} else {
+			cap, err := provider.ParseCap(rest[2])
+			if err != nil {
+				return err
+			}
+			if err := provider.SetAccountCap(p.ID, rest[1], cap); err != nil {
+				return err
+			}
 		}
 		if p, err = provider.Find(p.ID); err != nil {
 			return err
@@ -1097,13 +1320,40 @@ func accountCapCmd(rest []string) error {
 		return nil
 	}
 	for _, r := range refs {
-		if c := p.AccountCap(r); c > 0 {
-			fmt.Printf("%s · capped at %d%% of each usage window\n", r, c)
+		caps := p.CapsOf(r)
+		if caps.All > 0 {
+			fmt.Printf("%s · capped at %d%% of each usage window\n", r, caps.All)
+		} else if len(caps.Windows) > 0 {
+			fmt.Println(r, muted.Render("· no cap on its other windows: used to 100%"))
 		} else {
 			fmt.Println(r, muted.Render("· no cap: used to 100%"))
 		}
+		for _, w := range slices.Sorted(maps.Keys(caps.Windows)) {
+			if c := caps.Windows[w]; c >= 100 {
+				fmt.Printf("  %s · no cap on this window\n", w)
+			} else {
+				fmt.Printf("  %s · capped at %d%%\n", w, c)
+			}
+		}
 	}
 	return nil
+}
+
+// parseWindowCap reads a window's own share as the CLI takes it: "50",
+// "50%", none (off, 100) for no cap on that window, default (-) to follow
+// the account's cap.
+func parseWindowCap(s string) (int, error) {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "default", "account", "-", "0":
+		return 0, nil
+	case "none", "off", "no", "100", "100%":
+		return 100, nil
+	}
+	n, err := provider.ParseCap(s)
+	if err != nil {
+		return 0, fmt.Errorf("a window's cap is a share from %d to %d (percent), none for no cap on it, or default to follow the account's cap, not %q", provider.MinCap, provider.MaxCap, s)
+	}
+	return n, nil
 }
 
 // accountConcurrencyCmd shows, or sets, the limit on requests at once of a
@@ -1221,6 +1471,41 @@ func queueCmd(rest []string) error {
 	return nil
 }
 
+// rpmCmd shows, or sets, how many requests each of a provider's accounts
+// or keys sends the vendor in any minute (coeo91 on Discord: OpenRouter's
+// free models take 20).
+func rpmCmd(rest []string) error {
+	if len(rest) < 1 || len(rest) > 2 {
+		return fmt.Errorf("magpie provider rpm <id> [n|off]")
+	}
+	p, err := provider.Find(rest[0])
+	if err != nil {
+		return err
+	}
+	if len(rest) > 1 {
+		n := 0
+		switch s := strings.ToLower(strings.TrimSpace(rest[1])); s {
+		case "off", "none", "no", "-":
+		default:
+			if n, err = strconv.Atoi(s); err != nil {
+				return fmt.Errorf("requests a minute is a whole number, or off, not %q", rest[1])
+			}
+		}
+		if err := provider.SetRPM(p.ID, n); err != nil {
+			return err
+		}
+		if p, err = provider.Find(p.ID); err != nil {
+			return err
+		}
+	}
+	if n := p.RPMLimit(); n > 0 {
+		fmt.Printf("%s · each account or key: at most %d requests a minute\n", p.Name, n)
+	} else {
+		fmt.Printf("%s · each account or key: no limit on requests a minute\n", p.Name)
+	}
+	return nil
+}
+
 // printMoved says which agents a change moved off models it stopped
 // serving (agent.Reseat).
 func printMoved(moved []agent.Move) {
@@ -1230,5 +1515,111 @@ func printMoved(moved []agent.Move) {
 			continue
 		}
 		fmt.Println(green.Render("✓"), "moved", m.String())
+	}
+}
+
+// editPicks works out a provider's picks from `magpie provider models <id>
+// args…`: plain ids replace them, all (or -) gives the default back, and
+// +id / -id add one to or take one out of the models exposed now, so a
+// user adding a model keeps the rest (MOMO on Discord: 35 exposed → 8).
+func editPicks(p provider.Provider, args []string) ([]string, error) {
+	if len(args) == 1 && (args[0] == "-" || args[0] == "all") {
+		return nil, nil
+	}
+	edits := 0
+	for _, a := range args {
+		if len(a) > 1 && (a[0] == '+' || a[0] == '-') {
+			edits++
+		}
+	}
+	if edits == 0 {
+		return slices.Clone(args), nil
+	}
+	if edits != len(args) {
+		return nil, fmt.Errorf("give either the whole list (magpie provider models %s a b c) or only changes (+a -b), not both", p.ID)
+	}
+	picks := slices.Clone(p.Models)
+	if len(picks) == 0 {
+		// no picks yet: the change is to the models exposed by default
+		for _, m := range p.Exposed() {
+			picks = append(picks, m.ID)
+		}
+	}
+	for _, a := range args {
+		id := strings.TrimPrefix(a[1:], p.ID+"/")
+		if a[0] == '+' {
+			if !slices.Contains(picks, id) {
+				picks = append(picks, id)
+			}
+			continue
+		}
+		i := slices.Index(picks, id)
+		if i < 0 {
+			return nil, fmt.Errorf("%s/%s isn't exposed, so there is nothing to take out", p.ID, id)
+		}
+		picks = slices.Delete(picks, i, i+1)
+	}
+	if len(picks) == 0 {
+		// no picks means the default list, not none
+		return nil, fmt.Errorf("that leaves no model exposed · to keep %s's models out of the list: magpie provider listed %s no", p.Name, p.ID)
+	}
+	return picks, nil
+}
+
+// printPicksChange says what a change to a provider's picks did: how many
+// models were exposed before and after, and which went or came. A list
+// that replaced the old one says so, and how to add one instead.
+func printPicksChange(before, after provider.Provider, args []string) {
+	ids := func(p provider.Provider) []string {
+		var out []string
+		for _, m := range p.Exposed() {
+			out = append(out, m.ID)
+		}
+		return out
+	}
+	was, now := ids(before), ids(after)
+	var gone, added []string
+	for _, id := range was {
+		if !slices.Contains(now, id) {
+			gone = append(gone, id)
+		}
+	}
+	for _, id := range now {
+		if !slices.Contains(was, id) {
+			added = append(added, id)
+		}
+	}
+	replaced := len(args) > 0 && !strings.HasPrefix(args[0], "+") && !(len(args[0]) > 1 && args[0][0] == '-')
+	if len(args) == 0 {
+		replaced = true // provider set models=
+	}
+	what := "exposed models"
+	if replaced && len(after.Models) > 0 {
+		what = "exposed models replaced"
+	}
+	fmt.Println(green.Render("✓"), what+":", len(was), "→", len(now))
+	list := func(ms []string) string {
+		if len(ms) > 8 {
+			return strings.Join(ms[:8], ", ") + fmt.Sprintf(" … %d more", len(ms)-8)
+		}
+		return strings.Join(ms, ", ")
+	}
+	if len(added) > 0 {
+		fmt.Println(" ", green.Render("+"), list(added))
+	}
+	if len(gone) > 0 {
+		fmt.Println(" ", amber.Render("-"), list(gone))
+	}
+	if replaced && len(gone) > 0 && len(after.Models) > 0 {
+		fmt.Println(muted.Render("  the ids given are now the whole list · to add one and keep the rest: magpie provider models " + after.ID + " +<model>"))
+	}
+	avail := map[string]bool{}
+	for _, m := range after.Available() {
+		avail[m.ID] = true
+	}
+	for _, id := range added {
+		if len(avail) > 0 && !avail[id] {
+			fmt.Println(" ", amber.Render("!"), after.ID+"/"+id, muted.Render("isn't in "+after.Name+"'s list; exposed as given"))
+		}
 	}
 }

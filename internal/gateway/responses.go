@@ -255,7 +255,7 @@ func parseResponses(body []byte) (*Request, error) {
 		return nil, fmt.Errorf("invalid request: %v", err)
 	}
 	r := &Request{Model: q.Model, System: q.Instructions, MaxTokens: q.MaxOutputTokens, Temp: q.Temperature,
-		TopP: q.TopP, Stream: q.Stream, Parallel: q.ParallelToolCalls, Fast: q.ServiceTier == "priority", CacheKey: q.PromptCacheKey, Include: q.Include,
+		TopP: q.TopP, Stream: q.Stream, Parallel: q.ParallelToolCalls, Fast: q.ServiceTier == "priority" || q.ServiceTier == "ultrafast", Ultrafast: q.ServiceTier == "ultrafast", Tier: q.ServiceTier, CacheKey: q.PromptCacheKey, Include: q.Include,
 		ClientMetadata: sentRaw(q.ClientMetadata)}
 	r.Text, r.Format = textFormat(sentRaw(q.Text))
 	if q.Reasoning != nil {
@@ -279,7 +279,7 @@ func parseResponses(body []byte) (*Request, error) {
 		// written to the vendor's cache again (Anthropic's system comes
 		// first; a Claude subscription's waiting run is found by it) (#502)
 		replied := false
-		var rawItems []json.RawMessage // decoded only for native standalone outputs
+		var rawItems []json.RawMessage // decoded only for native standalone outputs and sealed reasoning
 		for i, it := range items {
 			if it.Role == "assistant" || strings.HasPrefix(it.Type, "function_call") || strings.HasPrefix(it.Type, "custom_tool_call") || strings.HasPrefix(it.Type, "tool_search") || it.Type == "reasoning" {
 				replied = true
@@ -362,8 +362,19 @@ func parseResponses(body []byte) (*Request, error) {
 						b.WriteString(s.Text)
 					}
 				}
-				if b.Len() > 0 {
-					r.Messages = append(r.Messages, Message{Role: "assistant", Parts: []Part{{Kind: Thinking, Text: b.String()}}})
+				part := Part{Kind: Thinking, Text: b.String()}
+				if it.EncryptedContent != "" {
+					// sealed: the item goes back to a Responses API as it
+					// came, id, summary and all (#1445)
+					if rawItems == nil {
+						_ = json.Unmarshal(q.Input, &rawItems)
+					}
+					if i < len(rawItems) {
+						part.Sealed, part.SealedBy = rawItems[i], sealResponses
+					}
+				}
+				if b.Len() > 0 || part.Sealed != nil {
+					r.Messages = append(r.Messages, Message{Role: "assistant", Parts: []Part{part}})
 				}
 			}
 		}
@@ -553,6 +564,82 @@ func orphanedToolOutputs(body []byte) []byte {
 	return encoded
 }
 
+// pairToolItems gives a Responses request's tool call that no result in
+// the request answers a synthetic one, as pairToolMessages does for a Chat
+// request: an upstream that checks the exchange on the chat form it turns
+// the request into refuses a lone call — Volcengine's coding plan answers
+// 400 "An assistant message with 'tool_calls' must be followed by tool
+// messages responding to each 'tool_call_id'" (#1341), and OpenAI's own
+// Responses API "No tool output found for function call". The result goes
+// at the end of the run of calls and results the call is in, where a chat
+// form has its tool messages. A result with no call is left to
+// orphanedToolOutputs, and one naming a call another request carried
+// (previous_response_id) stays as it is.
+func pairToolItems(body []byte) []byte {
+	if !bytes.Contains(body, []byte(`_call"`)) {
+		return body
+	}
+	var q map[string]json.RawMessage
+	if json.Unmarshal(body, &q) != nil {
+		return body
+	}
+	var input []json.RawMessage
+	if json.Unmarshal(q["input"], &input) != nil {
+		return body
+	}
+	type item struct {
+		Type   string `json:"type"`
+		CallID string `json:"call_id"`
+	}
+	items := make([]item, len(input))
+	answered := map[string]bool{}
+	for i, raw := range input {
+		if json.Unmarshal(raw, &items[i]) != nil {
+			items[i] = item{}
+		}
+		if t := items[i].Type; (t == "function_call_output" || t == "custom_tool_call_output") && items[i].CallID != "" {
+			answered[items[i].CallID] = true
+		}
+	}
+	exchange := func(t string) bool {
+		switch t {
+		case "function_call", "custom_tool_call", "tool_search_call",
+			"function_call_output", "custom_tool_call_output", "tool_search_output":
+			return true
+		}
+		return false
+	}
+	out := make([]json.RawMessage, 0, len(input)+1)
+	var synthetic []json.RawMessage // results owed by the run in progress
+	for i, raw := range input {
+		out = append(out, raw)
+		it := items[i]
+		if (it.Type == "function_call" || it.Type == "custom_tool_call") && it.CallID != "" && !answered[it.CallID] {
+			kind := "function_call_output"
+			if it.Type == "custom_tool_call" {
+				kind = "custom_tool_call_output"
+			}
+			result, _ := marshalPlain(map[string]any{"type": kind, "call_id": it.CallID,
+				"output": "[The result of this tool call is unavailable: the turn was interrupted.]"})
+			synthetic = append(synthetic, result)
+			answered[it.CallID] = true
+		}
+		if len(synthetic) > 0 && exchange(it.Type) && (i+1 == len(input) || !exchange(items[i+1].Type)) {
+			out = append(out, synthetic...)
+			synthetic = nil
+		}
+	}
+	if len(out) == len(input) {
+		return body
+	}
+	q["input"], _ = marshalPlain(out)
+	encoded, err := marshalPlain(q)
+	if err != nil {
+		return body
+	}
+	return encoded
+}
+
 // mergeTurns joins consecutive messages of the same role, since the
 // Responses API splits an assistant turn into one item per part.
 func mergeTurns(msgs []Message) []Message {
@@ -663,6 +750,21 @@ func withReasoningText(body []byte) []byte {
 	return nb
 }
 
+// sealedReasoning is a reasoning item a Responses API sealed, fit to go
+// back to one as it came: encrypted_content in it, and no reasoning text
+// (which OpenAI and the ChatGPT backend refuse in input, #1411; one with
+// text goes as before).
+func sealedReasoning(p Part) bool {
+	if !p.sealedBy(sealResponses) {
+		return false
+	}
+	var it struct {
+		Enc     string            `json:"encrypted_content"`
+		Content []json.RawMessage `json:"content"`
+	}
+	return json.Unmarshal(p.Sealed, &it) == nil && it.Enc != "" && len(it.Content) == 0
+}
+
 // buildResponses renders a request for a Responses upstream.
 func buildResponses(r *Request, model, host string, rejectTemp bool) []byte {
 	// A turn's reasoning goes back as a reasoning item, as a model that
@@ -671,7 +773,7 @@ func buildResponses(r *Request, model, host string, rejectTemp bool) []byte {
 	// gets it: OpenAI's and those in front of it read only their own
 	// sealed reasoning, and may refuse an item without it.
 	replay := replaysReasoning(model, host)
-	var input []map[string]any
+	var input []any
 	for _, m := range r.Messages {
 		var content []map[string]any
 		flushMsg := func() {
@@ -684,6 +786,9 @@ func buildResponses(r *Request, model, host string, rejectTemp bool) []byte {
 		for _, p := range m.Parts {
 			switch p.Kind {
 			case Text:
+				if p.Text == "" && p.Signature != "" {
+					continue // only Gemini's signature, which is Gemini's
+				}
 				t := "input_text"
 				if m.Role == "assistant" {
 					t = "output_text"
@@ -700,7 +805,12 @@ func buildResponses(r *Request, model, host string, rejectTemp bool) []byte {
 					content = append(content, map[string]any{"type": "input_image", "image_url": dataURL(p)})
 				}
 			case Thinking:
-				if replay && p.Text != "" {
+				if !replay && sealedReasoning(p) {
+					// a Responses API's own sealed reasoning goes back as
+					// it came: id, summary and encrypted_content (#1445)
+					flushMsg()
+					input = append(input, p.Sealed)
+				} else if replay && p.Text != "" {
 					flushMsg()
 					input = append(input, map[string]any{"type": "reasoning", "summary": []any{},
 						"content": []map[string]any{{"type": "reasoning_text", "text": p.Text}}})
@@ -736,7 +846,7 @@ func buildResponses(r *Request, model, host string, rejectTemp bool) []byte {
 		flushMsg()
 	}
 	if input == nil {
-		input = []map[string]any{}
+		input = []any{}
 	}
 	out := map[string]any{"model": model, "input": input, "stream": r.Stream, "store": false}
 	if len(r.ClientMetadata) > 0 {
@@ -771,6 +881,13 @@ func buildResponses(r *Request, model, host string, rejectTemp bool) []byte {
 	if r.Fast && (host == "chatgpt.com" || host == "api.openai.com") {
 		out["service_tier"] = "priority"
 	}
+	// Ultrafast only the ChatGPT backend offers
+	if r.Ultrafast && host == "chatgpt.com" {
+		out["service_tier"] = "ultrafast"
+	}
+	if r.OwnTier && r.Tier != "" {
+		out["service_tier"] = r.Tier
+	}
 	if r.Effort != "" {
 		out["reasoning"] = map[string]any{"effort": r.Effort, "summary": "auto"}
 	} else if r.Thinking {
@@ -779,9 +896,10 @@ func buildResponses(r *Request, model, host string, rejectTemp bool) []byte {
 	// the client's include goes on as the request would have without
 	// magpie. Sealed reasoning is asked for only with reasoning, as Codex
 	// asks for it: OpenAI refuses it of a model that doesn't reason. What
-	// comes back sealed goes no further than magpie, and the input's sealed
-	// reasoning isn't sent on this way, so no account or vendor is handed
-	// another's to refuse (withoutRefused, sealedKinds, on a relay).
+	// comes back sealed goes to a Responses client as it came, and the
+	// input's goes back to a Responses upstream, as it would without magpie
+	// (#1445); an account or vendor that can't read another's turns it away,
+	// and is asked again without it (foreignReasoning, withoutRefused).
 	var include []string
 	for _, v := range r.Include {
 		if v == "" || slices.Contains(include, v) || (v == "reasoning.encrypted_content" && out["reasoning"] == nil) {
@@ -940,6 +1058,10 @@ func (d *responsesDecoder) decode(data string, emit func(Event)) error {
 			d.called, d.calling = true, true
 			emit(Event{Kind: KToolStart, ID: ev.Item.CallID, Name: ev.Item.Name})
 		}
+		if ev.Item.Type == "reasoning" {
+			// an item of its own, by the id the upstream gave it (#1445)
+			emit(Event{Kind: KThinkStart, ID: ev.Item.ID})
+		}
 	case "response.output_text.delta":
 		d.endCall(emit)
 		emit(Event{Kind: KText, Text: ev.Delta})
@@ -962,6 +1084,16 @@ func (d *responsesDecoder) decode(data string, emit func(Event)) error {
 				d.full = string(ev.Item.Arguments)
 			}
 			d.endCall(emit)
+		}
+		if ev.Item.Type == "reasoning" && ev.Item.EncryptedContent != "" {
+			// sealed: the item as the upstream wrote it, for a Responses
+			// client and for its next request (#1445)
+			var whole struct {
+				Item json.RawMessage `json:"item"`
+			}
+			if json.Unmarshal([]byte(data), &whole) == nil && len(whole.Item) > 0 {
+				emit(Event{Kind: KSealed, Name: sealResponses, ID: ev.Item.ID, Text: string(whole.Item)})
+			}
 		}
 		if a := ev.Item.Action; ev.Item.Type == "web_search_call" && a != nil && a.Query != "" {
 			var hits []Hit
@@ -1020,9 +1152,13 @@ type responsesEncoder struct {
 	open    Kind            // kind of the open item
 	itemID  string          // id of the open item
 	text    strings.Builder // text of the open message / reasoning
-	output  []map[string]any
-	col     collector
-	named   map[string]nsTool // the request's namespaced tools
+	// a reasoning item began upstream (KThinkStart): the next thinking
+	// opens an item of its own, by thinkID when the upstream named it
+	thinkNew bool
+	thinkID  string
+	output   []any
+	col      collector
+	named    map[string]nsTool // the request's namespaced tools
 }
 
 // callTo names the tool a function_call item is to as the client knows it:
@@ -1081,7 +1217,7 @@ func (e *responsesEncoder) response(status string, extra map[string]any) map[str
 	// response.created has output null (its nil slice in an any isn't nil)
 	output := e.output
 	if output == nil {
-		output = []map[string]any{}
+		output = []any{}
 	}
 	out := map[string]any{"id": e.id, "object": "response", "created_at": e.created, "status": status,
 		"model": e.model, "output": output, "parallel_tool_calls": true, "tool_choice": "auto", "tools": []any{}}
@@ -1111,10 +1247,16 @@ func (e *responsesEncoder) start(ev Event) {
 }
 
 func (e *responsesEncoder) closeItem() {
+	e.closeAs(nil)
+}
+
+// closeAs closes the open item, as sealed when the upstream wrote it
+// whole (a reasoning item it sealed).
+func (e *responsesEncoder) closeAs(sealed json.RawMessage) {
 	if e.open == "" {
 		return
 	}
-	var item map[string]any
+	var item any
 	switch e.open {
 	case Text:
 		t := e.text.String()
@@ -1128,6 +1270,9 @@ func (e *responsesEncoder) closeItem() {
 		part := map[string]any{"type": "summary_text", "text": t}
 		e.send("response.reasoning_summary_part.done", map[string]any{"item_id": e.itemID, "output_index": e.item, "summary_index": 0, "part": part})
 		item = map[string]any{"id": e.itemID, "type": "reasoning", "status": "completed", "summary": []map[string]any{part}}
+		if sealed != nil {
+			item = sealed
+		}
 	case ToolCall:
 		args := strings.TrimSpace(e.text.String())
 		if args == "" {
@@ -1148,6 +1293,10 @@ func (e *responsesEncoder) openItem(k Kind, prefix string, item map[string]any) 
 	e.closeItem()
 	e.item++
 	e.open, e.itemID = k, prefix+newID()
+	if k == Thinking && e.thinkID != "" {
+		e.itemID = e.thinkID
+	}
+	e.thinkNew, e.thinkID = false, ""
 	item["id"] = e.itemID
 	item["status"] = "in_progress"
 	e.send("response.output_item.added", map[string]any{"output_index": e.item, "item": item})
@@ -1175,13 +1324,35 @@ func (e *responsesEncoder) event(ev Event) {
 		if ev.Text == "" {
 			return
 		}
-		if e.open != Thinking {
+		if e.open != Thinking || e.thinkNew {
 			e.openItem(Thinking, "rs_", map[string]any{"type": "reasoning", "summary": []any{}})
 			e.send("response.reasoning_summary_part.added", map[string]any{"item_id": e.itemID, "output_index": e.item, "summary_index": 0,
 				"part": map[string]any{"type": "summary_text", "text": ""}})
 		}
 		e.text.WriteString(ev.Text)
 		e.send("response.reasoning_summary_text.delta", map[string]any{"item_id": e.itemID, "output_index": e.item, "summary_index": 0, "delta": ev.Text})
+	case KThinkStart:
+		e.thinkNew, e.thinkID = true, ""
+		if strings.HasPrefix(ev.ID, "rs_") {
+			e.thinkID = ev.ID
+		}
+	case KSealed:
+		if ev.Name != sealResponses {
+			break // another API's, which a Responses client can't read
+		}
+		raw := json.RawMessage(ev.Text)
+		if e.open == Thinking && !e.thinkNew && (ev.ID == "" || ev.ID == e.itemID) {
+			// the item streamed so far, done as the upstream wrote it
+			e.closeAs(raw)
+			break
+		}
+		// none of it streamed (no summary): added and done whole
+		e.closeItem()
+		e.item++
+		e.thinkNew, e.thinkID = false, ""
+		e.send("response.output_item.added", map[string]any{"output_index": e.item, "item": raw})
+		e.send("response.output_item.done", map[string]any{"output_index": e.item, "item": raw})
+		e.output = append(e.output, raw)
 	case KToolStart:
 		if ev.ID == "" {
 			ev.ID = "call_" + newID()
@@ -1243,13 +1414,24 @@ func (e *responsesEncoder) finish() {
 
 // renderResponses is the non-streaming reply.
 func renderResponses(res Result, model string, named map[string]nsTool) []byte {
-	output := []map[string]any{}
+	output := []any{}
 	for _, p := range res.Parts {
 		switch p.Kind {
 		case Text:
+			if p.Text == "" && p.Signature != "" {
+				continue // only Gemini's signature, which is Gemini's
+			}
 			output = append(output, map[string]any{"id": "msg_" + newID(), "type": "message", "role": "assistant", "status": "completed",
 				"content": []map[string]any{{"type": "output_text", "text": p.Text, "annotations": []any{}}}})
 		case Thinking:
+			if p.sealedBy(sealResponses) {
+				// as the upstream wrote it: id, summary, encrypted_content
+				output = append(output, p.Sealed)
+				continue
+			}
+			if p.Text == "" {
+				continue // another API's sealed thinking, or only its signature
+			}
 			output = append(output, map[string]any{"id": "rs_" + newID(), "type": "reasoning", "status": "completed",
 				"summary": []map[string]any{{"type": "summary_text", "text": p.Text}}})
 		case ToolCall:

@@ -13,6 +13,7 @@ import (
 	"github.com/yetone/magpie/internal/agent"
 	"github.com/yetone/magpie/internal/appdir"
 	"github.com/yetone/magpie/internal/edit"
+	"github.com/yetone/magpie/internal/lastgood"
 	"github.com/yetone/magpie/internal/library"
 	"github.com/yetone/magpie/internal/provider"
 )
@@ -25,12 +26,20 @@ type Profile struct {
 	// instructions; nil for a profile saved while the library was empty,
 	// or before profiles kept it, which leaves the library as it is.
 	Library *library.Setup
+	// Models are the agents' model lists (#1368), by the id their lists are
+	// kept under (agent.ListsFor): which of magpie's models each shows and
+	// in what order. An agent not named, every one in a profile saved
+	// before profiles kept them, keeps the list it has.
+	Models map[string]provider.ModelList
 }
 
 // libraryKey holds the library's setup among a profile's "agent.field"
 // keys: it has no dot, so it is no agent's field, and a profile saved
 // before it is read as it always was.
 const libraryKey = "library"
+
+// modelsKey holds the agents' model lists, as libraryKey the library's.
+const modelsKey = "models"
 
 // MarshalJSON writes the fields and the library's setup side by side.
 func (p Profile) MarshalJSON() ([]byte, error) {
@@ -40,6 +49,9 @@ func (p Profile) MarshalJSON() ([]byte, error) {
 	}
 	if p.Library != nil {
 		m[libraryKey] = p.Library
+	}
+	if p.Models != nil {
+		m[modelsKey] = p.Models
 	}
 	return json.Marshal(m)
 }
@@ -59,6 +71,15 @@ func (p *Profile) UnmarshalJSON(b []byte) error {
 			}
 			p.Library = &library.Setup{}
 			if err := json.Unmarshal(raw, p.Library); err != nil {
+				return fmt.Errorf("%s: %w", k, err)
+			}
+			continue
+		}
+		if k == modelsKey {
+			if string(raw) == "null" {
+				continue
+			}
+			if err := json.Unmarshal(raw, &p.Models); err != nil {
 				return fmt.Errorf("%s: %w", k, err)
 			}
 			continue
@@ -86,9 +107,22 @@ func Load() (map[string]Profile, error) {
 		return out, nil
 	}
 	if err := json.Unmarshal(b, &out); err != nil {
-		return nil, fmt.Errorf("%s: %w", Path(), err)
+		// one a crash left all zero (#1505) is its last good generation
+		bak, ferr := lastgood.Fallback(Path(), b, validProfiles)
+		if ferr != nil {
+			return nil, fmt.Errorf("%s: %w", Path(), err)
+		}
+		out = map[string]Profile{}
+		if err := json.Unmarshal(bak, &out); err != nil {
+			return nil, fmt.Errorf("%s: %w", Path(), err)
+		}
 	}
 	return out, nil
+}
+
+func validProfiles(b []byte) bool {
+	var m map[string]Profile
+	return json.Unmarshal(b, &m) == nil
 }
 
 // Names lists profiles alphabetically.
@@ -106,6 +140,9 @@ func store(ps map[string]Profile) error {
 	if err != nil {
 		return err
 	}
+	if err := lastgood.Keep(Path(), validProfiles, 0o600); err != nil {
+		return err
+	}
 	return edit.WriteAtomic(Path(), append(b, '\n'))
 }
 
@@ -121,10 +158,21 @@ func Fields() map[string]string {
 	return p
 }
 
-// Snapshot captures every detected agent's fields, and the library's setup
-// unless the library is empty.
+// ModelLists captures every detected agent's model list, one the user never
+// picked for included: applied, it shows that agent every model again.
+func ModelLists() map[string]provider.ModelList {
+	out := map[string]provider.ModelList{}
+	for _, a := range agent.Detected() {
+		id := strings.ToLower(a.ListsFor())
+		out[id] = provider.ModelListOf(id)
+	}
+	return out
+}
+
+// Snapshot captures every detected agent's fields and model list, and the
+// library's setup unless the library is empty.
 func Snapshot() (Profile, error) {
-	p := Profile{Fields: Fields()}
+	p := Profile{Fields: Fields(), Models: ModelLists()}
 	s, err := library.Snapshot()
 	if err != nil {
 		return p, err
@@ -164,18 +212,29 @@ func Delete(name string) error {
 
 // Applied is what applying a profile did.
 type Applied struct {
-	Changed int // agent fields changed
+	Changed int // agent fields changed, and model lists
 	// Library is what bringing the library's setup back wrote into the
 	// agents; nil for a profile that carries none.
 	Library *library.Result
 }
 
-// Apply writes every field in p that differs from what is set now, then
-// brings the library's setup back when p carries one and writes it into
-// the agents (their files kept aside first). It stops at the first error.
+// Apply puts back the agents' model lists p carries, writes every field in
+// p that differs from what is set now, then brings the library's setup back
+// when p carries one and writes it into the agents (their files kept aside
+// first). It stops at the first error. The lists go first, so the files
+// that list an agent's models are written for the list it is switched to,
+// and its model is set last, over them.
 func Apply(p Profile) (Applied, error) {
+	var out Applied
+	if len(p.Models) > 0 {
+		lists, err := provider.SetModelLists(p.Models)
+		out.Changed = len(lists)
+		if err != nil {
+			return out, err
+		}
+	}
 	n, err := ApplyFields(p.Fields)
-	out := Applied{Changed: n}
+	out.Changed += n
 	if err != nil || p.Library == nil {
 		return out, err
 	}
@@ -184,10 +243,13 @@ func Apply(p Profile) (Applied, error) {
 }
 
 // ApplyFields writes every value in p that differs from what is set now.
+// Only agents found on this computer are written: a profile synced from
+// another one may name agents missing here, and writing their config would
+// make them look installed.
 // It returns the number of changes made and the first error encountered.
 func ApplyFields(p map[string]string) (int, error) {
 	agents := map[string]*agent.Agent{}
-	for _, a := range agent.All() {
+	for _, a := range agent.Detected() {
 		agents[a.ID] = a
 	}
 	keys := make([]string, 0, len(p))

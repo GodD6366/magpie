@@ -26,6 +26,15 @@ type groupsJSON struct {
 	// Moved: the agents turning found groups off moved off one of them,
 	// to its model from one provider (agent.Reseat)
 	Moved []agent.Move `json:"moved,omitempty"`
+	// Templates: groups for common needs made of the user's own models,
+	// which the page adds in a click (provider.Templates)
+	Templates []provider.Template `json:"templates"`
+	// Shared: share's answer, the group as text to paste into another
+	// magpie (provider.ShareGroup)
+	Shared string `json:"shared,omitempty"`
+	// Imported: import's answer, the group added and what of the text
+	// this magpie has none of (provider.ImportGroup)
+	Imported *provider.Imported `json:"imported,omitempty"`
 }
 
 type groupJSON struct {
@@ -44,6 +53,9 @@ type groupJSON struct {
 	// Patterns: its patterns, each with how many models it matches now
 	// (#766), so one that matches nothing is said on its card
 	Patterns []provider.PatternHit `json:"patterns"`
+	// Decides: it is a group of decision models, asked at /v1/systemone
+	// and by a group's classifier, never by an agent
+	Decides bool `json:"decides,omitempty"`
 }
 
 type memberJSON struct {
@@ -55,6 +67,9 @@ type memberJSON struct {
 	Model    string `json:"model,omitempty"` // what the vendor is asked for
 	On       int    `json:"on"`              // its keys or accounts on
 	Group    bool   `json:"group,omitempty"` // a routing group in the group; Name is its
+	// ProviderOff: its provider is switched off, so the group skips it
+	// until it is on again; Provider, Name, Icon and Model are still said
+	ProviderOff bool `json:"providerOff,omitempty"`
 	// Of is the model's id without the effort the member is fixed at, and
 	// Effort that effort ("provider/model:low"); "" for one without
 	Of     string `json:"of,omitempty"`
@@ -170,7 +185,7 @@ func keyPools(p provider.Provider) []poolJSON {
 }
 
 func groupsState() groupsJSON {
-	out := groupsJSON{Groups: []groupJSON{}, Models: []modelRef{}, Pools: []poolJSON{}, Deciders: []modelRef{}, Found: provider.AutoGroupsOn()}
+	out := groupsJSON{Groups: []groupJSON{}, Models: []modelRef{}, Pools: []poolJSON{}, Deciders: []modelRef{}, Found: provider.AutoGroupsOn(), Templates: provider.Templates()}
 	for _, e := range provider.Deciders() {
 		out.Deciders = append(out.Deciders, modelRef{ID: e.ID, Name: e.Name, Provider: e.Provider.ID, PName: e.Provider.Name, Icon: e.Provider.Icon})
 	}
@@ -183,6 +198,7 @@ func groupsState() groupsJSON {
 	for _, g := range provider.Groups() {
 		gj := groupJSON{Group: g, Info: []memberJSON{}, Holds: []string{}, Offers: []string{}, Shared: []string{}, Patterns: []provider.PatternHit{}}
 		gj.Patterns = append(gj.Patterns, provider.PatternHits(g)...)
+		gj.Decides = g.Decides()
 		for _, e := range served {
 			if e.ID == provider.GroupPrefix+g.ID {
 				gj.Offers, gj.Shared = append(gj.Offers, e.Efforts...), append(gj.Shared, e.Shared...)
@@ -236,6 +252,10 @@ func groupsState() groupsJSON {
 					}
 				}
 				gj.Ready = true
+			} else if pid, model, ok := strings.Cut(of, "/"); ok {
+				if p, err := provider.Find(pid); err == nil && !p.On() {
+					m.ProviderOff, m.Provider, m.Name, m.Icon, m.Model = true, p.ID, p.Name, p.Icon, model
+				}
 			}
 			gj.Info = append(gj.Info, m)
 		}
@@ -283,6 +303,11 @@ func groupRoutes(mux *http.ServeMux) {
 			Order []string `json:"order"`
 			// delete: several groups at once, all or none
 			IDs []string `json:"ids"`
+			// template: which one, saved under the group's name
+			// (provider.AddTemplate)
+			Kind string `json:"kind"`
+			// import: a group shared as text (provider.ShareGroup)
+			Text string `json:"text"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 			fail(rw, err)
@@ -291,6 +316,8 @@ func groupRoutes(mux *http.ServeMux) {
 		in := body.Group
 		var err error
 		var moved []agent.Move
+		var shared string
+		var imported *provider.Imported
 		switch r.PathValue("action") {
 		case "found":
 			// off, an agent set to a found group is moved to its model
@@ -319,6 +346,19 @@ func groupRoutes(mux *http.ServeMux) {
 			}
 		case "show":
 			err = provider.ShowGroup(in.ID)
+		case "copy":
+			// a group as it is, under name (provider.CopyGroup)
+			_, err = provider.CopyGroup(in.ID, in.Name)
+		case "share":
+			// the group as text for another magpie: no key goes with it
+			shared, err = provider.ShareGroup(in.ID)
+		case "import":
+			var res provider.Imported
+			if res, err = provider.ImportGroup(body.Text); err == nil {
+				imported = &res
+			}
+		case "template":
+			_, err = provider.AddTemplate(body.Kind, in.Name)
 		case "switch":
 			// a group of the user's on or off, kept as it is (PAMI on Discord)
 			err = provider.SwitchGroup(in.ID, body.On)
@@ -333,7 +373,7 @@ func groupRoutes(mux *http.ServeMux) {
 			return
 		}
 		st := groupsState()
-		st.Moved = moved
+		st.Moved, st.Shared, st.Imported = moved, shared, imported
 		writeJSON(rw, st)
 	})
 }
