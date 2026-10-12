@@ -51,8 +51,17 @@ func gatewayExternal(g usage.GatewaySession) sessions.ExternalSession {
 	return e
 }
 
+// gatewayListed is a gateway session as a list shows it: titled by what it
+// was first asked, when magpie recorded it, not by its ses_… id (YOU on
+// Discord)
+func gatewayListed(g usage.GatewaySession) sessions.ExternalSession {
+	e := gatewayExternal(g)
+	e.Title = sessions.GatewayTitle(g.Agent, g.ID)
+	return e
+}
+
 func gatewaySession(g usage.GatewaySession) sessions.Session {
-	return sessions.MergeExternal(nil, []sessions.ExternalSession{gatewayExternal(g)})[0]
+	return sessions.MergeExternal(nil, []sessions.ExternalSession{gatewayListed(g)})[0]
 }
 
 func sessionRoutes(mux *http.ServeMux, w Windows) {
@@ -86,7 +95,7 @@ func sessionRoutes(mux *http.ServeMux, w Windows) {
 		gateway := listedGateway(usage.GatewaySessions(time.Time{}, nativeKeys))
 		ext := make([]sessions.ExternalSession, 0, len(gateway))
 		for _, g := range gateway {
-			ext = append(ext, gatewayExternal(g))
+			ext = append(ext, gatewayListed(g))
 		}
 		list = sessions.MergeExternal(list, ext)
 		if len(list) > n {
@@ -388,7 +397,7 @@ func combinedSessionStats(days int) sessions.Stats {
 	gs, gd := usage.GatewaySessionWindowExcept(since, nativeKeys)
 	ext := make([]sessions.ExternalSession, 0, len(gs))
 	for _, g := range gs {
-		ext = append(ext, gatewayExternal(g))
+		ext = append(ext, gatewayListed(g))
 	}
 	daily := make([]sessions.ExternalDayUsage, 0, len(gd))
 	for _, d := range gd {
@@ -407,11 +416,15 @@ func warmSessions() {
 	}
 	go func() {
 		time.Sleep(3 * time.Second)
-		warmUp(
-			func() { statsFor(0) },
-			func() { statsFor(30) },
-			func() { usage.QueryPage(usage.All, usage.Filter{}, 0, 50) },
-		)
+		// with few readers, as nobody waits on it yet: after an update
+		// that reads every file again, it held every core (#1665)
+		sessions.Warm(func() {
+			warmUp(
+				func() { statsFor(0) },
+				func() { statsFor(30) },
+				func() { usage.QueryPage(usage.All, usage.Filter{}, 0, 50) },
+			)
+		})
 	}()
 }
 

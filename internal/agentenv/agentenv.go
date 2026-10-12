@@ -52,6 +52,8 @@ var Vars = []string{
 	"QODER_CONFIG_DIR", "QODERCN_CONFIG_DIR",
 	// Grok: its home, and where its CLI is installed
 	"GROK_HOME", "GROK_BIN_DIR",
+	// Grok App's data folder (its agent-home/config.toml), else the OS's app-data one
+	"GROK_APP_HOME",
 	// Kimi Code and its shared folder
 	"KIMI_CODE_HOME", "KIMI_SHARE_DIR",
 	// Qwen Code's home, ~/.qwen without it
@@ -90,6 +92,9 @@ var Vars = []string{
 	// nvm's and fnm's folders, which hold the Node versions an agent's CLI
 	// is installed under, and which of them a terminal uses
 	"NVM_DIR", "FNM_DIR",
+	// mise's and asdf's folders, whose shims stand for an agent's CLI and
+	// whose installs hold the Node versions it is under
+	"MISE_DATA_DIR", "ASDF_DIR",
 	// Google Cloud's credentials file and gcloud's folder, which Vertex AI's
 	// tokens are minted from (and Gemini CLI's own, on Vertex AI)
 	"GOOGLE_APPLICATION_CREDENTIALS", "CLOUDSDK_CONFIG",

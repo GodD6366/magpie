@@ -306,6 +306,11 @@ type Settings struct {
 	// it left before it renews, a reset credit unspent before it runs out;
 	// once each. 0 is off.
 	ResetReminder int `json:"resetReminder,omitempty"`
+	// TurnDoneAlert is how many seconds an agent's turn runs, from the
+	// user's prompt to its last reply, before magpie says it is done with a
+	// notification (itieniu on X): a long task set going while the user
+	// works elsewhere. Only turns the app's own gateway serves; 0 is off.
+	TurnDoneAlert int `json:"turnDoneAlert,omitempty"`
 	// PlainNames has the model lists magpie gives agents name each model
 	// by its name alone, without its provider's or "routing group" after it
 	// (#335) — but for two in one list that would read the same, which keep
@@ -359,6 +364,10 @@ type Settings struct {
 	// "[1m]", and adds none to one whose id has it. Off, as before, it shows
 	// both, the plain one compacting at Claude Code's 200K.
 	DesktopLongest bool `json:"desktopLongest,omitempty"`
+	// GuideHidden: the user put away the Agents page's Get started card
+	// (wangye1644294 on X) before finishing it. Kept here, not in the
+	// page's storage, so the panel, the window and a reload agree.
+	GuideHidden bool `json:"guideHidden,omitempty"`
 	// CompactAt is the window told for a longer one when FullContext is
 	// off, in tokens: 0 is WorkingWindow (#876: 272K was the only one).
 	// A provider's or a model's own (ModelCompacts) comes before it.
@@ -394,6 +403,11 @@ type Settings struct {
 	// panel shows, nothing more: routing, caps, the Usage page and the menu
 	// bar's cells still have them. The panel's order is UsageOrder.
 	PanelUsageHidden []string `json:"panelUsageHidden,omitempty"`
+	// UsageAgentsHidden are the clients, by the id the ledger records them
+	// under ("curl", "Go-http-client", an agent's id), that the Usage page's
+	// Agents list leaves out (ikunbots on X). It is that list's only: the
+	// ledger keeps their calls, and the totals and the chart count them.
+	UsageAgentsHidden []string `json:"usageAgentsHidden,omitempty"`
 	// Visible narrows the models an agent is shown, by agent id: the
 	// families (the tag a provider or group is given), provider ids and
 	// group ids its lists hold. An agent it doesn't name is shown them all.
@@ -408,6 +422,11 @@ type Settings struct {
 	// or an old one, is not shown until it is ticked. HiddenModels is not
 	// read for such an agent. An agent named with no entries is shown none.
 	PickedModels map[string][]string `json:"pickedModels,omitempty"`
+	// OwnModelsHidden are the agents, by id, whose pickers leave out the
+	// models the agent reaches on its own, not through magpie (DeepSeek
+	// Harness's own DeepSeek models, #1642): only magpie's are offered, and
+	// one the agent is set to stays.
+	OwnModelsHidden []string `json:"ownModelsHidden,omitempty"`
 	// AgentEfforts are the reasoning efforts the gateway asks for on an
 	// agent's requests, by agent id, for an agent whose own config can't
 	// carry one (Cursor Private Inference, #1003): one of the levels in
@@ -997,6 +1016,9 @@ func save(s Settings, recording bool) error {
 	if s.ResetReminder < 0 || s.ResetReminder > 168 {
 		return fmt.Errorf("a reset reminder is from 1 to 168 hours before, or 0 for off, not %d", s.ResetReminder)
 	}
+	if s.TurnDoneAlert < 0 || s.TurnDoneAlert > 86400 {
+		return fmt.Errorf("a turn is said done after 1 to 86400 seconds, or 0 for off, not %d", s.TurnDoneAlert)
+	}
 	if math.IsNaN(s.BalanceAlert) || math.IsInf(s.BalanceAlert, 0) || s.BalanceAlert < 0 {
 		return fmt.Errorf("a balance alert is at an amount of 0 or more (0 for off), not %v", s.BalanceAlert)
 	}
@@ -1052,6 +1074,7 @@ func save(s Settings, recording bool) error {
 	s.AgentOrder, s.AgentsHidden, s.AgentsShown = ids(s.AgentOrder), ids(s.AgentsHidden), ids(s.AgentsShown)
 	s.UsageOrder = ids(s.UsageOrder)
 	s.PanelUsageHidden = ids(s.PanelUsageHidden)
+	s.UsageAgentsHidden = ids(s.UsageAgentsHidden)
 	s.TrayUsages = ids(s.TrayUsages)
 	for i, u := range s.CodexAutoReset {
 		s.CodexAutoReset[i] = strings.ToLower(u)

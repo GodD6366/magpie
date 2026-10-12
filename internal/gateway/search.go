@@ -66,8 +66,9 @@ type CallFor struct {
 	// model that described is the one magpie picks in its place
 	// (VisionMissing), and the Routing view names both.
 	Missing string `json:"missing,omitempty"`
-	// MCP, on a web search, is that the agent called magpie's web search
-	// MCP server (SearchMCPPath) itself, for no model of magpie's.
+	// MCP, on a web search or an image's description, is that the agent
+	// called magpie's MCP server (SearchMCPPath, VisionMCPPath) itself, for
+	// no model of magpie's.
 	MCP bool `json:"mcp,omitempty"`
 }
 
@@ -128,7 +129,46 @@ func searchesFor(p provider.Provider, proto provider.Protocol, model string, req
 // searchesModel is searchesItself for one model: a Remote magpie searches
 // for the models its list says it does, on any API (search_remote.go).
 func searchesModel(p provider.Provider, proto provider.Protocol, model string) bool {
-	return searchesItself(p, proto) || proto != provider.Gemini && remoteSearch(p, model) != ""
+	return searchesItself(p, proto) || proto != provider.Gemini && remoteSearch(p, model) != "" || modelSearches(p, proto, model)
+}
+
+// searchModels are the models a provider runs web_search for only for some
+// of its models, by API: Command Code's Provider API passes the tool on to
+// the model's vendor, and 12 of its 87 models search (M3chD09's run of all
+// of them, #1590); the rest take the tool and don't search, or have it
+// stripped, so they keep magpie's searcher. Its Claude models search on
+// Messages only, the others on Responses only.
+var searchModels = map[string]map[provider.Protocol][]string{
+	"commandcode": {
+		provider.Anthropic: {"claude-sonnet-5-5", "claude-haiku-5-5"},
+		provider.Responses: {"gpt-6-luna", "gpt-5.6-sol", "gpt-5.6-luna",
+			"meta/muse-spark-1.2", "meta/muse-spark-1.2-contributor", "meta/muse-spark-1.3", "meta/muse-spark-1.3-contributor",
+			"xai/grok-4.5", "xai/grok-4.6", "xai/grok-4.7"},
+	},
+}
+
+// searchModelsHosts are searchModels' providers by host, for one added by
+// hand rather than from the preset.
+var searchModelsHosts = map[string]string{"api.commandcode.ai": "commandcode"}
+
+// modelSearches is whether a provider of searchModels searches by itself
+// for model on proto. Command Code refuses every built-in tool under its
+// zero-data-retention header (x-cmd-zdr: cmd_zdr_unsupported_tool), so a
+// provider sent that header searches for none.
+func modelSearches(p provider.Provider, proto provider.Protocol, model string) bool {
+	if p.Account != nil || p.Base(proto) == "" {
+		return false
+	}
+	id := p.Preset
+	if _, ok := searchModels[id]; !ok {
+		id = searchModelsHosts[provider.HostOf(p.Base(proto))]
+	}
+	for k, v := range p.Headers {
+		if strings.EqualFold(k, "x-cmd-zdr") && strings.TrimSpace(v) != "" && v != "0" {
+			return false
+		}
+	}
+	return slices.Contains(searchModels[id][proto], model)
 }
 
 // searchHosts are the APIs that search by themselves: OpenAI's, xAI's,
@@ -274,7 +314,7 @@ func chosenSearcher() (*provider.Provider, string, string) {
 	if m := searcherModel(p); m != "" {
 		return &p, m, ""
 	}
-	if ms := p.Available(); len(ms) > 0 {
+	if ms := p.Exposed(); len(ms) > 0 {
 		return &p, ms[0].ID, ""
 	}
 	return &p, "", SearcherNoneOf
@@ -339,10 +379,13 @@ func RelaysSaidToSearch() []provider.Provider {
 
 // smallModel is the provider's cheapest small model of a vendor that
 // searches well, or its cheapest, or its first; only among those keep
-// holds, when it is given.
+// holds, when it is given. Only a model the user enabled is picked (what
+// agents are offered, Exposed), never one of the rest of the vendor's
+// list: OpenRouter turned away an unpicked anthropic/claude-haiku-5.5 for
+// the user's region (JonahFu on X).
 func smallModel(p provider.Provider, keep func(catalog.Model) bool) string {
 	var ms []catalog.Model
-	for _, m := range p.Available() {
+	for _, m := range p.Exposed() {
 		if keep != nil && !keep(m) {
 			continue
 		}

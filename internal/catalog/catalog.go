@@ -41,6 +41,12 @@ type Model struct {
 	Images bool `json:",omitempty"`
 	// ImageInput is the source's explicit answer; nil means it did not say.
 	ImageInput *bool `json:",omitempty"`
+	// InputModalities and OutputModalities are what the model takes and
+	// gives (text, image, audio, video, pdf) as its source listed them;
+	// nil is not said. Images (and the user's override of it) still
+	// decides "image" (provider.Entry.Modalities).
+	InputModalities  []string `json:",omitempty"`
+	OutputModalities []string `json:",omitempty"`
 	// Context is how many tokens a prompt may hold, when known: models.dev's
 	// input limit, else its context window.
 	Context int `json:",omitempty"`
@@ -281,6 +287,9 @@ type mdModel struct {
 	ID          string `json:"id"`
 	Name        string `json:"name"`
 	ReleaseDate string `json:"release_date"`
+	// Family is the line models.dev puts the model in (gpt-sol, mimo):
+	// the levels a new one it lists without any most likely takes
+	Family      string `json:"family"`
 	Temperature *bool  `json:"temperature"` // false: rejects temperature/top_p
 	Thinks      bool   `json:"reasoning"`
 	Reasoning   []struct {
@@ -320,18 +329,68 @@ func (m mdModel) efforts() []string {
 	return out
 }
 
+// levels are the reasoning levels p gives m: its own, else, for one it
+// says thinks but lists without levels — a model just added, as OpenAI's
+// gpt-6.1-sol was (NextCommit on Discord) — those of the newest of p's
+// thinking models of its family released by then (gpt-6-sol's). A family
+// whose models all take a thinking switch alone (Xiaomi's mimo) gives
+// none, as before (#214).
+func (p mdProvider) levels(m mdModel) []string {
+	if e := m.efforts(); len(e) > 0 || !m.Thinks || m.Family == "" || m.budgeted() {
+		return e
+	}
+	var kin *mdModel
+	for _, x := range p.Models {
+		if x.Family != m.Family || !x.Thinks || x.ID == m.ID || len(x.efforts()) == 0 {
+			continue
+		}
+		if m.ReleaseDate != "" && x.ReleaseDate > m.ReleaseDate {
+			continue
+		}
+		if kin == nil || x.ReleaseDate > kin.ReleaseDate || x.ReleaseDate == kin.ReleaseDate && x.ID > kin.ID {
+			kin = &x
+		}
+	}
+	if kin == nil {
+		return nil
+	}
+	return kin.efforts()
+}
+
 // window is the tokens a prompt to m may hold: the input limit where
 // models.dev gives one (gpt-5's 272K of its 400K), else the whole context.
 // A row whose input limit sits above its window (Cloudflare AI Gateway's
 // gpt-5 at 272K over 128K) holds the window: the cap never exceeds it.
+//
+// Either limit under LeastWindow says nothing (Window), so the other one
+// answers, or none does.
 func (m mdModel) window() int {
-	if m.Limit.Input > 0 {
-		if m.Limit.Context > 0 && m.Limit.Context < m.Limit.Input {
-			return m.Limit.Context
+	in, ctx := Window(m.Limit.Input), Window(m.Limit.Context)
+	if in > 0 {
+		if ctx > 0 && ctx < in {
+			return ctx
 		}
-		return m.Limit.Input
+		return in
 	}
-	return m.Limit.Context
+	return ctx
+}
+
+// LeastWindow is the smallest context window a list is taken at its word
+// for. Less can't hold an agent's system prompt, let alone a turn, and an
+// agent told it compacts at once or won't send at all (H20 on Discord: hy3
+// and Cline's free models listed at 512, which Claude Code and Codex took
+// as the model's window). The smallest real chat models' windows are
+// about 4096 (gpt-3.5-turbo-instruct's 4095, mythomax's 4096): those stand.
+const LeastWindow = 2048
+
+// Window is n as a model's context window: n, or 0 — not known, for
+// models.dev, a family's window or the agent's default to answer — when n
+// is under LeastWindow.
+func Window(n int) int {
+	if n < LeastWindow {
+		return 0
+	}
+	return n
 }
 
 var modelsDevURL = "https://models.dev/api.json" // a var for tests
@@ -362,6 +421,12 @@ var (
 	// listed are the bare ids of every model models.dev lists, whatever it
 	// says of them: an id listed is never taken for another (renamed)
 	listed map[string]bool
+	// canonical are the bare ids of every model models.dev says an entry is
+	// (canonical_model_id, #1520): DeepSeek's deepseek-flash is
+	// deepseek/deepseek-v4.1-flash, the id WorkBuddy and the relays serve it
+	// under, which no catalog lists by it. One is a model as a listed one
+	// is, so it is never taken for another either (renamed)
+	canonical map[string]bool
 
 	syncMu sync.Mutex
 )
@@ -402,53 +467,79 @@ func load() map[string]mdProvider {
 					named := map[string]map[string]int{}
 					sizes, outs := map[string]map[int]int{}, map[string]map[int]int{}
 					levels := map[string]map[string]int{}
-					// one vote a provider for each list it gives a model: a
-					// gateway listing it under each host it routes to
-					// (llmgateway's deepinfra/…, xiaomi/…) votes once, not once
-					// a host
 					voted := map[string]bool{}
 					listed = map[string]bool{}
+					canonical = map[string]bool{}
+					// vote is what one entry says of a model, counted for
+					// the id it names it by: its window, reply limit,
+					// thinking, images, levels and name. One vote a
+					// provider for each list it gives a model: a gateway
+					// listing it under each host it routes to (llmgateway's
+					// deepinfra/…, xiaomi/…) votes its levels once, not
+					// once a host.
+					vote := func(who, own, by string, x mdModel) {
+						if x.Name != "" && x.Name != own && x.Name != who {
+							if named[who] == nil {
+								named[who] = map[string]int{}
+							}
+							named[who][x.Name]++
+						}
+						if e := x.efforts(); len(e) > 0 {
+							l := strings.Join(e, ",")
+							if levels[who] == nil {
+								levels[who] = map[string]int{}
+							}
+							if k := by + "\x00" + who + "\x00" + l; !voted[k] {
+								voted[k] = true
+								levels[who][l]++
+							}
+						}
+						if x.Thinks || len(x.efforts()) > 0 {
+							reasons[who]++
+						} else {
+							reasons[who]--
+						}
+						if slices.Contains(x.Modalities.Input, "image") {
+							votes[who]++
+						} else {
+							votes[who]--
+						}
+						if w := x.window(); w > 0 {
+							if sizes[who] == nil {
+								sizes[who] = map[int]int{}
+							}
+							sizes[who][w]++
+						}
+						if o := x.Limit.Output; o > 0 {
+							if outs[who] == nil {
+								outs[who] = map[int]int{}
+							}
+							outs[who][o]++
+						}
+					}
 					for pid, p := range m {
 						for id, x := range p.Models {
 							listed[bareID(id)] = true
+							if _, _, ok := strings.Cut(x.Canonical, "/"); ok {
+								canonical[bareID(x.Canonical)] = true
+							}
 							OneHourFor(id, x.Cost)
-							if x.Name != "" && x.Name != id && x.Name != bareID(id) {
-								if named[bareID(id)] == nil {
-									named[bareID(id)] = map[string]int{}
-								}
-								named[bareID(id)][x.Name]++
+							vote(bareID(id), id, pid, x)
+						}
+					}
+					// and a model no catalog lists by its id, one entries
+					// only name as their canonical_model_id (#1520), takes
+					// their word for it too: its window, thinking, images
+					// and name are the model's, whoever serves it. One
+					// listed by its id keeps the answers it has, so nothing
+					// known changes.
+					for pid, p := range m {
+						for id, x := range p.Models {
+							if _, _, ok := strings.Cut(x.Canonical, "/"); !ok {
+								continue
 							}
-							if e := x.efforts(); len(e) > 0 {
-								l := strings.Join(e, ",")
-								if levels[bareID(id)] == nil {
-									levels[bareID(id)] = map[string]int{}
-								}
-								if k := pid + "\x00" + bareID(id) + "\x00" + l; !voted[k] {
-									voted[k] = true
-									levels[bareID(id)][l]++
-								}
-							}
-							if x.Thinks || len(x.efforts()) > 0 {
-								reasons[bareID(id)]++
-							} else {
-								reasons[bareID(id)]--
-							}
-							if slices.Contains(x.Modalities.Input, "image") {
-								votes[bareID(id)]++
-							} else {
-								votes[bareID(id)]--
-							}
-							if w := x.window(); w > 0 {
-								if sizes[bareID(id)] == nil {
-									sizes[bareID(id)] = map[int]int{}
-								}
-								sizes[bareID(id)][w]++
-							}
-							if o := x.Limit.Output; o > 0 {
-								if outs[bareID(id)] == nil {
-									outs[bareID(id)] = map[int]int{}
-								}
-								outs[bareID(id)][o]++
+							if c := bareID(x.Canonical); !listed[c] {
+								vote(c, id, pid, x)
 							}
 						}
 					}
@@ -493,7 +584,7 @@ func Reset() {
 	loadMu.Lock()
 	defer loadMu.Unlock()
 	loaded = false
-	mdev, images, windows, outputs, efforts, thinks, names, listed = nil, nil, nil, nil, nil, nil, nil, nil
+	mdev, images, windows, outputs, efforts, thinks, names, listed, canonical = nil, nil, nil, nil, nil, nil, nil, nil, nil
 }
 
 // Sync downloads the models.dev catalog into CachePath. It serializes with
@@ -694,8 +785,9 @@ func Provider(id string) []Model {
 			continue
 		}
 		mm := Model{ID: m.ID, Name: m.Name, Provider: id, Released: m.ReleaseDate, Price: m.Cost, Temperature: m.Temperature,
-			Images: slices.Contains(m.Modalities.Input, "image"), ImageInput: imageInput(m.Modalities.Input), Context: m.window(), Output: m.Limit.Output}
-		mm.Efforts = m.efforts()
+			Images: slices.Contains(m.Modalities.Input, "image"), ImageInput: imageInput(m.Modalities.Input), Context: m.window(), Output: m.Limit.Output,
+			InputModalities: m.Modalities.Input, OutputModalities: m.Modalities.Output}
+		mm.Efforts = p.levels(m)
 		mm.Reasoning = m.Thinks || len(mm.Efforts) > 0
 		out = append(out, mm)
 	}
@@ -875,16 +967,19 @@ var relayPrefixes = []string{"claude-"}
 // by b (found), and the window the rename names, if any: a window mark
 // taken off ("deepseek-v4.1-flash[1m]", "[200k]", and Claude Code's
 // claude-opus-5[1m], which is claude-opus-5), then a relay's prefix
-// ("claude-deepseek-v4.1-flash"). An id models.dev lists is always its own
-// model, never renamed; a prefix comes off only when what is left is
-// listed, and names a version ("claude-auto" is not the router "auto").
+// ("claude-deepseek-v4.1-flash"). An id models.dev lists, or knows as an
+// entry's canonical_model_id, is always its own model, never renamed
+// (cortecs's claude-sonnet-4 is claude-sonnet-4-0, not sonnet-4-0); a
+// prefix comes off only when what is left is known — listed, or an entry's
+// canonical_model_id (#1520) — and names a version ("claude-auto" is not
+// the router "auto").
 func renamed(b string) (string, int, bool) {
-	if _, ok := found(b, listed); ok {
+	if _, ok := found(b, listed); ok || canonical[b] {
 		return "", 0, false
 	}
 	r, w := unmarked(b)
 	if r != b {
-		if _, ok := found(r, listed); ok {
+		if knownModel(r) {
 			return r, w, true
 		}
 	}
@@ -893,11 +988,21 @@ func renamed(b string) (string, int, bool) {
 		if !ok || !strings.ContainsAny(rest, "0123456789") {
 			continue
 		}
-		if _, ok := found(rest, listed); ok {
+		if knownModel(rest) {
 			return rest, w, true
 		}
 	}
 	return "", 0, false
+}
+
+// knownModel is whether models.dev knows b as a model: listed by its id,
+// or named as an entry's canonical_model_id (#1520) — a model no catalog
+// lists by it, which relays serve and Claude Code asks for under a prefix.
+func knownModel(b string) bool {
+	if _, ok := found(b, listed); ok {
+		return true
+	}
+	return canonical[b]
 }
 
 // unmarked is a bare id without a window mark at its end ("[1m]",
@@ -955,13 +1060,63 @@ func ListedBy(providers []string, id string) ([]string, bool) {
 				if bareID(key) != want {
 					continue
 				}
-				if e := m.efforts(); len(e) > 0 || !m.budgeted() {
+				if e := all[pid].levels(m); len(e) > 0 || !m.budgeted() {
 					return slices.Clone(e), true
 				}
 			}
 		}
 	}
 	return nil, false
+}
+
+// KinEfforts are the reasoning levels of a model none of the providers
+// named lists, taken from the newest of their thinking models of the same
+// name but for its version (gpt-6.1-sol's from gpt-6-sol, mimo-v2.7-flash's
+// from mimo-v2.6-flash): a model newer than the catalog on this machine
+// offers its line's levels, not none. False when none of them has one.
+func KinEfforts(providers []string, id string) ([]string, bool) {
+	all := load()
+	shape, ok := versionless(bareID(id))
+	if !ok {
+		return nil, false
+	}
+	var (
+		levels             []string
+		newest, from, name string
+		found              bool
+	)
+	for _, pid := range providers {
+		for key, m := range all[pid].Models {
+			if !m.Thinks && len(m.efforts()) == 0 || m.budgeted() {
+				continue
+			}
+			if s, ok := versionless(bareID(key)); !ok || s != shape {
+				continue
+			}
+			// the newest; of two the same day, the first provider's, then
+			// the greater id, whatever order the map gives
+			if !found || m.ReleaseDate > newest || m.ReleaseDate == newest && pid == from && key > name {
+				levels, newest, from, name, found = all[pid].levels(m), m.ReleaseDate, pid, key, true
+			}
+		}
+	}
+	return slices.Clone(levels), found
+}
+
+// versionless is a model id with each of its version parts (6.1, v2.6) as
+// "#", and whether it has one beside a name: gpt-#-sol.
+func versionless(b string) (string, bool) {
+	parts := strings.Split(b, "-")
+	versioned, named := false, false
+	for i, s := range parts {
+		v := strings.TrimPrefix(s, "v")
+		if v != "" && strings.Trim(v, "0123456789.") == "" && v[0] != '.' {
+			parts[i], versioned = "#", true
+		} else {
+			named = true
+		}
+	}
+	return strings.Join(parts, "-"), versioned && named
 }
 
 // budgeted reports whether models.dev says the model takes a thinking

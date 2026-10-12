@@ -170,7 +170,7 @@
     <div class="callout"><b>何もしなくてもできるグループ。</b> すでに持っているモデルを提供する 2 つ目のプロバイダを追加すると（Claude サブスクリプションと Copilot の Claude Opus、DeepSeek 自身の API と OpenRouter の DeepSeek など）、magpie はそれを提供するすべてのプロバイダにまたがるグループ <code>group/auto-&lt;model&gt;</code> を自動で作ります。名前はベンダーごとの表記の違い（<code>deepseek/deepseek-chat</code>、<code>deepseek-chat</code>）を吸収して照合されます。エージェントにこれを選ぶとリクエストがすべてに分散されます。不要なものは <code>magpie group rm</code> で非表示にできます。</div>
     <div class="table-wrap"><table>
       <tr><th>ルーティング</th><th>先に使われるもの</th></tr>
-      <tr><td>スマート <code>smart</code></td><td>デフォルトです。メンバーのアカウントとキーをまとめて扱い（グループ内のグループは 1 つとして扱います。下記参照）、クォータに余裕のあるサブスクリプションのうち、利用枠が最も早く更新されるもの。基準は週の枠です。週の枠がなく 5 時間枠だけのアカウント（Claude Enterprise）は 5 時間枠で判断されるため、それより後に週の枠が更新されるものすべてより先になります。失敗後に休止中のものは最後に回ります。</td></tr>
+      <tr><td>スマート <code>smart</code></td><td>デフォルトです。メンバーのアカウントとキーをまとめて扱い（グループ内のグループは 1 つとして扱います。下記参照）、クォータに余裕のあるサブスクリプションのうち、利用枠が最も早く更新されるもの。基準は週の枠です。週の枠がなく 5 時間枠だけのアカウント（Claude Enterprise）は 5 時間枠で判断されるため、それより後に週の枠が更新されるものすべてより先になります。リセットのないクレジット（WorkBuddy のパッケージはそれぞれの日に失効します）は、残りのうち最も早く失効する時点で判断されるため、クレジットが最も早く失効する WorkBuddy アカウントが先になります。失敗後に休止中のものは最後に回ります。</td></tr>
       <tr><td>順番どおり <code>order</code></td><td>最初のモデルが応答できなくなるまでそれを使い、次へ進みます。</td></tr>
       <tr><td>持ち回り <code>rotate</code></td><td>各会話の次のターンを、次のメンバーのアカウントやキーに送り、負荷を分散します。</td></tr>
       <tr><td>使用量の少ない順 <code>usage</code></td><td>利用枠の残りが最も多いアカウントやキー。</td></tr>
@@ -200,6 +200,7 @@
     <ul>
       <li><b>ループは不可。</b> グループは、直接でも中のグループ経由でも、自分自身を含められません。Coder が Fast を含んでいるときに、Coder を含む Fast を保存しようとすると拒否され、ピッカーにもそのようなグループは表示されません。入れ子は最大 8 階層です。他のグループに含まれているグループは削除できないので、先にそちらから外してください。</li>
       <li><b>各グループは自分のルーティングに従います。</b> 外側のグループのルーティングが何であれ、内側のグループの中には及びません。スマート、持ち回り、使用量の少ない順、週のペースは、内側のグループを 1 つのメンバーとして、内側のグループが最初に試すアカウントやキーで評価します。そこが選ばれると、内側のグループが丸ごと、自分の順序で試されます。Claude（順番どおり）と GPT（順番どおり）を含むスマートの Coder は、両者のアカウントをすべてまとめて比べるのではなく、Claude の先頭と GPT の先頭を比べます。</li>
+      <li><b>独自のルーティングを持つプロバイダーも同じです。</b> プロバイダーのアカウントやキーのルーティングを順番どおり、持ち回り、使用量の少ない順、週のペース、重みにしたモデルは、どのグループの中でもそれを保ちます。グループはそれが最初に試すアカウントやキーで比べ、選ばれたら自分の順序で丸ごと試します。既定のスマートのままのプロバイダーは、アカウントがグループの他のものとまとめて比べられ、どのプロバイダーのものでも枠が最も早くリセットされるものが先になります。</li>
       <li><b>フェイルオーバーは通ります。</b> 内側のグループのモデルがすべて失敗すると、他のメンバーと同様に、外側のグループの次のメンバーが応答します。</li>
       <li>2 回現れるモデル（単独と、中のグループ内）は、最初の位置で一度だけ問い合わせます。</li>
     </ul>
@@ -220,6 +221,7 @@ magpie group rule add opus-anywhere use=copilot/claude-opus-5.5 intent=<span cla
 magpie group rule add opus-anywhere use=deepseek/deepseek-v4-flash compact  <span class="c"># /compact の要約は安いモデルへ</span>
 magpie group rule add opus-anywhere use=kimi/kimi-k2.6 folders=~/oss,<span class="s">"~/My Project"</span>  <span class="c"># これらのプロジェクトのターンはまずこのモデルへ</span>
 magpie group rule add opus-anywhere pause=copilot/claude-opus-5.5 time=14:00-18:00 days=mon-fri  <span class="c"># その時間帯は外す</span>
+magpie group rule add opus-anywhere pause=claude/claude-opus-5-5 except-folders=~/big-task  <span class="c"># ~/big-task のタスク専用：ほかのフォルダでは外す</span>
 magpie group set coder models+=group/opus-anywhere  <span class="c"># グループの中のグループ</span>
 magpie group rule opus-anywhere      <span class="c"># ルール一覧。rule rm|mv &lt;n&gt;、rule classifier &lt;group&gt; &lt;model&gt;</span>
 magpie group copy opus-anywhere <span class="s">"Opus test"</span>  <span class="c"># モデル・ルーティング・ルールが同じ複製。別々に変更できる</span>
@@ -236,7 +238,7 @@ magpie claude group/opus-anywhere    <span class="c"># これを使う</span></p
       <figcaption>ゲートウェイを通ったすべての呼び出しの残高、トークン、キャッシュヒット、コスト。</figcaption>
     </figure>
     <p><b>コンテキスト。</b> Usage の <span class="ui">Context</span> タブでは、ゲートウェイを通るときに読み取った各エージェントのプロンプトの中身を表示します。システムプロンプト、ツール定義（MCP サーバーのツールはまとめて 1 つ）、指示ファイルと skills、ツールが読み込んだファイル、ツールのその他の出力、会話が、モデルのコンテキストウィンドウのどれだけを占めるかがわかります。各エージェントには 100 点満点のスコア（プロンプトのうちキャッシュから読まれた割合、スタートの軽さ、埋まる速さ、失敗の頻度）と、スコアの根拠を示す「軽いスタート」「MCP が重い」などのタグが付きます。セッションを開くと最新リクエストのウィンドウをマスごとに見られ、<span class="ui">Routing</span> ページでも選んだリクエストについて同じものが表示されます。部分・マス・項目をクリックすると、magpie が送ったままの本文を読めます（マスクがオンならマスク済み）。本文は直近 10 件のリクエスト分だけ、magpie の実行中にメモリに置かれます。保存するのは名前だけで、プロンプトの本文は保存せず、どこにも送りません。</p>
-    <p><b>プロファイル。</b> <span class="ui">Agents</span> タブの下部にある <span class="ui">＋ Save current</span> で、全エージェントの設定を名前を付けて保存できます。チップをクリックすれば、すべてを一度に元に戻せます。</p>
+    <p><b>プロファイル。</b> <span class="ui">Agents</span> タブの下部にある <span class="ui">＋ Save current</span> で、全エージェントの設定を名前を付けて保存できます。チップをクリックすれば、すべてを一度に元に戻せます。使用中のプロファイルには ✓ が付き、トレイパネルの <span class="ui">プロファイル</span> ボタンにもその名前が表示されます。その後に設定を手で変えると ✓ は外れます。</p>
 
     <h2 id="cli"><a class="anchor" href="#cli">ターミナルから</a></h2>
     <p><code>magpie tui</code> はターミナルで動くアプリ全体で、上記の各手順にはそれぞれコマンドがあります。<code>magpie help</code> ですべて確認できます。</p>

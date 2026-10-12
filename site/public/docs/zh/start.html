@@ -170,7 +170,7 @@
     <div class="callout"><b>不用手动建的组。</b>再加一个供应商，只要它提供的模型和已有的同名（比如 Claude 订阅和 Copilot 都有 Claude Opus，DeepSeek 官方 API 和 OpenRouter 都有 DeepSeek），magpie 就会自动把它们组成一个路由组：<code>group/auto-&lt;模型&gt;</code>，包含所有提供这个模型的供应商。名字按各家不同的写法匹配（<code>deepseek/deepseek-chat</code> 和 <code>deepseek-chat</code> 算同一个）。给 Agent 选这个组，请求就会分摊到这些供应商上；不想要的可以用 <code>magpie group rm</code> 隐藏。</div>
     <div class="table-wrap"><table>
       <tr><th>路由</th><th>谁排在前面</th></tr>
-      <tr><td>智能 <code>smart</code></td><td>默认。把成员的账号和 Key 放在一起排（组里的路由组算一个，见下文）：还有余量的订阅里，额度最先重置的排第一。看周额度的重置时间；只有 5 小时额度、没有周额度的账号（如 Claude Enterprise）看它的 5 小时重置，所以排在所有更晚重置的周额度前面。失败后在休息的排最后。</td></tr>
+      <tr><td>智能 <code>smart</code></td><td>默认。把成员的账号和 Key 放在一起排（组里的路由组算一个，见下文）：还有余量的订阅里，额度最先重置的排第一。看周额度的重置时间；只有 5 小时额度、没有周额度的账号（如 Claude Enterprise）看它的 5 小时重置，所以排在所有更晚重置的周额度前面。没有重置时间的积分（WorkBuddy 的积分包，各自到期）按剩余积分最早过期的时间算，所以积分最先过期的 WorkBuddy 账号排第一。失败后在休息的排最后。</td></tr>
       <tr><td>按顺序 <code>order</code></td><td>先用第一个模型，它答不了再换下一个。</td></tr>
       <tr><td>轮流 <code>rotate</code></td><td>会话的每一轮交给下一个成员的账号或 Key，均摊负载。</td></tr>
       <tr><td>最少使用 <code>usage</code></td><td>剩余额度最多的账号或 Key 排第一。</td></tr>
@@ -200,6 +200,7 @@
     <ul>
       <li><b>不会无限递归。</b>一个组不能包含它自己，无论是直接包含，还是经由它里面的组间接包含。Coder 已经包含 Fast 时，再把 Coder 放进 Fast 会被拒绝，选择器里也不会列出这样的组。最多嵌套 8 层。一个组被别的组包含时不能删除，要先从那个组里移除它。</li>
       <li><b>每一层按自己的路由。</b>外层组不管用什么路由，都不会伸进它里面的组：智能、轮流、最少使用、重置前用完都把子组当作一个成员，拿子组自己会先用的那个账号或 Key 来比；排到它时，子组按自己的顺序整体尝试。Coder 设为智能、里面放 Claude（按顺序）和 GPT（按顺序）两个组时，比较的是 Claude 组的第一个和 GPT 组的第一个，不会把两组的账号混在一起排。</li>
+      <li><b>服务商自己的路由也一样。</b>一个模型的服务商把账号或 Key 设为按顺序、轮流、用量少的优先、重置前用完或按权重时，在任何路由组里都保持这个路由：组拿它会先用的那个账号或 Key 来比，排到它时按它自己的顺序整体尝试。保持默认“智能”的服务商，它的账号和组里其他账号放在一起排，额度最先重置的排第一，不管属于哪个服务商。</li>
       <li><b>故障转移照常。</b>子组里的模型全部失败时，由外层组的下一个成员接手，和其他成员一样。</li>
       <li>同一个模型出现两次（单独一次，子组里一次）时只问一次，按它第一次出现的位置。</li>
     </ul>
@@ -220,6 +221,7 @@ magpie group rule add opus-anywhere use=copilot/claude-opus-5.5 intent=<span cla
 magpie group rule add opus-anywhere use=deepseek/deepseek-v4-flash compact  <span class="c"># /compact 的总结交给便宜的模型</span>
 magpie group rule add opus-anywhere use=kimi/kimi-k2.6 folders=~/oss,<span class="s">"~/My Project"</span>  <span class="c"># 这些项目里的对话先发给它</span>
 magpie group rule add opus-anywhere pause=copilot/claude-opus-5.5 time=14:00-18:00 days=mon-fri  <span class="c"># 这段时间不用它</span>
+magpie group rule add opus-anywhere pause=claude/claude-opus-5-5 except-folders=~/big-task  <span class="c"># 只留给 ~/big-task 里的任务：其他文件夹不用它</span>
 magpie group set coder models+=group/opus-anywhere  <span class="c"># 路由组里放路由组</span>
 magpie group rule opus-anywhere      <span class="c"># 查看规则；rule rm|mv &lt;n&gt;，rule classifier &lt;组&gt; &lt;模型&gt; 换判断模型</span>
 magpie group copy opus-anywhere <span class="s">"Opus test"</span>  <span class="c"># 复制一份：模型、路由方式和规则都一样，可单独修改</span>
@@ -236,7 +238,7 @@ magpie claude group/opus-anywhere    <span class="c"># 使用它</span></pre>
       <figcaption>经过网关的每次调用的余额、token、缓存命中和费用。</figcaption>
     </figure>
     <p><b>上下文。</b><span class="ui">用量</span> 里的 <span class="ui">上下文</span> 标签页显示每个 Agent 的提示词里装了什么，在请求经过网关时读出：系统提示词、工具定义（一个 MCP 服务器的工具算作一项）、指令文件与 skills、工具读入的文件、工具的其他输出和对话，各占模型上下文窗口的多少。每个 Agent 有一个百分制得分——缓存读到了多少提示词、起步多轻、上下文涨得多快、失败多不多——以及「起步轻」「MCP 偏重」之类的标签，说明得分从何而来。打开一个会话，可以一格一格地看它最近一次请求的窗口；在 <span class="ui">路由</span> 页点选任意请求也能看到。点一个部分、一格或一项，可以看到 magpie 发出去的原文，开着遮盖时是遮盖后的。原文只为最近 10 次请求留在内存里，magpie 退出就没了；存下来的只有名称，不保存提示词的文字，也不会发往任何地方。</p>
-    <p><b>方案。</b>在 <span class="ui">Agent</span> 标签页底部点 <span class="ui">＋ 保存当前</span>，把所有 Agent 的设置存成一个方案；之后点这个方案就能一键全部切回。</p>
+    <p><b>方案。</b>在 <span class="ui">Agent</span> 标签页底部点 <span class="ui">＋ 保存当前</span>，把所有 Agent 的设置存成一个方案；之后点这个方案就能一键全部切回。正在使用的方案带 ✓，托盘面板的 <span class="ui">方案</span> 按钮也显示它的名字；之后手动改过设置，✓ 就会消失。</p>
 
     <h2 id="cli"><a class="anchor" href="#cli">命令行</a></h2>
     <p><code>magpie tui</code> 是终端里的完整界面，上面每一步也都有对应命令。<code>magpie help</code> 列出全部命令。</p>

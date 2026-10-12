@@ -387,13 +387,24 @@ func FetchingNew() bool { return newRunning.Load() > 0 }
 // accounts there then; an account signed in while magpie runs (in magpie or
 // in the agent's own app) otherwise showed magpie's built-in list, fewer
 // models than the vendor serves, until Refresh was clicked (#204). One that
-// fails is asked again after newFetchRetry, not each time.
-func FetchNew(timeout time.Duration) {
+// fails is asked again after newFetchRetry, not each time. It reports
+// whether an account is left without its list (one that failed, or that
+// failed less than newFetchRetry ago), for a caller with no page to ask
+// again from (the terminal, magpie serve) to try once more later.
+func FetchNew(timeout time.Duration) (missing bool) {
 	newRunning.Add(1)
 	defer newRunning.Add(-1)
 	newFetches.Lock()
 	defer newFetches.Unlock()
-	for _, p := range All() {
+	// listing them asks a CLI who is signed in, if never asked: one that
+	// hasn't answered yet is waited for, and they are listed again
+	ps := All()
+	if waited, unknown := awaitIdentities(timeout); unknown {
+		missing = true
+	} else if waited {
+		ps = All()
+	}
+	for _, p := range ps {
 		// a list of decision models fetched before magpie kept their
 		// windows and input, or not fetched yet (ARNO on Discord)
 		decide := p.decideListDue()
@@ -405,6 +416,7 @@ func FetchNew(timeout time.Duration) {
 			continue
 		}
 		if t, ok := newFetches.m[p.ID]; ok && time.Since(t) < newFetchRetry {
+			missing = true
 			continue
 		}
 		newFetches.m[p.ID] = time.Now()
@@ -417,9 +429,11 @@ func FetchNew(timeout time.Duration) {
 		}
 		if err != nil {
 			log.Println(p.ID + ": " + err.Error())
+			missing = true
 		}
 		cancel()
 	}
+	return missing
 }
 
 // fetchOne asks the first endpoint that answers, with p's key.
@@ -427,7 +441,11 @@ func (p Provider) fetchOne(ctx context.Context) ([]catalog.Model, string, error)
 	if u := strings.TrimSpace(p.ModelsURL); u != "" {
 		// asked where the user said, and nowhere else: the base URLs
 		// list nothing, or the wrong thing
-		ms, err := catalog.FetchURL(ctx, u, p.Key, p.Chat == "" && p.Responses == "", p.listHeaders())
+		anthropic := p.Chat == "" && p.Responses == ""
+		if anthropic {
+			ctx = p.listAuth(ctx)
+		}
+		ms, err := catalog.FetchURL(ctx, u, p.Key, anthropic, p.listHeaders())
 		if err != nil {
 			return nil, u, err
 		}
@@ -454,7 +472,11 @@ func (p Provider) fetchOne(ctx context.Context) ([]catalog.Model, string, error)
 			}
 			continue
 		}
-		ms, at, err := catalog.FetchAt(ctx, base, p.Key, proto == Anthropic, p.listHeaders())
+		lctx := ctx
+		if proto == Anthropic {
+			lctx = p.listAuth(ctx) // a vendor that takes one key header alone
+		}
+		ms, at, err := catalog.FetchAt(lctx, base, p.Key, proto == Anthropic, p.listHeaders())
 		if err == nil {
 			if proto != Anthropic {
 				base = p.fixV1(base, at)
@@ -588,7 +610,7 @@ func (p Provider) planModels(ms []catalog.Model) []catalog.Model {
 		if m.Free {
 			id = m.ID[strings.LastIndex(m.ID, "/")+1:]
 		}
-		if m.Context == 0 {
+		if catalog.Window(m.Context) == 0 {
 			out[i].Context = catalog.ContextOf(id)
 		}
 		if m.Output == 0 {
@@ -760,17 +782,26 @@ func anyImageInput(a, b *bool) *bool {
 
 // Serves reports whether key k can be asked for model: false only when the
 // vendor's lists say another of the provider's keys sees it and k doesn't.
+// A key no list marks — its own wasn't answered, or it was added since —
+// is unknown, and serves: a failed list is not an empty one (#1598, the
+// first of five keys left out of every request).
 func (p Provider) Serves(k KeyAccount, model string) bool {
 	live, _, ok := p.live()
 	if !ok {
 		return true
 	}
+	id := keyID(k.Key)
+	var keys []string
+	found, listed := false, false
 	for _, m := range live {
 		if m.ID == model {
-			return len(m.Keys) == 0 || slices.Contains(m.Keys, keyID(k.Key))
+			keys, found = m.Keys, true
+		}
+		if !listed && slices.Contains(m.Keys, id) {
+			listed = true
 		}
 	}
-	return true
+	return !found || len(keys) == 0 || !listed || slices.Contains(keys, id)
 }
 
 // Exposed lists the models magpie offers to agents for this provider: the
@@ -924,6 +955,23 @@ func (p Provider) Thinks(model string) bool {
 	return catalog.Thinks(model)
 }
 
+// PaidBesideFree says model costs its subscription's credits while the
+// subscription serves other models at no cost to them (catalog.Model's
+// Free: WorkBuddy's "x0.00", Qoder's is_free, Cline's free models). Its
+// credits running out then says nothing of those: they draw on none
+// (Creat.wu on Discord). False for a model not on the list, or where no
+// model is free.
+func (p Provider) PaidBesideFree(model string) bool {
+	listed, paid, free := false, false, false
+	for _, m := range p.Available() {
+		if strings.EqualFold(m.ID, model) {
+			listed, paid = true, !m.Free
+		}
+		free = free || m.Free
+	}
+	return listed && paid && free
+}
+
 // Known are the model's own reasoning levels, when known.
 func (p Provider) Known(model string) []string {
 	for _, m := range p.Available() {
@@ -970,7 +1018,9 @@ func (p Provider) Levelless(model string) bool {
 // lists them, or — for a vendor models.dev doesn't list the model under (a
 // custom provider, a proxy) — its maker's, else the ones the others serving
 // it give. A model models.dev lists for this vendor without levels takes
-// none: the vendor says it has none to pick from.
+// none: the vendor says it has none to pick from — unless it says the
+// model thinks and lists its family with levels (catalog's levels: a model
+// just added, gpt-6.1-sol).
 func effortsOf(m catalog.Model) []string {
 	if len(m.Efforts) > 0 || m.Provider != "" {
 		return m.Efforts
@@ -982,12 +1032,20 @@ func effortsOf(m catalog.Model) []string {
 // word on: its maker's, when a vendor of magpie's presets makes it — none
 // for Xiaomi's mimo-v2.6-flash, which takes a thinking switch alone and
 // turns away the max resellers list for it (#214) — else those most of the
-// providers giving any give it (a Volcengine endpoint's glm-5.3-flash).
+// providers giving any give it (a Volcengine endpoint's glm-5.3-flash),
+// else, for one newer than the catalog, its maker's line's
+// (catalog.KinEfforts).
 func borrowedEfforts(id string) []string {
 	if e, ok := catalog.ListedBy(makerCatalogs(), id); ok {
 		return e
 	}
-	return catalog.EffortsOf(id)
+	if e := catalog.EffortsOf(id); len(e) > 0 {
+		return e
+	}
+	// one newer than this machine's catalog: its maker's line's levels
+	// (gpt-6.1-sol, NextCommit on Discord)
+	e, _ := catalog.KinEfforts(makerCatalogs(), id)
+	return e
 }
 
 // makerCatalogs are the models.dev ids of the vendors among the presets
@@ -1021,6 +1079,9 @@ func (p Provider) ListPrice(model string) (catalog.Price, bool) {
 		// served at no cost: not at the price of the model it is free of
 		return catalog.Price{}, true
 	}
+	if pr, ok := p.cursorFastPrice(model); ok {
+		return pr, true
+	}
 	names := pricedNames(model)
 	if p.kimiCodeMember() {
 		if id, ok := kimiCodeAPI[strings.ToLower(strings.TrimSpace(model))]; ok {
@@ -1036,6 +1097,56 @@ func (p Provider) ListPrice(model string) (catalog.Price, bool) {
 		}
 	}
 	return catalog.Price{}, false
+}
+
+// cursorFast is a Cursor id of a Grok model in its fast mode, at an effort
+// or not, at a window or not: grok-4.7-fast, grok-4.7-low-fast,
+// grok-4.7-xhigh-fast@500k. m[1] is the model it is fast of.
+var cursorFast = regexp.MustCompile(`^((?:.*/)?grok-[0-9][^/@]*?)(?:-(?:minimal|low|medium|high|xhigh|extra-high))?-fast(?:@[0-9]+k)?$`)
+
+// cursorFastPrices are what Cursor bills a Grok model in its fast mode
+// per million tokens, as its own model list says
+// (https://cursor.com/docs/models, read 2026-10-12): Grok 4.7 (Fast) $4
+// input, $1 cache read, $12 output ("Fast mode is available at 2x
+// pricing"), and "Fast mode for long context (>256k) is billed at 3x
+// standard rates" ($6, $1.5, $18). No catalog lists these ids, so a call
+// on Cursor's grok-4.7-fast, or on a routing group of it, had no cost at
+// all (TradingLife on Discord).
+var cursorFastPrices = map[string]catalog.Price{
+	"grok-4.7": {Input: 4, CacheRead: 1, Output: 12,
+		Tiers: []catalog.Tier{{Above: 256000, Input: 6, CacheRead: 1.5, Output: 18}}},
+}
+
+// servedByCursor is whether p is a Cursor account: the built-in's or the
+// Cursor plugin's.
+func (p Provider) servedByCursor() bool {
+	if p.Account == nil {
+		return false
+	}
+	return p.Account.Agent == "cursor" || p.PluginProvider() == "cursor"
+}
+
+// cursorFastPrice is Cursor's price for its fast id of a Grok model
+// (cursorFastPrices), on a Cursor account only: elsewhere a "-fast" Grok
+// id is a model of its own (xAI's grok-4-fast is $0.2 / $0.5), not this
+// mode, and Grok Build's grok-4.7-build-fast has no published price.
+func (p Provider) cursorFastPrice(model string) (catalog.Price, bool) {
+	if !p.servedByCursor() {
+		return catalog.Price{}, false
+	}
+	m := cursorFast.FindStringSubmatch(strings.ToLower(strings.TrimSpace(model)))
+	if m == nil {
+		return catalog.Price{}, false
+	}
+	base := m[1]
+	if i := strings.LastIndex(base, "/"); i >= 0 {
+		base = base[i+1:]
+	}
+	pr, ok := cursorFastPrices[base]
+	if ok {
+		pr.Tiers = slices.Clone(pr.Tiers)
+	}
+	return pr, ok
 }
 
 // membershipCatalogs are models.dev catalogs of a membership's own
@@ -1206,18 +1317,28 @@ func byIDOrWas(id string) (Provider, bool) {
 // prices it.
 var grokEffort = regexp.MustCompile(`^((?:.*/)?grok-[0-9][^/]*?)-(?:minimal|low|medium|high|xhigh|extra-high)$`)
 
+// grokWindow is a Grok id offered at a context window of its own
+// ("grok-4.7@500k", grokContextModels and the grok plugin's windowsOf): the
+// same model, asked for at a longer window.
+var grokWindow = regexp.MustCompile(`^((?:.*/)?grok-[0-9][^/@]*)@[0-9]+k$`)
+
 // pricedNames are the ids a model is priced by, in order: its own, then,
 // for a Grok id named at an effort, the model it is that effort of — the
-// same model, at the same price (#224). Codex Auto Review uses GPT-5.6 Luna
+// same model, at the same price (#224) — or at a window (grok-4.7@500k),
+// the model it is that window of. Codex Auto Review uses GPT-5.6 Luna
 // according to OpenAI's rate card (2026-09-30):
 // https://help.openai.com/en/articles/11481834-chatgpt-rate-card-business-enterpriseedu-credit-based-pricing
 // This is a list-price estimate, not evidence of a response's served model.
-// Other names without catalog prices stay unpriced (grok-4.7-build, grok-4.7-mini,
-// grok-4.7-fast).
+// Other names without catalog prices stay unpriced here (grok-4.7-build,
+// grok-4.7-mini, grok-4.7-fast); a Cursor account's fast ids are priced at
+// Cursor's own fast rate (Provider.cursorFastPrice).
 func pricedNames(model string) []string {
 	out := []string{model}
 	if model == "codex-auto-review" {
 		out = append(out, "gpt-5.6-luna")
+	}
+	if m := grokWindow.FindStringSubmatch(strings.ToLower(strings.TrimSpace(model))); m != nil {
+		out = append(out, m[1])
 	}
 	if m := grokEffort.FindStringSubmatch(strings.ToLower(strings.TrimSpace(model))); m != nil {
 		out = append(out, m[1])
@@ -1280,6 +1401,10 @@ type Entry struct {
 	Icons      []string `json:"-"`                // a group's: its providers' icons, one per provider
 	Images     bool     `json:"images,omitempty"` // takes images as input (a group's: a member does)
 	ImageInput *bool    `json:"-"`                // explicit answer, nil when unknown
+	// Inputs and Outputs are what the model's source listed it takes and
+	// gives (catalog.Model's InputModalities, OutputModalities); see
+	// Modalities
+	Inputs, Outputs []string `json:"-"`
 	// Context is the tokens a prompt may hold, when known (a group's: the
 	// least of its members')
 	Context int `json:"context,omitempty"`
@@ -1320,9 +1445,35 @@ type Entry struct {
 func Catalog() []Entry {
 	entries := providerEntries()
 	out := groupEntries(entries)
+	kept := unlistedByGroups(entries)
 	for _, e := range entries {
-		if !e.Provider.Unlisted {
+		if !e.Provider.Unlisted && !kept[e.ID] {
 			out = append(out, e)
+		}
+	}
+	return out
+}
+
+// unlistedByGroups are the models, by "provider/model", that a group
+// keeps out of the lists (Group.Unlists): those it names, a member fixed
+// at an effort counting as its model, and those its patterns match.
+func unlistedByGroups(entries []Entry) map[string]bool {
+	if !slices.ContainsFunc(heldOf("file", load).Groups, func(g Group) bool { return g.Unlists }) {
+		return nil
+	}
+	out := map[string]bool{}
+	for _, g := range groupsIn(entries) {
+		if !g.Unlists || g.Hidden || g.Disabled {
+			continue
+		}
+		for _, id := range g.Members {
+			if strings.HasPrefix(id, GroupPrefix) {
+				continue
+			}
+			model, _ := memberEffortIn(entries, id)
+			if p, m, ok := resolveIn(entries, model); ok {
+				out[p.ID+"/"+m] = true
+			}
 		}
 	}
 	return out
@@ -1336,12 +1487,14 @@ func Served() []Entry {
 }
 
 // Unlisted are the models Served has and Catalog doesn't: those of the
-// providers kept for routing groups (Provider.Unlisted), which agents
-// aren't offered.
+// providers kept for routing groups (Provider.Unlisted), and those a group
+// keeps out of the lists (Group.Unlists), which agents aren't offered.
 func Unlisted() []Entry {
 	var out []Entry
-	for _, e := range providerEntries() {
-		if e.Provider.Unlisted {
+	entries := providerEntries()
+	kept := unlistedByGroups(entries)
+	for _, e := range entries {
+		if e.Provider.Unlisted || kept[e.ID] {
 			out = append(out, e)
 		}
 	}
@@ -1388,7 +1541,8 @@ func entryFor(p Provider, m catalog.Model, s settings.Settings) Entry {
 	// an agent's list showed the whole magpie/<provider>/<model> (#955)
 	name := cmp.Or(m.Name, m.ID)
 	e := Entry{ID: p.ID + "/" + m.ID, Model: m.ID, Family: p.Family, Name: name, Efforts: effortsOf(m), Provider: p,
-		Images: images, ImageInput: imageInput, Context: ctx, Output: output, Free: m.Free, Rate: m.Rate, RateWas: m.RateWas, Tiers: m.Tiers, Released: m.Released}
+		Images: images, ImageInput: imageInput, Context: ctx, Output: output, Free: m.Free, Rate: m.Rate, RateWas: m.RateWas, Tiers: m.Tiers, Released: m.Released,
+		Inputs: m.InputModalities, Outputs: m.OutputModalities}
 	if n, ok := modelNameIn(s.ModelNames, p.ID, m.ID); ok {
 		e.Name, e.Default = n, name
 	} else {
@@ -1409,6 +1563,29 @@ func entryFor(p Provider, m catalog.Model, s settings.Settings) Entry {
 		e.AgentsV2 = slices.Contains(e.Efforts, "ultra")
 	}
 	return e
+}
+
+// Modalities are what the model takes and gives, as an agent's model list
+// says them: every kind its source listed (a plugin's audio, video and pdf
+// too, #1595), with image as Images has it, the user's say included. With
+// no list, the input is text and image or text alone when whether it
+// takes images is known, and nil when it isn't; output is nil unless said.
+func (e Entry) Modalities() (in, out []string) {
+	if e.Inputs != nil {
+		in = slices.DeleteFunc(slices.Clone(e.Inputs), func(k string) bool { return k == "image" })
+		if e.Images {
+			at := 0
+			if len(in) > 0 && in[0] == "text" {
+				at = 1
+			}
+			in = slices.Insert(in, at, "image")
+		}
+	} else if e.Images {
+		in = []string{"text", "image"}
+	} else if e.ImageInput != nil {
+		in = []string{"text"}
+	}
+	return in, slices.Clone(e.Outputs)
 }
 
 // EntryOf is the model as the agents see it, by the id they ask for. It is
@@ -1549,9 +1726,11 @@ func IDs() []string {
 // A vendor models.dev doesn't list (a custom provider, a proxy, a plugin
 // whose list says none, as Cline's) serves models it knows from others, under
 // the vendor's prefix too: cline-free/mimo-v2.6-flash is mimo-v2.6-flash.
+// A window the vendor lists under catalog.LeastWindow (512, H20 on Discord)
+// is no window: models.dev's answers, else none, and the agent's default.
 func ListedWindow(m catalog.Model) int {
-	if m.Context > 0 {
-		return m.Context
+	if n := catalog.Window(m.Context); n > 0 {
+		return n
 	}
 	return catalog.ContextOf(m.ID)
 }

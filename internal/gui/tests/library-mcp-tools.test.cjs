@@ -17,12 +17,12 @@ const HOME = "/Users/nf";
 const LONG = "Read the complete contents of a file from the file system as text. Handles various text encodings and provides detailed error messages if the file cannot be read. Use this tool when you need to examine the contents of a single file.";
 const fixture = () => ({
   dir: `${HOME}/.magpie/library`, backups: `${HOME}/.magpie/backups`, home: HOME,
-  agents: [{ id: "claude", name: "Claude Code", icon: "claudecode-color", skills: `${HOME}/.claude/skills`, mcp: `${HOME}/.claude.json` }],
+  agents: [{ id: "claude", name: "Claude Code", icon: "claudecode-color", skills: `${HOME}/.claude/skills`, mcp: `${HOME}/.claude.json`, toolsOff: true }],
   instructions: { agents: [], sets: [] }, foundServers: [], projects: [], foundSkills: [], skills: [],
   servers: [
     { name: "filesystem", transport: "stdio", command: "npx", args: ["-y", "@modelcontextprotocol/server-filesystem", HOME], agents: ["claude"] },
-    { name: "bare", transport: "stdio", command: "bare-mcp", agents: [] },
-    ...Array.from({ length: 6 }, (_, i) => ({ name: "more" + i, transport: "stdio", command: "more-mcp", agents: [] })),
+    { name: "bare", transport: "stdio", command: "bare-mcp", agents: ["claude"] },
+    ...Array.from({ length: 6 }, (_, i) => ({ name: "more" + i, transport: "stdio", command: "more-mcp", agents: ["claude"] })),
   ],
 });
 const tools = [

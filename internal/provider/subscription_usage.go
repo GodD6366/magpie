@@ -39,6 +39,12 @@ type QuotaWindow struct {
 	Amount float64 `json:"amount,omitempty"`
 	Limit  float64 `json:"limit,omitempty"`
 	Unit   string  `json:"unit,omitempty"`
+	// RunsOutAt is when the soonest of what is left is lost, and RunsOut
+	// how much (in Unit), when it runs out apart from the window's reset:
+	// WorkBuddy's credits come in packages that each end on their own
+	// day. Smart routing takes it for the window's renewal (cdredfox on X).
+	RunsOutAt *time.Time `json:"runsOutAt,omitempty"`
+	RunsOut   float64    `json:"runsOut,omitempty"`
 	// Family is the model family a per-model window belongs to (Antigravity's
 	// "Gemini 3.1 Pro (High)" is Gemini's), for the GUI to show one figure a
 	// family, the tightest; each window is still here, and routing reads
@@ -596,8 +602,8 @@ func claudeReadAt(user string) *time.Time {
 }
 
 // claudeUsage keeps each Claude account's allowance as Claude Code last
-// told it: its /usage, run when the user asks (AskClaudeUsage) and only for
-// the account it is signed in to, or what it said as it answered
+// told it: its /usage, run when the user asks (AskClaudeUsage, Asked), or
+// what it said as it answered
 // (NoteClaudeLimits). magpie never asks Anthropic for it itself; the Usage
 // page's timer, the switch list and routing show what is kept here.
 var claudeUsage struct {
@@ -708,11 +714,14 @@ func AskUsage() {
 	l.Unlock()
 }
 
-// claudeWindows is the allowance of the Claude account user. Only the
-// account Claude Code is signed in to (active) is read, by Claude Code's
-// own /usage: when the user asked since it last was, or when the last
-// reading's claudeUsageWait is up and Claude Code was used since; any other
-// time it is what was kept.
+// claudeWindows is the allowance of the Claude account user, read by
+// Claude Code's own /usage. The account Claude Code is signed in to
+// (active) is read when the user asked since it last was, or when the last
+// reading's claudeUsageWait is up and Claude Code was used since. A saved
+// account is read only when its card is refreshed (savedRefresh), by Claude
+// Code run in the account's own config directory (readSavedClaudeUsage),
+// Claude Code's own sign-in left as it is (#1630). Any other time it is
+// what was kept.
 // magpie itself never asks Anthropic.
 func claudeWindows(ctx context.Context, user string, active bool) ([]QuotaWindow, error) {
 	key := strings.ToLower(user)
@@ -725,7 +734,7 @@ func claudeWindows(ctx context.Context, user string, active bool) ([]QuotaWindow
 	due := e.tried.IsZero() || asked > e.tried.UnixNano() ||
 		active && now.Sub(e.tried) >= e.wait && (e.heard.After(e.tried) || claudeUsedSince(e.tried))
 	// nor, with allowances read only when asked, one nobody asked for
-	read := active && due && now.Sub(e.tried) >= claudeAskFloor && !holding(ctx)
+	read := (active || savedRefresh(ctx, user)) && due && now.Sub(e.tried) >= claudeAskFloor && !holding(ctx)
 	c.Lock()
 	// one reading an ask or a wait, its first caller's; the others keep
 	// to it
@@ -763,11 +772,17 @@ func claudeWindows(ctx context.Context, user string, active bool) ([]QuotaWindow
 		}
 		return []QuotaWindow{}, errClaudeNotAsked
 	}
-	if ClaudeCodeMovedOff(user) {
+	if active && ClaudeCodeMovedOff(user) {
 		return kept()
 	}
-	ws, err := readClaudeUsage(ctx)
-	if ClaudeCodeMovedOff(user) {
+	var ws []QuotaWindow
+	var err error
+	if active {
+		ws, err = readClaudeUsage(ctx, "")
+	} else {
+		ws, err = readSavedClaudeUsage(ctx, user)
+	}
+	if active && ClaudeCodeMovedOff(user) {
 		return kept()
 	}
 	if err != nil {
@@ -804,8 +819,18 @@ func claudeWindows(ctx context.Context, user string, active bool) ([]QuotaWindow
 
 var (
 	errClaudeNotAsked = errors.New("not read yet: magpie reads Claude's usage by running Claude Code's /usage")
-	errClaudeSaved    = errors.New("magpie doesn't read a saved account's usage; it shows what Claude Code reports while using it")
+	errClaudeSaved    = errors.New("not read yet: refresh this account's card to have Claude Code's /usage read it")
 )
+
+// savedRefresh says ctx is the refresh of the card of the saved Claude
+// account user, the one ask that runs Claude Code for a saved account. The
+// Usage page opened, its timer, `magpie quota` and routing keep to what
+// was read: a run in every saved account's directory for each of them
+// would start Claude Code once per account.
+func savedRefresh(ctx context.Context, user string) bool {
+	r, ok := refreshing(ctx)
+	return ok && wasAsked(ctx) && r.wants("claude", user)
+}
 
 // elapsed is ws as of now: a window that has reset since it was read
 // starts again from nothing.

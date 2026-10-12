@@ -6,9 +6,9 @@ import (
 	"debug/buildinfo"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -66,6 +66,10 @@ type Option struct {
 	// whether it is now (provider.IsFastPick)
 	FastFor string `json:"fastFor,omitempty"`
 	Fast    bool   `json:"fast,omitempty"`
+	// OwnFast: its fast mode is a GPT model's on a provider the user added
+	// by its address (provider.OwnFast, #1615), asked for there as OpenAI's
+	// priority, which the provider may or may not serve
+	OwnFast bool `json:"ownFast,omitempty"`
 
 	// own: served on the agent's own sign-in (viaMagpie), for Same
 	own bool
@@ -163,6 +167,11 @@ type Agent struct {
 	// the Agents page says so and what turns it off, and the gateway lists
 	// it only its own models.
 	FailingOver func() bool
+	// EndFailover takes out what account failover wrote, for magpie
+	// quitting: left there, the agent would be pointed at a gateway that
+	// no longer answers, and retry till magpie is open again (Leon920717
+	// on X). The next start's Sync writes it again.
+	EndFailover func() error
 	// Follow, for an agent whose own picker moves its main model where
 	// magpie keeps other settings following it (Claude Code's /model and
 	// its tiers), brings those along to the model picked there. Run as the
@@ -235,6 +244,11 @@ type Agent struct {
 	// move, when set, points the agent's config at to where it names the
 	// gateway at from: an address of WSL's that changed (#1013).
 	move func(from, to string) error
+	// viaProxy, when set, says whether the agent's requests for the
+	// gateway get there through the proxy it sends them by (ok), whether
+	// that is known yet, and the proxy and where it is set; ok with no
+	// proxy when it sends them straight there (see codex_proxy.go).
+	viaProxy func() (ok, known bool, proxy, from string)
 	// dirShared says Dir is a folder another agent keeps its files in too
 	// (omp's, when PI_CODING_AGENT_DIR points it at Pi's): that it is there
 	// says nothing of this agent.
@@ -291,9 +305,10 @@ func (a *Agent) Detected() bool {
 // started before Claude Code's installer put claude.exe in ~/.local/bin
 // and added that to the user's PATH, or a self-update restarting with the
 // PATH it had then, never listed it, while the sign-in, which asked
-// FindTool, found it (#839, #1482). "" when it is in none.
+// FindTool, found it (#839, #1482). A mise wrapper script found there is
+// given as the program it runs (proc.LookPath). "" when it is in none.
 func binAt(name string) string {
-	if p, err := exec.LookPath(name); err == nil {
+	if p, err := proc.LookPath(name); err == nil {
 		return p
 	}
 	if runtime.GOOS == "windows" {
@@ -400,6 +415,35 @@ func (a *Agent) Values() map[string]string {
 		m[f.Key] = f.Get()
 	}
 	return m
+}
+
+// Picks are the options f's picker offers: all of them, unless the user
+// asked a's pickers to offer magpie's models alone (#1642, MizuIro-H). Then
+// a field that picks among magpie's catalog leaves out the models the agent
+// reaches on its own (DeepSeek Harness's DeepSeek ones), but for its
+// default and the one it is set to.
+func (a *Agent) Picks(f Field, cur map[string]string) []Option {
+	opts := f.Options(cur)
+	if !provider.OwnModelsHidden(a.ListsFor()) || !slices.ContainsFunc(opts, func(o Option) bool { return o.Ref != "" }) {
+		return opts
+	}
+	return slices.DeleteFunc(slices.Clone(opts), func(o Option) bool { return Own(o) && o.Value != cur[f.Key] })
+}
+
+// Own reports whether o is a model the agent reaches on its own, not one of
+// magpie's catalog: what Picks leaves out on the user's word.
+func Own(o Option) bool { return o.Ref == "" && o.Value != "" }
+
+// OwnModels reports whether one of a's pickers that picks among magpie's
+// catalog offers models of the agent's own too, which Picks can leave out.
+func (a *Agent) OwnModels(cur map[string]string) bool {
+	for _, f := range a.Fields {
+		opts := f.Options(cur)
+		if slices.ContainsFunc(opts, func(o Option) bool { return o.Ref != "" }) && slices.ContainsFunc(opts, Own) {
+			return true
+		}
+	}
+	return false
 }
 
 // Detected returns the agents present on this machine, in display order.

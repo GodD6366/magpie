@@ -71,6 +71,11 @@ type Model struct {
 	// ImageSaid is whether the plugin (or models.dev) said if it takes
 	// images: Image false without it is not known
 	ImageSaid bool `json:"imageSaid"`
+	// Inputs and Outputs are the kinds capabilities.input and .output say
+	// the model takes and gives (text, image, audio, video, pdf), in
+	// OpenCode's order: not image alone (#1595)
+	Inputs  []string `json:"inputs,omitempty"`
+	Outputs []string `json:"outputs,omitempty"`
 	// Fast is set by the plugin on a model it runs in its vendor's fast
 	// mode when the request says service_tier "priority" (m.fast: Cursor's
 	// plugin from 0.2.2, for a model Cursor has a fast variant of)
@@ -628,10 +633,12 @@ type Authorization struct {
 // already signed in replaces that one's instead.
 const NewAccount = "new"
 
-// Authorize begins an OAuth sign-in to account (a key, or NewAccount).
+// Authorize begins an OAuth sign-in to account (a key, or NewAccount),
+// through the proxy ctx names (netproxy.With): the plugin's requests for
+// it, there and in Finish, go through that one (#1663).
 func Authorize(ctx context.Context, provider string, method int, inputs map[string]string, account string) (Authorization, error) {
 	var a Authorization
-	err := Call(ctx, "authorize", map[string]any{"provider": provider, "method": method, "inputs": inputs, "account": account}, &a)
+	err := Call(ctx, "authorize", map[string]any{"provider": provider, "method": method, "inputs": inputs, "account": account, "proxy": proxyOf(ctx)}, &a)
 	return a, err
 }
 
@@ -654,8 +661,8 @@ func failure(why string) error {
 }
 
 // Finish waits for an OAuth sign-in to finish: an "auto" one on its own,
-// a "code" one with the code pasted back. It gives where the sign-in was
-// saved.
+// a "code" one with the code pasted back, through the proxy Authorize was
+// given. It gives where the sign-in was saved.
 func Finish(ctx context.Context, session, code string) (Saved, error) {
 	var r struct {
 		OK    bool   `json:"ok"`
@@ -672,14 +679,14 @@ func Finish(ctx context.Context, session, code string) (Saved, error) {
 }
 
 // APIKey signs in to account (a key, or NewAccount) with a key, as an
-// "api" method does.
+// "api" method does, through the proxy ctx names.
 func APIKey(ctx context.Context, provider string, method int, inputs map[string]string, key, account string) (Saved, error) {
 	var r struct {
 		OK    bool   `json:"ok"`
 		Error string `json:"error"`
 		Saved
 	}
-	if err := Call(ctx, "apiKey", map[string]any{"provider": provider, "method": method, "inputs": inputs, "key": key, "account": account}, &r); err != nil {
+	if err := Call(ctx, "apiKey", map[string]any{"provider": provider, "method": method, "inputs": inputs, "key": key, "account": account, "proxy": proxyOf(ctx)}, &r); err != nil {
 		return Saved{}, err
 	}
 	if !r.OK {
@@ -877,6 +884,11 @@ type UsageWindow struct {
 	Models    []string `json:"models"`
 	NotModels []string `json:"notModels"`
 	Aside     bool     `json:"aside"`
+	// RunsOutAt (RFC 3339) is when the soonest credits left in the window
+	// are lost, and RunsOut how many, when the vendor's credits expire
+	// apart from the window's reset (WorkBuddy's packages)
+	RunsOutAt string  `json:"runsOutAt"`
+	RunsOut   float64 `json:"runsOut"`
 }
 
 // Checkin is what came of an account's daily check-in, as the plugin's

@@ -76,7 +76,9 @@ line; agents connected to magpie lose it when it quits.
   (`magpie visible <agent> --only-picked`, back with `--show-new`). A
   model asked for by name still works either way.
 - **Profiles.** Snapshot every agent's settings under a name and switch all of
-  them back in one move.
+  them back in one move. The profile in use, the one applying would change
+  nothing, is ticked, the tray panel's Profiles button shows its name, and
+  `magpie profiles` marks it ✓.
 - **Real logos, no framework.** Plain HTML over the system webview; brand
   icons from [lobehub/icons](https://github.com/lobehub/lobe-icons).
 
@@ -128,6 +130,7 @@ line; agents connected to magpie lose it when it quits.
 | Qoder (CLI)  | `~/.qoder/settings.json` (`$QODER_CONFIG_DIR`) | model, effort (a `magpie` custom provider; needs a Qoder plan with BYOK) |
 | Qoder CN (CLI) | `~/.qoder-cn/settings.json` (`$QODERCN_CONFIG_DIR`) | model, effort (as Qoder; its own accounts, a Qoder CN plan with BYOK) |
 | Grok Build   | `~/.grok/config.toml` (`$GROK_HOME`) | model, effort |
+| Grok App     | `agent-home/config.toml` in its data folder (`$GROK_APP_HOME`, else `~/Library/Application Support/com.grokapp.grok-app`, `%APPDATA%\grokapp\grok-app\data`, `$XDG_DATA_HOME/grok-app`, or `~/.grok-app`) | model (a `[model.magpie]` provider channel as the App's Providers page writes one, with magpie's models and their effort levels in `app_models`; `[models] default = "magpie"`, what was there put back on Disconnect; a model or default effort picked in the App kept; effort is picked in the App's composer; MCP servers and skills reach it through Grok Build's row) |
 | ZCode        | `~/.zcode/v2/config.json`         | provider (magpie's models in ZCode's picker) |
 | WorkBuddy    | `~/.workbuddy/models.json` (`$WORKBUDDY_CONFIG_DIR`) | provider (magpie's models in WorkBuddy's picker) |
 | WorkBuddy AI | `~/.workbuddy-ai/models.json` (the international build) | provider (magpie's models in WorkBuddy AI's picker) |
@@ -272,10 +275,22 @@ deleted keys keep their historical identity. Older records appear as
 **key not recorded**, never inferred from today's configured key.
 These are upstream credentials, not keys clients use to call Magpie.
 
-The CSV's `cache_write_tokens` is still every cache write; the last two
+The CSV's `cache_write_tokens` is still every cache write; the two
 columns, `cache_write_5m_tokens` and `cache_write_1h_tokens`, split it by how
 long Anthropic keeps it (a record from before the split is all 5-minute).
 The app shows the split on a request's Cache and the usage tiles' tooltips.
+
+**Requests and failures** count requests, each once by how it ended: a
+request failed when the agent got an error. One that a later try answered
+(the next member of a group, another account) is not a failure; the Usage
+page, the Requests card, its rankings and group rows, and `magpie usage`
+count it as answered on a retry (`retried` in the JSON). On the Requests
+card each count is a button for its requests in the list below (the
+Failed and Retried filters, `failed=1` and `retried=1`). A try a vendor
+refused or turned away keeps its own row, for what it billed and why, marked
+handed on, and isn't counted as a request. The CSV's last columns are
+`tries` (on the final row, when the request took more than one) and
+`handed_on`.
 
 **Output speed** (tok/s on the Usage and Routing pages, `magpie usage`) is
 output tokens over the time after the first token, summed per request: the
@@ -302,25 +317,35 @@ shows the least its reply wrote at instead (`≥98 tok/s`): its output tokens
 over that whole time, the wait for the first token in it, so the speed after
 the first token is never under it. Only a reply of 1,000 tokens or more
 written over a second or more shows one; a shorter reply's wait is too much
-of its time to tell anything. Only Claude Code's and Claude Desktop's rows
-show one: their line that asked for a reply is written before it is sent. A
-Codex call in a turn of several is timed from the last tool output before
-its token count, and Codex can write the output of a tool that call itself
-asked for before the count, so its time can begin inside the call and a
-floor from it could read high; it shows none.
-A call whose session file timed it (a Codex
-turn of one call) shows its own speed as before. A floor never mixes into a
-measured speed: the Speed trend and `magpie usage` count timed calls only.
+of its time to tell anything; a count of tokens bounds that share, a
+duration doesn't (a 5 s reply can be 4 s of wait). Claude Code's, Claude
+Desktop's and Codex's rows show one: Claude's line that asked for a reply is
+written before it is sent, and a Codex call in a turn of several is timed
+from what the model had last been given before the call's first output
+item to its last, never from the output of a tool the call itself ran,
+which an older rollout writes before the call's token count. OpenCode's rows
+show none.
+A call whose session file timed it (a Codex turn of one call) shows its own
+speed as before. When that call reasoned, the file has its first token but
+not its first text, so no speed is measured; it shows the least its answer
+wrote at instead: its output less the reasoning, all written after the first
+token, over the time from the first token to its end. Its whole output over
+that time would count reasoning written before the first token and read
+high. A floor never mixes into a measured speed: the Speed trend and
+`magpie usage` count timed calls only.
 
 A group's speed (a row of the Usage page's ranking, by model, provider or
 agent, its Output speed card, and the overview's lists) says how many
 replies it is of, by one rule: with replies whose speed was measured, their
-speed and how many they are (`125 tok/s (1)`, though the group has 260
-requests, most of them Codex calls in a turn of several); with none, but
-rows that tell a floor, the least those wrote at, their tokens over their
-whole times, and how many (`≥100 tok/s (30)`); with neither, nothing. Its
-tooltip says which. A ranking by speed orders a floor-only group by its
-floor (`usage.Totals` `decode_n`, `floor_out`, `floor_ms`, `floor_n`;
+speed and how many they are (`125 tok/s (1)`, not beside "260 requests"
+alone); with rows that tell a floor, the least those wrote at and how many
+(`≥100 tok/s (30)`); with both, both, the measured first
+(`125 tok/s (1) · ≥50 tok/s (259)`), as a few measured replies may not
+stand for the rest and a floor is no measure; with neither, nothing. The
+Output speed card shows the measured speed as its figure and the floor
+under it. The tooltip says what each is of. A ranking by speed orders and
+bars a group by its measured speed, or its floor when it has none
+(`usage.Totals` `decode_n`, `floor_out`, `floor_ms`, `floor_n`;
 `usage.Row.Floor`).
 
 It lists **accounts** too: each Codex, Claude or other subscription account's
@@ -336,7 +361,8 @@ inferred from today's sign-in. OTLP export never carries the account.
 
 One magpie can serve several computers (an office one, a personal one):
 share it on the network (Settings → Share on local network), and on each
-other computer add it as a **Remote magpie** — in the app's Add sheet, on the
+other computer add it as a **Remote magpie** — in the app's Add sheet, under
+its own heading, Another computer's magpie, after On this machine; on the
 TUI's Providers page (`a`, then its address and key; `w` changes the address,
 `m` fetches its list again), or
 `magpie provider add remote-magpie sk-magpie-… url=http://192.168.1.20:3425 id=office`.
@@ -576,7 +602,9 @@ Provider attribution stays independent; CSV puts `provider_key_*` before
 An existing LAN key becomes **Magpie** without changing the credential.
 `lanKey` remains in settings for older Magpie versions. Disabling or removing
 the default key replaces that mirror with a random non-empty revoked value;
-rotation does not re-enable it. The key store records migration completion,
+rotation does not re-enable it. Turning sharing off and on again neither
+re-enables a disabled default key nor makes a removed one again; only
+asking for a new sharing key makes one. The key store records migration completion,
 even if `lanKeyId` cannot be saved, so reads do not keep retrying that write.
 A migration write failure is logged without preventing gateway startup,
 CLI key management, or the Settings and key-list pages from opening.
@@ -1089,6 +1117,15 @@ the vendor's cache of it is worth keeping), `session`, `turn` or `off`.
 `models=` replaces the whole list, in order; a bare model id works when only
 one provider serves it.
 
+`listed=no` (the group editor's **Model lists: The group alone**) keeps the
+models a group names, and those its patterns match, out of `magpie models`,
+`/v1/models` and every agent's list, so a client offers the group alone.
+They are still served: the group routes over them, and a request naming one
+as `provider/model` is answered. A group in it keeps its own setting, and a
+group switched off keeps nothing out. `listed=yes` lists them again. To keep
+a whole provider for groups, use its **Only through routing groups** switch
+instead.
+
 A group can also be of decision models alone (Jev and the like: TypeSafe's,
 Bailian's `decision-model-preview`, a plugin's marked models) — never mixed
 with models that hold a conversation. It is not offered to agents; it is asked
@@ -1195,9 +1232,21 @@ each of these groups ordered by the share used.
   when the weeks renew in the same hour. Reset times are compared to the
   hour, by the clock: 13:55 and 14:05 are different hours, 14:05 and
   14:55 the same. An account
-  with no week (Claude Enterprise) goes by its 5 hours. A Claude account
+  with no week (Claude Enterprise) goes by its 5 hours. Credits that
+  run out before their window renews, or that have no reset at all
+  (WorkBuddy's packages, each ending on its own day), count as renewing
+  when they run out: of several WorkBuddy accounts, the one whose credits
+  left end first goes first. The daily Free Plan credits aren't counted,
+  since they end at the same midnight on every account. A Claude account
   magpie knows nothing of yet goes first once, to learn what it has left
   from the answer; any other unknown account goes after those known.
+  An account with a month beside its week (Factory) goes by its month:
+  when the month holds less than its weeks add up to (Factory's, by
+  one user's readings, about two weeks' worth), what a week leaves isn't
+  lost at the week's reset, as the
+  month still has it to spend later. Its row
+  on the Routing page says the fullest window's share with when that
+  window renews: "32% used · renews in 3 days" is the week's.
 - **In order**: the accounts in their order. The first takes every request
   until it is used up (100%) or fails.
 - **In turn**: each turn of a conversation goes to the next account. A new
@@ -1469,7 +1518,7 @@ machine), with every session in `sessions` where the window's lists the
 top 100 by tokens; `sessionCount` is how many there are. `GET /v1/magpie/usage/requests` is its requests a page at a time
 (`offset`, `limit` up to 500), with the same filters as the Requests log:
 `period`, `day`, `agent`, `provider`, `model`, `account`, `callerKey`,
-`purpose`, `failed`, `q`, `via`, `computer`. What was said in a call is not
+`purpose`, `failed`, `retried`, `q`, `via`, `computer`. What was said in a call is not
 in either. Like `/v1/magpie/quotas`, they answer this machine, and another
 only with a gateway key. A key held to a budget, to some models or to some
 accounts is told its own calls alone: `/v1/magpie/usage` refuses it with a
@@ -1951,7 +2000,13 @@ For S3:
 - The access key needs to read and write `<prefix>/magpie/`. On AWS it also
   needs to list the bucket.
 - A server without conditional writes is supported. There magpie checks the
-  object's ETag just before each write.
+  object's ETag just before each write. Two computers that write in the
+  same moment can both pass that check (Aliyun OSS, #1776), and the later
+  write is the one kept. The other computer notices at its next sync, a
+  few minutes later. It finds a file other than the one it wrote, so it
+  merges again from before its own write: what it changed goes back up
+  beside the other computer's change. It never takes the other's file as
+  having seen its own.
 - Shared usage is reconciled only after a complete S3 listing. A missing or
   repeated continuation token, or a listing still truncated after 100 pages,
   reports a sync error and keeps previously downloaded usage days in place.

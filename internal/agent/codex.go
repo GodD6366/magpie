@@ -4,6 +4,7 @@ import (
 	"cmp"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -512,6 +513,13 @@ func codexIn(at place) *Agent {
 			return nil
 		}
 		on := !disconnected() && codexFailover()
+		// failover is magpie's own idea, not the user's: never handed
+		// Codex's requests while a proxy they'd go through doesn't pass
+		// them on to magpie, which would have every turn fail with 502
+		// (codex_proxy.go); one written before goes again
+		if on && at.spell == nil && !codexProxyOK(path, at.gw()) {
+			on = false
+		}
 		if mirror {
 			t, _ := edit.GetTOMLTable(path, "model_providers."+p)
 			hasGateway := t["base_url"] == at.codexURL()
@@ -611,6 +619,17 @@ func codexIn(at place) *Agent {
 		}
 		if !withMagpie {
 			return own
+		}
+		// the models magpie serves on the Codex accounts in it (codex/…)
+		// are left out while they would only add a hop: Codex on its own
+		// ChatGPT sign-in, that one account alone in magpie. On a relay or
+		// a key they are not Codex's sign-in, and over several accounts
+		// magpie routes; offered via magpie then, beside the direct ones
+		// (#1603: Codex on CC Switch's custom relay, two accounts, GPT
+		// models direct only). Routed, Codex's own say via magpie already.
+		onSignIn := (p == "" || p == "openai" || isCCSwitchMirror(p)) && chatGPT()
+		if !through && (!onSignIn || codexFailover()) {
+			return append(own, viaMagpie("codex", "")...)
 		}
 		return append(own, viaMagpieFor("codex", "")...)
 	}
@@ -857,7 +876,13 @@ func codexIn(at place) *Agent {
 		Beside:      beside,
 		Routed:      routed,
 		FailingOver: failingOver,
-		OwnVia:      codexOwnViaMagpie,
+		EndFailover: func() error {
+			if !failingOver() {
+				return nil
+			}
+			return errors.Join(dropMirrorFailover(), dropBase())
+		},
+		OwnVia: codexOwnViaMagpie,
 		Sync: func() error {
 			// model_provider = "magpie" left with its table gone (taken by
 			// another tool, or a hand edit), which keeps Codex from loading
@@ -1069,14 +1094,22 @@ func codexIn(at place) *Agent {
 				// the model magpie puts every subagent on, whatever the
 				// lead asked for in spawn_agent (willz on Discord): kept in
 				// magpie's settings, not Codex's config, since the gateway
-				// rewrites the subagent's request. Only a ChatGPT account's
-				// models are offered: a subagent's task is sealed for them
+				// rewrites the subagent's request. Every model magpie serves
+				// is offered (#1633: a lead on a chat provider, its
+				// subagents wanted there too); a subagent whose task a
+				// ChatGPT-backed lead sealed stays on the model asked for
+				// unless the one set is a ChatGPT account's (the gateway)
 				Key: "subagent_model", Label: "subagent model", Quiet: true,
 				Get: provider.CodexSubagentModel,
 				Set: provider.SetCodexSubagentModel,
 				Options: func(map[string]string) []Option {
-					var out []Option
+					var out, groups []Option
 					for _, e := range provider.CodexSubagentModels() {
+						if e.Group != "" {
+							groups = append(groups, Option{Value: e.ID, Label: e.Name, Note: "routing group · via magpie",
+								Icon: e.Provider.Icon, Icons: e.Icons, Group: RoutingGroups, Ref: e.ID})
+							continue
+						}
 						note := e.Provider.Name + " · via magpie"
 						if a := e.Provider.Account; a != nil && a.User != "" {
 							note = a.User + " · via magpie"
@@ -1084,7 +1117,7 @@ func codexIn(at place) *Agent {
 						out = append(out, Option{Value: e.ID, Label: e.Name, Note: note, Icon: e.Provider.Icon,
 							Group: e.Provider.Name, Ref: e.ID, Context: e.Context})
 					}
-					return out
+					return append(out, groups...)
 				},
 			},
 			{
@@ -1173,6 +1206,7 @@ func codexIn(at place) *Agent {
 	// and moved to WSL's new one when that changed (#1013)
 	if at.spell == nil {
 		a.reach = at.base
+		a.viaProxy = func() (bool, bool, string, string) { return codexThroughProxy(path, at.gw()) }
 		a.move = func(from, to string) error { return codexMoveGateway(path, from, to) }
 	}
 	return a
@@ -1429,6 +1463,29 @@ func codexFailover() bool {
 		}
 	}
 	return false
+}
+
+// EndCodexFailover takes account failover out of this machine's Codex
+// as the magpie serving its gateway quits (EndFailover): Codex goes
+// straight to OpenAI again rather than retrying a gateway that's gone.
+// The app-server codex sessions share read the old base URL as it started
+// and keeps it, and KeepCodexDaemonCurrent ends with magpie, so it is
+// restarted here, when no session is on it (thisisvainxx on X: back on
+// its own config, Codex took "several restarts").
+func EndCodexFailover() error {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return err
+	}
+	a := codex(home)
+	if !a.FailingOver() {
+		return nil
+	}
+	if err := a.EndFailover(); err != nil {
+		return err
+	}
+	codexDaemonCheck(a.Path)
+	return nil
 }
 
 // CodexOwnOnly reports whether the Codex that asks the gateway for its

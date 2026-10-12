@@ -43,6 +43,7 @@ import (
 	"github.com/yetone/magpie/internal/profile"
 	"github.com/yetone/magpie/internal/provider"
 	"github.com/yetone/magpie/internal/redact"
+	"github.com/yetone/magpie/internal/sessions"
 	"github.com/yetone/magpie/internal/settings"
 	"github.com/yetone/magpie/internal/update"
 )
@@ -234,6 +235,10 @@ type profileJSON struct {
 	// Agents is what it holds, by agent, to be read before it is applied
 	// (#467); a value that reads as a key or a token is left out
 	Agents []profile.Group `json:"agents"`
+	// InUse: the setup is this profile now, applying it would change
+	// nothing (profile.InUse); the page marks it so (superhtoooth on X:
+	// nothing said which profile was in use)
+	InUse bool `json:"inUse,omitempty"`
 }
 
 type profileLibraryJSON struct {
@@ -271,6 +276,10 @@ type stateJSON struct {
 	// Last: this is the state kept from the last read (laststate.go), for
 	// the page to draw while the fresh one is read
 	Last bool `json:"last,omitempty"`
+	// Served is how many models magpie serves, groups left out: the Get
+	// started card's first step ("add a model source") is done once
+	// there is one, agents found or not
+	Served int `json:"served"`
 }
 
 // unlistedJSON is a model of a provider kept for routing groups, and the
@@ -463,6 +472,10 @@ type searchVendorJSON struct {
 	Name    string `json:"name"`
 	KeysURL string `json:"keysURL,omitempty"`
 	NeedURL bool   `json:"needURL,omitempty"` // one the user runs
+	// KeyOptional: it can be added with no key (You.com's free search, #1626)
+	KeyOptional bool `json:"keyOptional,omitempty"`
+	// its own address, the one used while no base URL is set (#1580)
+	Base string `json:"base,omitempty"`
 }
 
 func searchState(s *settingsJSON) {
@@ -479,7 +492,7 @@ func searchState(s *settingsJSON) {
 		s.SearchAPIs = append(s.SearchAPIs, j)
 	}
 	for _, v := range provider.SearchVendors {
-		s.SearchVendors = append(s.SearchVendors, searchVendorJSON{ID: v.ID, Name: v.Name, KeysURL: v.KeysURL, NeedURL: v.Base == ""})
+		s.SearchVendors = append(s.SearchVendors, searchVendorJSON{ID: v.ID, Name: v.Name, KeysURL: v.KeysURL, NeedURL: v.Base == "", KeyOptional: v.KeyOptional, Base: v.Base})
 	}
 	s.SearchProvider = gateway.Searcher()
 	s.SearchAuto, s.SearchUnused = gateway.AutoSearcher(), gateway.SearcherUnused()
@@ -526,7 +539,7 @@ func settingsState() settingsJSON {
 		s.TerminalDefault = found.Default
 	}
 	s.FX = currentFX()
-	if (s.UsageAlert > 0 || s.BalanceAlert > 0 || s.ResetReminder > 0) && notifyProblem != nil {
+	if (s.UsageAlert > 0 || s.BalanceAlert > 0 || s.ResetReminder > 0 || s.TurnDoneAlert > 0) && notifyProblem != nil {
 		s.NotifyProblem = notifyProblem()
 	}
 	s.ProxyNow, s.ProxySource = netproxy.Describe()
@@ -1050,10 +1063,11 @@ func Handler(w Windows, gw *gateway.Server) http.Handler {
 		// round — keyed by agent, not by "<provider>/<model>" — so they are
 		// not among them, and belong to the Agents page.
 		in.Visible, in.HiddenModels, in.OrderedModels = cur.Visible, cur.HiddenModels, cur.OrderedModels
-		in.PickedModels = cur.PickedModels     // "only models I pick" (#1337)
-		in.FastPicks = cur.FastPicks           // switched in the agents' pickers (#954)
-		in.AgentEfforts = cur.AgentEfforts     // picked in an agent's row (#1003)
-		in.PluginCheckins = cur.PluginCheckins // set on its own (plugin-checkin below)
+		in.PickedModels = cur.PickedModels       // "only models I pick" (#1337)
+		in.OwnModelsHidden = cur.OwnModelsHidden // an agent's own models left out (#1642)
+		in.FastPicks = cur.FastPicks             // switched in the agents' pickers (#954)
+		in.AgentEfforts = cur.AgentEfforts       // picked in an agent's row (#1003)
+		in.PluginCheckins = cur.PluginCheckins   // set on its own (plugin-checkin below)
 		settings.CarryPerModel(&in, &cur)
 		in.LAN, in.LANKey = cur.LAN, cur.LANKey
 		in.LANKeyID = cur.LANKeyID
@@ -1070,6 +1084,8 @@ func Handler(w Windows, gw *gateway.Server) http.Handler {
 		in.UsageOrder = cur.UsageOrder // the Usage page's, dragged there
 		// and what the tray panel's Allowances tab leaves out, set there
 		in.PanelUsageHidden = cur.PanelUsageHidden
+		// and the clients the Usage page's Agents list leaves out, set there
+		in.UsageAgentsHidden = cur.UsageAgentsHidden
 		// how agents' lists name models, set on its own for the agents to be told
 		in.PlainNames, in.PlainOwnNames = cur.PlainNames, cur.PlainOwnNames
 		in.CodexAgentsV1 = cur.CodexAgentsV1
@@ -1077,6 +1093,8 @@ func Handler(w Windows, gw *gateway.Server) http.Handler {
 		in.CompactAt = cur.CompactAt     // and so is the threshold
 		// Claude Desktop's list, set in its row on the Agents page
 		in.DesktopLongest = cur.DesktopLongest
+		// and the Get started card put away, from the card itself
+		in.GuideHidden = cur.GuideHidden
 
 		in.CodexTitles = cur.CodexTitles // set on its own (codex-titles below)
 		// and so is the model Codex's auto-review runs on (codex-auto-review)
@@ -1141,8 +1159,8 @@ func Handler(w Windows, gw *gateway.Server) http.Handler {
 		}
 		// an alert turned on or moved is looked at now, the Mac asked for its
 		// leave to notify as it is turned on (#368)
-		if (in.UsageAlert != cur.UsageAlert || in.BalanceAlert != cur.BalanceAlert || in.ResetReminder != cur.ResetReminder) &&
-			(in.UsageAlert > 0 || in.BalanceAlert > 0 || in.ResetReminder > 0) && onAlerts != nil {
+		if (in.UsageAlert != cur.UsageAlert || in.BalanceAlert != cur.BalanceAlert || in.ResetReminder != cur.ResetReminder || in.TurnDoneAlert != cur.TurnDoneAlert) &&
+			(in.UsageAlert > 0 || in.BalanceAlert > 0 || in.ResetReminder > 0 || in.TurnDoneAlert > 0) && onAlerts != nil {
 			onAlerts()
 		}
 		// the tray menu follows the page's language (#301)
@@ -1263,6 +1281,21 @@ func Handler(w Windows, gw *gateway.Server) http.Handler {
 			return
 		}
 		if err := provider.SetCodexAgentsV1(in.On); err != nil {
+			fail(rw, err)
+			return
+		}
+		writeJSON(rw, settingsState())
+	})
+	// the Agents page's Get started card put away, or back (GuideHidden)
+	mux.HandleFunc("POST /api/settings/guide", func(rw http.ResponseWriter, r *http.Request) {
+		var in struct{ Hidden bool }
+		if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+			fail(rw, err)
+			return
+		}
+		s := settings.Load()
+		s.GuideHidden = in.Hidden
+		if err := settings.Save(s); err != nil {
 			fail(rw, err)
 			return
 		}
@@ -1540,12 +1573,13 @@ func Handler(w Windows, gw *gateway.Server) http.Handler {
 		writeJSON(rw, settingsState())
 	})
 	// the Usage page's order of its cards, which the tray panel's Allowances
-	// tab follows, and what that tab leaves out, in magpie's settings; one
-	// not sent stays as it is
+	// tab follows, what that tab leaves out, and the clients the page's
+	// Agents list leaves out, in magpie's settings; one not sent stays as it is
 	mux.HandleFunc("POST /api/usage/arrange", func(rw http.ResponseWriter, r *http.Request) {
 		var in struct {
-			Order       *[]string
-			PanelHidden *[]string
+			Order        *[]string
+			PanelHidden  *[]string
+			AgentsHidden *[]string
 		}
 		if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
 			fail(rw, err)
@@ -1557,6 +1591,9 @@ func Handler(w Windows, gw *gateway.Server) http.Handler {
 		}
 		if in.PanelHidden != nil {
 			s.PanelUsageHidden = *in.PanelHidden
+		}
+		if in.AgentsHidden != nil {
+			s.UsageAgentsHidden = *in.AgentsHidden
 		}
 		if err := settings.Save(s); err != nil {
 			fail(rw, err)
@@ -1649,6 +1686,32 @@ func Handler(w Windows, gw *gateway.Server) http.Handler {
 		}
 		s := settings.Load()
 		s.RedactRules = in.Rules
+		if err := settings.Save(s); err != nil {
+			fail(rw, err)
+			return
+		}
+		writeJSON(rw, settingsState())
+	})
+	// one masking rule changed in place (nf1qaz2w on Discord): the rule at
+	// At, which must still be Was, becomes Rule, checked as an added one is.
+	// A rule that can't be used is said and every rule is kept as it was.
+	mux.HandleFunc("POST /api/settings/redact-rule", func(rw http.ResponseWriter, r *http.Request) {
+		var in struct {
+			At   int         `json:"at"`
+			Was  redact.Rule `json:"was"`
+			Rule redact.Rule `json:"rule"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+			fail(rw, err)
+			return
+		}
+		s := settings.Load()
+		next, err := editRedactRule(s.RedactRules, in.At, in.Was, in.Rule)
+		if err != nil {
+			fail(rw, err)
+			return
+		}
+		s.RedactRules = next
 		if err := settings.Save(s); err != nil {
 			fail(rw, err)
 			return
@@ -1795,6 +1858,11 @@ func held(h http.Handler) http.Handler {
 			// and the files read, not looked at again for each look-up
 			defer filememo.Hold()()
 		}
+		if strings.HasPrefix(r.URL.Path, "/api/sessions") || strings.HasPrefix(r.URL.Path, "/api/usage") {
+			// a page waits on the session files: the warm-up reading
+			// them reads at full speed meanwhile
+			defer sessions.Ask()()
+		}
 		if !(api && r.Method == http.MethodGet) {
 			// anything that may have written drops what was held, once it
 			// has answered with it
@@ -1814,14 +1882,22 @@ func state() stateJSON {
 	}
 	s.Unlisted = unlistedModels()
 	s.CLIBehind = cliBehind()
+	for _, e := range provider.Served() {
+		if e.Group == "" {
+			s.Served++
+		}
+	}
 	for _, a := range agent.Clients() {
 		s.Clients = append(s.Clients, clientJSON{ID: a.ID, Name: a.Name, Icon: a.Icon})
 	}
-	for _, a := range agent.Detected() {
+	detected := agent.Detected()
+	now := make(map[string]map[string]string, len(detected))
+	for _, a := range detected {
 		if a.Follow != nil {
 			_ = a.Follow()
 		}
 		vals := a.Values()
+		now[a.ID] = vals
 		aj := agentJSON{ID: a.ID, Name: a.Name, Icon: a.Icon, Path: tilde(a.Path), Fields: agentFields(a, vals)}
 		aj.Models = agentModelCount(a, aj.Fields)
 		aj.Menu = a.ListsModels
@@ -1850,7 +1926,7 @@ func state() stateJSON {
 	}
 	if ps, err := profile.Load(); err == nil {
 		for _, n := range profile.Names(ps) {
-			pj := profileJSON{Name: n, Summary: profile.Summary(ps[n]), Agents: profile.Details(ps[n])}
+			pj := profileJSON{Name: n, Summary: profile.Summary(ps[n]), Agents: profile.Details(ps[n]), InUse: profile.InUse(ps[n], detected, now)}
 			if l := ps[n].Library; l != nil {
 				servers, skills := l.On()
 				pj.Library = &profileLibraryJSON{Servers: servers, Skills: skills, Instructions: l.GivesInstructions()}
@@ -1922,4 +1998,30 @@ func codexUsers() []string {
 		}
 	}
 	return out
+}
+
+// editRedactRule is rules with the one at at, which must still be was,
+// changed to to: tidied and checked as an added rule is, in the same place.
+// It is refused when that rule is no longer there (changed or removed
+// meanwhile), when to has neither a prefix nor a pattern (taking a rule
+// away is Remove), and when to is another rule already listed.
+func editRedactRule(rules []redact.Rule, at int, was, to redact.Rule) ([]redact.Rule, error) {
+	if at < 0 || at >= len(rules) || rules[at] != was {
+		return nil, fmt.Errorf("that masking rule is no longer there: it was changed or removed meanwhile")
+	}
+	tidy, err := redact.CheckRules([]redact.Rule{to})
+	if err != nil {
+		return nil, err
+	}
+	if len(tidy) == 0 {
+		return nil, fmt.Errorf("a masking rule needs a prefix or a regular expression")
+	}
+	for i, o := range rules {
+		if i != at && o == tidy[0] {
+			return nil, fmt.Errorf("the masking rule %s is there already", o.Kind)
+		}
+	}
+	next := slices.Clone(rules)
+	next[at] = tidy[0]
+	return next, nil
 }

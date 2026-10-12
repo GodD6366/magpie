@@ -73,6 +73,10 @@ type pluginEntryJSON struct {
 	Providers []string `json:"providers"`         // the names of those it signs in to
 	Version   string   `json:"version,omitempty"` // installed
 	Latest    string   `json:"latest,omitempty"`  // on npm, when the market asked
+	// Icon is the picture its own package.json gives (magpie.icon), as
+	// the page can show it: the plugin's, which its row shows before any
+	// of its providers' own (#1775)
+	Icon string `json:"icon,omitempty"`
 	// Package is the package installed from a git repository, which its
 	// own package.json names
 	Package string `json:"package,omitempty"`
@@ -212,6 +216,15 @@ func pluginsState(ctx context.Context, w Windows) pluginsJSON {
 			j.Moved = []string{}
 		}
 		s.Plugins = append(s.Plugins, j)
+	}
+	// each plugin's own picture, kept and checked as a listed one's; at
+	// once: one still being fetched shows on the next ask
+	said := make([]string, len(s.Plugins))
+	for i, j := range s.Plugins {
+		said[i] = plugin.InstalledIcon(j.Spec)
+	}
+	for i, ic := range provider.RepoIcons(said, 0) {
+		s.Plugins[i].Icon = ic
 	}
 	return s
 }
@@ -524,7 +537,9 @@ func pluginRoutes(mux *http.ServeMux, w Windows) {
 			Provider string
 			Method   int
 			Inputs   map[string]string
-			Key      string // an "api" method's key
+			Key      string  // an "api" method's key
+			Proxy    *string // the one picked to sign in through (#1663)
+			User     string  // the account signed in to again
 		}
 		if err := json.NewDecoder(io.LimitReader(r.Body, 64<<10)).Decode(&in); err != nil {
 			fail(rw, err)
@@ -546,7 +561,7 @@ func pluginRoutes(mux *http.ServeMux, w Windows) {
 			writeJSON(rw, provider.SignInState{Agent: id, State: "done", User: pp.Name})
 			return
 		}
-		st, err := provider.StartPluginSignIn(in.Provider, in.Method, in.Inputs)
+		st, err := provider.StartPluginSignInWith(in.Provider, in.Method, in.Inputs, provider.SignInOptions{Proxy: in.Proxy, User: in.User})
 		if err != nil {
 			fail(rw, err)
 			return

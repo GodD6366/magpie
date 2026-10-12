@@ -96,7 +96,7 @@ func (s *Server) serveDecisionGroup(w http.ResponseWriter, r *http.Request, body
 		return
 	}
 	// a model a pause rule holds for now is out, as for a chat
-	ms, paused := provider.PausedOut(g, ms, agentOf(r), ruleClock())
+	ms, paused := provider.PausedOut(g, ms, agentOf(r), "", ruleClock())
 	if len(ms) == 0 && len(paused) > 0 {
 		writeError(w, provider.Chat, http.StatusServiceUnavailable, pausedError(asked, paused))
 		return
@@ -121,6 +121,7 @@ func (s *Server) serveDecisionGroup(w http.ResponseWriter, r *http.Request, body
 			return
 		}
 	}
+	cs = probeOne(cs) // of those resting, only the one back soonest (#1799)
 	if len(cs) == 0 {
 		writeError(w, provider.Chat, http.StatusServiceUnavailable, fmt.Sprintf("no key or account of the group %s's decision models may serve them now", g.Name))
 		return
@@ -244,8 +245,9 @@ func (s *Server) askDecisionGroup(model string, intents []string, prev before, e
 		return verdict{}, false, nil
 	}
 	g = g.Live()
-	ms, _ = provider.PausedOut(g, ms, RouterAgent, ruleClock())
+	ms, _ = provider.PausedOut(g, ms, RouterAgent, "", ruleClock())
 	cs, _, _ := s.decideTries(g, ms)
+	cs = probeOne(cs) // of those resting, only the one back soonest (#1799)
 	if len(cs) == 0 {
 		return verdict{}, true, fmt.Errorf("no decision model of the group %s can be asked now", g.Name)
 	}

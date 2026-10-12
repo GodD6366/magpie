@@ -346,7 +346,8 @@ func (s *Server) plan(p provider.Provider, model string, from provider.Protocol)
 // weighed together as the group's routing says — in order, member by
 // member, each as its own provider's routing orders it; else all as one,
 // so a subscription whose allowance renews soonest goes first whichever
-// provider it is of. A group in the group is planned by its own routing
+// provider it is of, but for a provider set to route another way, which
+// is planned as a group in the group is (ownRouting). A group in the group is planned by its own routing
 // alone, whatever the group's (#576): in order, in its place; else as
 // one, weighed with the rest by the one it would try first, and tried
 // whole where that one goes — the group's routing picks between its
@@ -399,7 +400,7 @@ func planLevel(g provider.Group, ms []provider.Member, depth int, from provider.
 		// where the one it would try first is, the rest of it after
 		type unit struct {
 			m     provider.Member // the model, for one of its keys
-			cs    []candidate     // a group in g: its own order
+			cs    []candidate     // a group in g, or a provider routed its own way: its own order
 			order []Weighed
 		}
 		var units []unit
@@ -420,19 +421,28 @@ func planLevel(g provider.Group, ms []provider.Member, depth int, from provider.
 				cs := planLevel(m.Via[depth], ms[i:j], depth+1, from, &sub, asides, wAsides)
 				pl.left = append(pl.left, sub.left...)
 				if len(cs) > 0 {
-					// weighed by the first it would try that isn't resting
-					head := cs[0]
-					for _, c := range cs {
-						if _, resting := restOf(c.restKey()); !resting {
-							if _, resting = restOf(c.restID()); !resting {
-								head = c
-								break
-							}
-						}
-					}
-					add(unit{cs: cs, order: sub.order}, head)
+					add(unit{cs: cs, order: sub.order}, firstAwake(cs))
 				}
 				i = j
+				continue
+			}
+			if ownRouting(m.Provider, g) {
+				// a provider routed its own way keeps it, as a group
+				// in the group does: weighed as one by the first it
+				// would try, and tried whole in its own order (kchen0x
+				// on X: Antigravity in order inside a Smart group)
+				cs, wg := weigh(m.Provider, keys(m), m.Model, from)
+				var order []Weighed
+				for k, c := range cs {
+					w := weighed(c, m.Provider, wg, false, from)
+					w.Turn = k == 0 && (m.Provider.Routing == provider.Rotate || m.Provider.Routing == provider.Weighted) && len(cs) > 1
+					w.Via = m.Groups()
+					order = append(order, w)
+				}
+				if len(cs) > 0 {
+					add(unit{cs: cs, order: order}, firstAwake(cs))
+				}
+				i++
 				continue
 			}
 			for _, c := range keys(m) {
@@ -490,6 +500,29 @@ func planLevel(g provider.Group, ms []provider.Member, depth int, from provider.
 	return out
 }
 
+// firstAwake is the first of cs that isn't resting, else the first: what
+// a group in a group, or a provider routed its own way, is weighed by.
+func firstAwake(cs []candidate) candidate {
+	for _, c := range cs {
+		if _, resting := restOf(c.restKey()); !resting {
+			if _, resting = restOf(c.restID()); !resting {
+				return c
+			}
+		}
+	}
+	return cs[0]
+}
+
+// ownRouting: p, a model's provider in g, is routed by its own routing
+// rather than weighed key by key with the rest of g. One left on Smart,
+// the default, or routed as g is, is weighed with g's other keys and
+// accounts as one pool, so a subscription whose allowance renews soonest
+// goes first whichever provider it is of; one set another way keeps it,
+// as the user set it, whatever g's routing.
+func ownRouting(p provider.Provider, g provider.Group) bool {
+	return p.Routing != "" && p.Routing != g.Routing
+}
+
 // capHeld is how the account acct of p is held at its usage cap for
 // model at now — a window at or past its own cap, else the account's — or
 // at 100% as a Codex account set not to spend its credits; nil when
@@ -501,6 +534,12 @@ func capHeld(p, acct provider.Provider, model string, now time.Time) *capHold {
 	}
 	a := acct.Account
 	caps := provider.HoldCaps(p, a.Agent, a.User)
+	if a.Agent == "codex" && freeOnChatGPT(model) {
+		// a call ChatGPT counts in no window spends nothing a usage cap
+		// keeps (#1593); credits set not to be spent still hold it at
+		// 100%, as nothing says the backend answers it there
+		caps = provider.WindowCaps{Credits: caps.Credits}
+	}
 	if !caps.Holds() {
 		return nil
 	}
@@ -646,6 +685,52 @@ func restLast(out []candidate, pl planned) ([]candidate, planned) {
 	return append(ready, resting...), pl
 }
 
+// probeOne keeps, of the candidates resting after a failure, only the one
+// back soonest (the first in order on a tie), at its place; the ready ones
+// all stay (#1799). Before, every request asked each resting member in
+// turn once those ahead of it failed, so a member that was down was asked
+// by every request its rest was meant to spare it from, and in an outage
+// of the whole group each request went to all of them. Now a request asks
+// at most one resting member: the one whose rest is nearest its end,
+// whose answer tells whether it is back, as AxonHub's error-aware
+// balancing lets a failed channel's penalty decay rather than send it
+// every request. A lone candidate is always kept, so a request still gets
+// a real answer, and nothing about the request's own content or model
+// rests a member (only the model, by restID), so it isn't left out over
+// those. The trace keeps every member, the resting ones with their rest.
+func probeOne(cs []candidate) []candidate {
+	if len(cs) < 2 {
+		return cs
+	}
+	soonest := -1
+	var until time.Time
+	rests := 0
+	rest := make([]bool, len(cs))
+	for i, c := range cs {
+		r, ok := restOf(c.restKey())
+		if !ok && c.restID() != c.restKey() {
+			r, ok = restOf(c.restID())
+		}
+		if !ok {
+			continue
+		}
+		rests, rest[i] = rests+1, true
+		if soonest < 0 || r.Until.Before(until) {
+			soonest, until = i, r.Until
+		}
+	}
+	if rests < 2 {
+		return cs
+	}
+	out := make([]candidate, 0, len(cs)-rests+1)
+	for i, c := range cs {
+		if i == soonest || !rest[i] {
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
 // restingOf is why c rests, by its own key or else its provider's, while
 // it does. A key resting out of its own windows has them read again as it
 // is planned, behind the request and once a minute at most: an ordered
@@ -660,6 +745,51 @@ func restingOf(c candidate) (Rest, bool) {
 		keyAllowance(c.p)
 	}
 	return r, ok
+}
+
+// quotaHeld is, when every candidate of cs is a key resting out of its
+// allowance or its credit — refused with a 429 or a 402 for it, the
+// vendor's words kept — the rest of the first, and when the first of them
+// is back: asked before then, each would be refused the same (#1772). A
+// subscription account isn't held so: its resets may be spent for it
+// (autoReset), and its windows are read again as it is planned.
+func quotaHeld(cs []candidate) (Rest, time.Time, bool) {
+	var first Rest
+	var back time.Time
+	for i, c := range cs {
+		r, ok := restingOf(c)
+		if !ok || c.p.Account != nil || r.Why != failQuota && r.Why != failCredit || !quotaStatus(r.Status) || r.said == "" {
+			return Rest{}, time.Time{}, false
+		}
+		if i == 0 {
+			first = r
+		}
+		if back.IsZero() || r.Until.Before(back) {
+			back = r.Until
+		}
+	}
+	return first, back, len(cs) > 0
+}
+
+// quotaStatus is a status a vendor says a key is out of its allowance with.
+func quotaStatus(status int) bool {
+	return status == http.StatusTooManyRequests || status == http.StatusPaymentRequired
+}
+
+// soonestBack is when the first of cs is back from its rest; false when
+// one of them isn't resting.
+func soonestBack(cs []candidate) (time.Time, bool) {
+	var back time.Time
+	for _, c := range cs {
+		r, ok := restingOf(c)
+		if !ok {
+			return time.Time{}, false
+		}
+		if back.IsZero() || r.Until.Before(back) {
+			back = r.Until
+		}
+	}
+	return back, !back.IsZero()
 }
 
 // spentAfter says whether every candidate in cs rests with its allowance
@@ -788,6 +918,23 @@ func shapeRefused(status int, body []byte) bool {
 		!quotaWords.Match(body) && !unservedWords.Match(body) && !refusedWords.Match(body)
 }
 
+// regionWords are how a vendor says it doesn't serve where the request
+// comes from: Google's 400 FAILED_PRECONDITION "User location is not
+// supported for the API use." (Gemini, Antigravity, Code Assist; #1621),
+// and OpenAI's "unsupported_country_region_territory", which a relay may
+// pass on as a 400. It is about the address the request leaves from, not
+// the request or the model: another member, going another way, may
+// answer, and this one rests only as briefly as any other failure does.
+// A request's own field named location ("location field is not
+// supported") isn't one.
+var regionWords = regexp.MustCompile(`(?i)\buser location is not supported for the api use\b|unsupported_country_region_territory|country, region,? or territory not supported`)
+
+// regionRefused says the vendor refused the request for where it came
+// from, with regionWords.
+func regionRefused(status int, body []byte) bool {
+	return status >= 400 && regionWords.Match(body)
+}
+
 // protectionWords are how the ChatGPT backend answers a long Codex
 // conversation it won't take as it is: 502 "response protection is
 // unavailable" (vs on Discord, 0.1.1108). It comes back the same for the
@@ -835,7 +982,7 @@ func retryable(status int, body []byte) bool {
 		// in front of zcode.z.ai): another provider goes another way
 		return true
 	case status == 400, status == 422:
-		return quotaWords.Match(body) || unservedWords.Match(body) || refusedWords.Match(body) || shapeWords.Match(body)
+		return quotaWords.Match(body) || unservedWords.Match(body) || refusedWords.Match(body) || shapeWords.Match(body) || regionWords.Match(body)
 	}
 	return false
 }
@@ -863,7 +1010,8 @@ const unsaidMargin = 1.2
 // another account of the model, it fails the same, and the agent, told it
 // as a vendor's error, never compacts. The message it is told instead
 // says the prompt is too long. Not for a rate limit, an account's
-// trouble, a model it doesn't serve, or one already saying it overflowed.
+// trouble, a model it doesn't serve, a region it doesn't serve, or one
+// already saying it overflowed.
 func tooLongUnsaid(p provider.Provider, model string, tokens, status int, body []byte) (string, bool) {
 	switch status {
 	case 400, 413, 422, 500, 502, 503, 504:
@@ -871,7 +1019,7 @@ func tooLongUnsaid(p provider.Provider, model string, tokens, status int, body [
 		return "", false
 	}
 	if overflowed(status, body) || failure(status, body) != failOther || quotaWords.Match(body) ||
-		unservedWords.Match(body) || refusedWords.Match(body) || provider.EdgeBlocked(body) {
+		unservedWords.Match(body) || refusedWords.Match(body) || provider.EdgeBlocked(body) || regionRefused(status, body) {
 		return "", false
 	}
 	window := windowOf(p, model)
@@ -936,7 +1084,7 @@ func passing(status int, header http.Header, body []byte, again int) (time.Durat
 	case status == 429:
 		// a relay's 429 often says nothing of when (#503: "负载已饱和，请稍
 		// 后再试"); a plan used up or no money left won't clear in seconds
-		return wait, again < rateRetries && failure(status, body) == failRate && !creditWords.Match(body)
+		return wait, again < rateRetries && failure(status, body) == failRate && !creditWords.Match(wordsOf(body))
 	}
 	return 0, false
 }
@@ -1929,6 +2077,38 @@ func refusedNote(reason string) string {
 	return "safety filter: " + reason
 }
 
+// refusedDetail is a refusal's note with what Anthropic's classifier said
+// of it in stop_details, when it said anything (#1768: which of cyber,
+// bio, frontier_llm… it was, for a user to tell one refusal from
+// another): its category as given, unknown ones too, and its
+// explanation, the vendor's own words, kept to a line. None is made up
+// when it gave none.
+func refusedDetail(reason string, details json.RawMessage) string {
+	var d struct {
+		Category    *string `json:"category"`
+		Explanation *string `json:"explanation"`
+	}
+	note := refusedNote(reason)
+	if len(details) == 0 || json.Unmarshal(details, &d) != nil {
+		return note
+	}
+	var said []string
+	if d.Category != nil && strings.TrimSpace(*d.Category) != "" {
+		said = append(said, "category "+strings.TrimSpace(*d.Category))
+	}
+	if d.Explanation != nil && strings.TrimSpace(*d.Explanation) != "" {
+		e := strings.Join(strings.Fields(*d.Explanation), " ")
+		if r := []rune(e); len(r) > 200 {
+			e = string(r[:200]) + "…"
+		}
+		said = append(said, e)
+	}
+	if len(said) == 0 {
+		return note
+	}
+	return note + " (" + strings.Join(said, ": ") + ")"
+}
+
 // streamPart is what one event of a reply carries of its content, in any
 // protocol, to tell a reply begun from its empty frame (#248).
 type streamPart struct {
@@ -2102,10 +2282,11 @@ func streamEvent(ev []byte) (kind, status int, msg string) {
 		return eventLead, 0, ""
 	case typ == "message_delta":
 		var d struct {
-			StopReason string `json:"stop_reason"`
+			StopReason  string          `json:"stop_reason"`
+			StopDetails json.RawMessage `json:"stop_details"`
 		}
 		if json.Unmarshal(v.Delta, &d) == nil && d.StopReason == "refusal" {
-			return refusal(d.StopReason)
+			return eventRefusal, refusedStatus, refusedDetail(d.StopReason, d.StopDetails)
 		}
 	case typ == "response.incomplete" || typ == "response.completed" && v.Response.Status == "incomplete":
 		if d := v.Response.IncompleteDetails; d != nil {
@@ -2336,8 +2517,9 @@ func refusedCode(data string) string {
 func refusedReply(b []byte) (string, bool) {
 	var v struct {
 		// Anthropic's
-		StopReason string       `json:"stop_reason"`
-		Content    []streamPart `json:"content"`
+		StopReason  string          `json:"stop_reason"`
+		StopDetails json.RawMessage `json:"stop_details"`
+		Content     []streamPart    `json:"content"`
 		// Chat's
 		Choices []struct {
 			FinishReason string `json:"finish_reason"`
@@ -2370,7 +2552,7 @@ func refusedReply(b []byte) (string, bool) {
 		return !slices.ContainsFunc(ps, streamPart.said)
 	}
 	if r, ok := filterReasons[v.StopReason]; ok && r == "refusal" && none(v.Content) {
-		return refusedNote(r), true
+		return refusedDetail(r, v.StopDetails), true
 	}
 	for _, c := range v.Choices {
 		if r, ok := filterReasons[c.FinishReason]; ok && (c.Message.Content == nil || c.Message.Content == "") && len(c.Message.ToolCalls) == 0 {
