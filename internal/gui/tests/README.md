@@ -1,5 +1,11 @@
 # Dropdown browser regression
 
+`settings-proxy-auth.test.cjs` checks optional SOCKS5/SOCKS5h usernames and
+passwords in Settings, using the real page with isolated API fixtures. It
+covers saving and reloading, escaped and non-UTF-8 credentials, masked
+addresses/status, clearing authentication, Tab and Escape, mode switches,
+HTTP compatibility, and narrow windows in English and Chinese on Chromium
+and WebKit.
 ## Installed desktop fonts
 
 `fonts.test.cjs` exercises the interface/code font controls with installed
@@ -187,6 +193,15 @@ shared helper; a control under what it unrolls (`data-unrolls`) going down
 with it; a click that asks to go somewhere with `scrollOnPurpose(e)`;
 the room kept at the foot going as the reader scrolls back; and the wheel.
 
+`sidebar-tab-top.test.cjs` checks that a tab picked in the sidebar opens at
+its top: Settings › General scrolled to its foot and Allowances picked,
+Library › MCP servers scrolled to its foot and Skills picked, and back. The
+tab already open, picked again, leaves the page where it is, and another
+page and back finds each where it was left. The page's own strip (the
+sidebar turned off, and a window narrower than `SIDE_AT`) is unchanged: a
+tab clicked there leaves the Library where it was. Chromium and WebKit, in
+every language.
+
 `routing-days-fit.test.cjs` checks Routing › Requests' day bar with the 30
 days the gateway keeps (#961): at 1100px, 733px (1100 at 150% text size) and
 440px no pill is cut off at its edge and the days that don't fit are under its
@@ -194,6 +209,15 @@ last pill, whose menu lists each with its count; the oldest picked from it is
 asked for and names the pill, with the bar held where it was; three days need
 no such pill; a window narrowed then widened fits again. Chromium and WebKit,
 in English, Chinese, Japanese and German.
+
+`dates-gui-lang.test.cjs` checks that dates and times read in the GUI's
+language, not the system's (#1843): English on a zh-CN browser, English on
+en-GB (the system's own English kept), and Chinese, Traditional Chinese,
+Japanese and German on en-US. Routing's day pills, those in the bar and those
+under its last pill's menu, and a request's time must match `intlLang()`'s
+tag and not the browser's. Chromium and WebKit, at 1100px and 390px.
+`TestDatesFollowGUILanguage` (Go, run in CI) fails on any formatting call in
+the assets given no locale, `[]` or `undefined`.
 
 `agent-disconnect-preview.test.cjs` checks the disconnect confirmation's
 file previews fill the body instead of the editor's label column. omp and
@@ -973,6 +997,21 @@ recorded tokens under no model name (tony on Discord: the cost's note read
 and its models name it "a model with no name", with no blank where a name
 goes; in Chromium and WebKit, English and Chinese.
 
+`usage-unpriced-sum.test.cjs` checks that Usage's sum says how many calls it
+couldn't price (#1856): Overview's and Requests' heads read "2 calls
+unpriced" beside the sum, or alone when none was priced, Overview's calls
+tile counts them, and Sessions says how many models. From 360 to 1240 wide
+the count and the sum stay whole and the page never scrolls sideways; in
+Chromium and WebKit, in every language. `MAGPIE_ASSETS` pointed at older
+assets shows it failing.
+
+`usage-loops.test.cjs` checks that Usage says, per model, how many of its
+replies magpie ended stuck in a loop (#1858): "2 looped" beside the model's
+failures in the Overview's row and the Requests ranking, the ranking's
+"Other" adding up those it holds, and nothing for a model with none. At 360
+and 1100 wide the page never scrolls sideways; in Chromium and WebKit, in
+every language. `MAGPIE_ASSETS` pointed at older assets shows it failing.
+
 `usage-keys-fold.test.cjs` checks the Usage page's card of a provider with
 many keys, each its balance (361 on Discord: an OpenRouter card listed every
 key's): the first three are in sight, the rest behind "Show N more keys" at
@@ -1018,6 +1057,24 @@ the error that ended it, and says in its details that the file records no
 status; its models are the one asked for, the one sent as asked and the one that answered, its effort is there, and its time is about (≈) what the file's stamps tell. A click opens and closes a row without moving the page, Enter and Space
 do the same, text selected in the details is not a click, and the rows stay open
 when the list is asked for again; in English and Chinese.
+
+`ledger-cache-tokens.test.cjs` (#1839) opens a request's details and finds its
+tokens there at every width: in, out, cache read and cache creation, 0 said as
+0 for a prompt that missed the cache, with what was written for an hour; a
+failure that spent nothing has no tokens row. No click moves the page and
+nothing spills out of the details; in Chromium and WebKit at 1100 and 390 wide,
+in every language.
+
+`own-requests.test.cjs` (#1839) tells magpie's own requests from the agents':
+magpie's row among the agents and its ledger row carry the "magpie's own" mark,
+the agent's don't; the account's and the model's rows say how many calls magpie
+made itself, the other account's nothing; and the account's card says how many
+of the period's requests were magpie's own, also when the summary comes after
+the allowances. On the Routing page a classifier on a subscription's model says
+every turn starts with a request to it, a group asking a subscription first
+while picking the effort too says two, and one on a key says nothing. No click
+moves the page and nothing is wider than the window; in Chromium and WebKit at
+1100 and 390 wide, in every language.
 
 `usage-ledger-chart.test.cjs` opens the Requests tab on what its requests add
 up to: a strip of four totals (tokens, requests, cost, the cache hit rate),

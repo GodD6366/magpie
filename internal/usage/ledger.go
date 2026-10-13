@@ -64,8 +64,8 @@ type Filter struct {
 	// Computer narrows to the calls of one computer (#542): ThisComputer,
 	// OtherComputers, or another's id; "" is every computer's
 	Computer string
-	// Through narrows to one of the two sources a row can be of
-	// (SourceGateway, SourceSession); "" keeps both. It is what the requests
+	// Through narrows to one of the sources a row can be of
+	// (SourceGateway, SourceSession, SourceReported); "" keeps all. It is what the requests
 	// page's source cells filter by, and, as with the other dimensions, the
 	// cells themselves are counted with it cleared so all three stay
 	// switchable. Not Record.Via, which is the computer that forwarded the
@@ -74,13 +74,17 @@ type Filter struct {
 }
 
 // SourceGateway and SourceSession are the two sources a request row is of,
-// which Row.Source spells "log" and "": the calls magpie's own gateway
+// which Row.Source spells "" and "log": the calls magpie's own gateway
 // served, and the ones read from the agents' own session files, which it
 // never saw. They are the requests page's source cells, and the values its
 // via= takes.
 const (
 	SourceGateway = "through"
 	SourceSession = "direct"
+	// SourceReported is the third: the calls a client reported through
+	// POST /v1/magpie/usage/requests (#1874), which went straight to their
+	// vendor. Record.Source and Row.Source spell it the same, as does via=.
+	SourceReported = "reported"
 )
 
 // SourceOf is the source a row is of, as the page's cells name them: the
@@ -92,8 +96,11 @@ func SourceOf(r Row) string {
 	if r.IsRejected() {
 		return ""
 	}
-	if r.Source == "log" {
+	switch r.Source {
+	case "log":
 		return SourceSession
+	case SourceReported:
+		return SourceReported
 	}
 	return SourceGateway
 }
@@ -376,11 +383,8 @@ func ledgerMatched(since, until time.Time, f Filter, recs []Record, logs []sessi
 		if r.Provider != "" && !slices.Contains(providers, r.Provider) {
 			providers = append(providers, r.Provider)
 		}
-		if !f.keeps(r) {
+		if !f.keepsRow(Row{Record: r, Source: source}) {
 			return
-		}
-		if !r.IsRejected() {
-			sum.add(r, pr)
 		}
 		sent := r.Model
 		if source == "" {
@@ -391,6 +395,9 @@ func ledgerMatched(since, until time.Time, f Filter, recs []Record, logs []sessi
 			row.Cost, row.Priced = r.CostAt(*pr), true
 		}
 		row.Agent = AgentOf(r.Agent)
+		if !r.IsRejected() {
+			sum.addFrom(row, pr)
+		}
 		rows = append(rows, row)
 	}
 	for i := len(recs) - 1; i >= 0; i-- {
@@ -401,7 +408,7 @@ func ledgerMatched(since, until time.Time, f Filter, recs []Record, logs []sessi
 		if id, ok := renamed[r.Provider]; ok {
 			r.Provider = id
 		}
-		add(r, priceOf(r), "")
+		add(r, priceOf(r), r.Source)
 	}
 	for i, c := range logs {
 		if (!since.IsZero() && c.Time.Before(since)) || after(until, c.Time) || matched[i] {
@@ -432,6 +439,11 @@ func ledgerMatched(since, until time.Time, f Filter, recs []Record, logs []sessi
 	return rows, sum, agents, providers
 }
 
+// ownPrice is what pricer answers for a reported call that said what it
+// cost: a price, so the call counts as priced, which Record.CostAt passes
+// over for the call's own cost.
+var ownPrice catalog.Price
+
 // pricer uses the same effective price as the model CLI and session totals:
 // explicit provider/model or provider-wide prices (including zero), then the
 // provider catalog, then the maker catalog. Settings are read once per query.
@@ -446,6 +458,9 @@ func pricer() func(Record) *catalog.Price {
 	prices := map[[3]string]*catalog.Price{}
 	s := settings.Load()
 	return func(r Record) *catalog.Price {
+		if r.OwnCost != nil {
+			return &ownPrice // CostAt answers its own cost (#1874)
+		}
 		served := strings.TrimSpace(r.Served)
 		if served == r.Model {
 			served = ""
@@ -654,6 +669,36 @@ func (t *Totals) addRow(r Row) {
 // app.js's LED_FLOOR_AGENTS has the same.
 var FloorAgents = map[string]bool{"claude": true, "claude-desktop": true, "codex": true}
 
+// A Codex turn of one call read from its session file is timed by the
+// turn's time_to_first_token_ms and its end, and that window can be one
+// network push, not the writing: Fallmonkey on Discord had a reply whose
+// first token came at 6.8 s, the model working, and the rest 0.2 s later
+// in one go, read as thousands of tok/s. Such a row's window after the first
+// token tells a speed only when it is CodexWindowMs or more and its tokens
+// (its answer, for one that reasoned) CodexBodyTokens or more; else it tells
+// the least it wrote at over the whole turn (Row.Floor). app.js's ledDecode
+// and ledFloor_ have the same.
+const (
+	CodexWindowMs   = 1000
+	CodexBodyTokens = 100
+)
+
+// codexTurn is whether r is a Codex turn of one call read from its session
+// file, the turn's first token known.
+func (r Row) codexTurn() bool {
+	return r.Source == "log" && r.Agent == "codex" && r.TTFT > 0
+}
+
+// Decode is the row's DecodeOf, a Codex turn of one call from its session
+// file held to CodexWindowMs and CodexBodyTokens.
+func (r Row) Decode() (tokens int, w int64) {
+	n, w := r.Record.Decode()
+	if w > 0 && r.codexTurn() && (w < CodexWindowMs || n < CodexBodyTokens) {
+		return 0, 0
+	}
+	return n, w
+}
+
 // Floor is the tokens and ms a row read from a session file tells the least
 // its reply wrote at by, when its speed wasn't measured. 0, 0 when it tells
 // none. app.js's ledFloorSpeed is the same rule for one row.
@@ -674,7 +719,17 @@ var FloorAgents = map[string]bool{"claude": true, "claude-desktop": true, "codex
 // its time. Its output over that time, as Fallmonkey asked, would count the
 // reasoning written before the first token too and read high: a gateway
 // reply of 496 tokens, 224 of them reasoning, 827 ms after a 10.2 s first
-// token, reads 600 tok/s so, its measured answer 415, and this 329.
+// token, reads 600 tok/s so, its measured answer 415, and this 329. That
+// window is held to what a measured one is (CodexWindowMs, CodexBodyTokens):
+// 827 ms can be one push as well.
+//
+// A Codex turn of one call that tells neither, its window after the first
+// token too short or its body too small, tells its output over the whole
+// turn, the wait for the first token in it, by the same rule as any other
+// such floor: 1,000 tokens or more over a second or more. It is the same
+// formula, so it has the same gate: under 1,000 tokens the wait is too much
+// of the time to tell anything (Fallmonkey on Discord: 11 tokens in 2.75 s
+// read ≥4 tok/s while an 815-token Claude Code reply told nothing).
 func (r Row) Floor() (tokens int, ms int64) {
 	if r.Source != "log" || !FloorAgents[r.Agent] || r.Failed() {
 		return 0, 0
@@ -682,15 +737,12 @@ func (r Row) Floor() (tokens int, ms int64) {
 	if _, w := r.Decode(); w > 0 {
 		return 0, 0
 	}
-	if r.Agent == "codex" && r.TTFT > 0 {
-		if r.Reasoning <= 0 {
-			return 0, 0
+	if r.codexTurn() {
+		if n := r.Output - r.Reasoning; r.Reasoning > 0 && n >= CodexBodyTokens {
+			if w := DecodeWindow(n, r.Millis, r.TTFT); w >= CodexWindowMs {
+				return n, w
+			}
 		}
-		n := r.Output - r.Reasoning
-		if w := DecodeWindow(n, r.Millis, r.TTFT); w > 0 {
-			return n, w
-		}
-		return 0, 0
 	}
 	if r.Output < 1000 || r.Millis < 1000 || int64(r.Output)*1000 > MaxDecodeSpeed*r.Millis {
 		return 0, 0

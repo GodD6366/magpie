@@ -16,7 +16,6 @@ import (
 	"io"
 	"net/http"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"regexp"
 	"runtime"
@@ -80,6 +79,9 @@ type cliSpec struct {
 	// latest is the newest version its own updater would install, for one
 	// not published on npm
 	latest func() string
+	// only are the systems (GOOS) its vendor builds it for, when not all:
+	// on any other its package installs nothing that runs
+	only []string
 }
 
 var cliSpecs = map[string]cliSpec{
@@ -103,6 +105,19 @@ var cliSpecs = map[string]cliSpec{
 			return nil
 		}},
 	"gemini": {npm: []string{"@google/gemini-cli"}, brew: []string{"gemini-cli"}},
+	// DevEco Code: npm's @deveco/deveco-code, or its own installer's
+	// ~/.local/bin/deveco → ~/.local/share/deveco/versions/<v>/deveco
+	// (install), deveco.exe in ~\.local\bin on Windows (install.ps1),
+	// both of which deveco upgrade replaces
+	// Its npm package carries macOS and Windows binaries only (and
+	// OpenHarmony's), none for Linux.
+	"deveco": {npm: []string{"@deveco/deveco-code"}, only: []string{"darwin", "windows"},
+		self: func(bin, real string) []string {
+			if strings.Contains(real, "/.local/share/deveco/versions/") || strings.HasSuffix(strings.ToLower(real), "/.local/bin/deveco.exe") {
+				return []string{bin, "upgrade"}
+			}
+			return nil
+		}},
 	"opencode": {npm: []string{"opencode-ai"}, brew: []string{"opencode"},
 		self: func(bin, real string) []string {
 			if strings.Contains(real, "/.opencode/bin/") {
@@ -206,7 +221,7 @@ func howInstalled(spec cliSpec, bin string) *updater {
 		prefix := slash[:strings.Index(slash, m[0])]
 		brew := filepath.FromSlash(prefix + "/bin/brew")
 		if !isFile(brew) {
-			if brew, err = exec.LookPath("brew"); err != nil {
+			if brew, err = proc.Look("brew"); err != nil {
 				return nil
 			}
 		}
@@ -242,13 +257,13 @@ func fromNodeModules(pkg, bin, real string) *updater {
 		bun := filepath.Join(filepath.Dir(bin), exe("bun"))
 		if !isFile(bun) {
 			var err error
-			if bun, err = exec.LookPath("bun"); err != nil {
+			if bun, err = proc.Look("bun"); err != nil {
 				return nil
 			}
 		}
 		return &updater{via: "bun", pkg: pkg, cmd: []string{bun, "add", "-g", pkg + "@latest"}}
 	case strings.Contains(lower, "/pnpm/") || strings.Contains(lower, "/.pnpm/"):
-		pnpm, err := exec.LookPath("pnpm")
+		pnpm, err := proc.Look("pnpm")
 		if err != nil {
 			return nil
 		}
@@ -284,7 +299,7 @@ func fromNodeModules(pkg, bin, real string) *updater {
 		u.path = filepath.Dir(npm) // its own node, not another on PATH
 	} else {
 		var err error
-		if npm, err = exec.LookPath("npm"); err != nil {
+		if npm, err = proc.Look("npm"); err != nil {
 			return nil
 		}
 	}

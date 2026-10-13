@@ -232,6 +232,10 @@ func (p Provider) TestModels(ctx context.Context, models []string) []Result {
 }
 
 func (p Provider) testOne(ctx context.Context, model string) Result {
+	if pat, off := ModelDisabled(p.ID, model); off {
+		// the user disabled it (#1867): not even a test reaches it
+		return Result{Model: model, Error: fmt.Sprintf("model %s/%s is disabled in magpie (it matches %q in Settings › Models › Disabled models)", p.ID, model, pat)}
+	}
 	if p.DecidesModel(model) && p.AsksDecideModels() {
 		// a decision model is sent the smallest System One question, a
 		// yes-or-no (ARNO on Discord: a System One model typed in by hand
@@ -310,7 +314,7 @@ func (p Provider) testOne(ctx context.Context, model string) Result {
 		// by is not one magpie sends them as
 		url, body := tinyDrawing(q, model)
 		r := probe(ctx, q, proto, url, []byte(body), model, drawWait)
-		if !r.OK && (r.Status == 404 || r.Status == 405) {
+		if !r.OK && (r.Status == 404 || r.Status == 405 || r.Status == 400 && catalog.PointsToChat(r.Error)) {
 			url, body := tiny(q, proto, model)
 			if c := probe(ctx, q, proto, url, q.tested(body), model, testWait); c.OK {
 				return c
@@ -322,7 +326,18 @@ func (p Provider) testOne(ctx context.Context, model string) Result {
 	if client != "" {
 		body = asClient(client, proto, body)
 	}
-	return probe(ctx, q, proto, url, q.tested(body), model, testWait)
+	r := probe(ctx, q, proto, url, q.tested(body), model, testWait)
+	if !r.OK && client == "" && proto == Chat && r.Status == 400 && catalog.DrawsID(model) && catalog.PointsToImagesAPI(r.Error) {
+		// an image model its name doesn't place on the images API
+		// (agnes-image-2.5-flash, #1837), which the vendor turns away in
+		// chat naming that API: the gateway draws with it there, so it is
+		// tested there
+		url, body := tinyDrawing(q, model)
+		if d := probe(ctx, q, proto, url, []byte(body), model, drawWait); d.OK {
+			return d
+		}
+	}
+	return r
 }
 
 // keyFor is p using the first key on that works with proto: one made for
@@ -348,6 +363,7 @@ func (p Provider) keyFor(proto Protocol) (Provider, bool) {
 // draws on an images API.
 func (p Provider) testModel(q Provider, proto Protocol) string {
 	k := q.first()
+	off := disabledNow() // a model the user disabled is never asked (#1867)
 	var pools [][]catalog.Model
 	if ms := p.Exposed(); len(ms) > 0 {
 		pools = append(pools, ms)
@@ -367,7 +383,7 @@ func (p Provider) testModel(q Provider, proto Protocol) string {
 	} {
 		for _, pool := range pools {
 			for _, m := range pool {
-				if !p.DecidesModel(m.ID) && want(m.ID) && (k.Key == "" || p.Serves(k, m.ID)) {
+				if !p.DecidesModel(m.ID) && !off(p.ID, m.ID) && want(m.ID) && (k.Key == "" || p.Serves(k, m.ID)) {
 					return m.ID
 				}
 			}

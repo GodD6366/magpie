@@ -8,6 +8,7 @@
 package provider
 
 import (
+	"bytes"
 	"cmp"
 	"encoding/json"
 	"errors"
@@ -124,7 +125,7 @@ type Provider struct {
 	// Affinity is how long a conversation stays with the key or account
 	// that answered it, so the vendor's prompt cache it filled is read
 	// again rather than lost (see Affinities): "" auto, "session",
-	// "turn", "off".
+	// "turn", "off", "strict".
 	Affinity string `json:"affinity,omitempty"`
 
 	// KeepLogin, on Codex's or Claude Code's subscription, keeps the agent
@@ -205,6 +206,16 @@ type Provider struct {
 	// OpenAI-only fields left out) fails. Off, the default, keeps that
 	// fitting, which a backend that isn't OpenAI's needs (#350).
 	CodexAsSent bool `json:"codexAsSent,omitempty"`
+
+	// PassUserAgent has a request go to the vendor with the User-Agent the
+	// agent that sent it gave (pi, opencode, Claude Code…), in place of
+	// magpie's own (#1851): a coding plan that serves only agents it names
+	// knows them by it. One the agent didn't give, or magpie's own
+	// requests, go as magpie. Off, the default, every request goes as
+	// magpie. Only a key+URL provider takes it: a signed-in account, a
+	// plugin's and one that goes as a client of its vendor's own keep the
+	// identity their signing gives (see PassesUserAgent).
+	PassUserAgent bool `json:"passUserAgent,omitempty"`
 
 	// PinUpstream, on the Cline API, has its DeepSeek models answered only
 	// by DeepSeek's own API (White Immortal on Discord): Cline routes a
@@ -292,8 +303,14 @@ type Provider struct {
 	ModelsURL string `json:"modelsURL,omitempty"`
 
 	// Models the user chose to expose. Empty means "the preset's picks, or
-	// everything the vendor lists when that list is short".
+	// everything the vendor lists when that list is short" — unless NoModels.
 	Models []string `json:"models,omitempty"`
+	// NoModels is the user's Select none (#1818): with no Models picked,
+	// none of its models are served — not to agents, not to any routing
+	// group, not by a "provider/model" id — while its balance and usage
+	// are still read and shown. Without it, no picks is the vendor's list
+	// as ever, so a file saved before it reads as it did. A pick clears it.
+	NoModels bool `json:"noModels,omitempty"`
 	// PickedFrom are the models the vendor listed when Models were saved: one
 	// listed since is served beside picks that held every one listed then
 	// (withNewlyListed), and one listed then and left unpicked stays out.
@@ -397,6 +414,10 @@ func read() (file, error) {
 	if err != nil {
 		return f, &unreadableError{Path(), err}
 	}
+	// An editor that saves with a byte-order mark leaves JSON that Go's
+	// decoder refuses; read as broken, the file fell back to its .bak, an
+	// older generation without what was saved since (#1821).
+	b = bytes.TrimPrefix(b, utf8BOM)
 	if err := json.Unmarshal(b, &f); err != nil {
 		// one left all zero by a crash (#1505) is its last good generation
 		bak, ferr := lastgood.Fallback(Path(), b, validProviders)
@@ -414,8 +435,10 @@ func read() (file, error) {
 // validProviders is providers.json's contents read as the catalog.
 func validProviders(b []byte) bool {
 	var f file
-	return json.Unmarshal(b, &f) == nil
+	return json.Unmarshal(bytes.TrimPrefix(b, utf8BOM), &f) == nil
 }
+
+var utf8BOM = []byte("\xef\xbb\xbf")
 
 // FileError is why providers.json can't be read, nil when it can or isn't
 // there: for what lists the providers to say so, not "none yet".
@@ -536,16 +559,7 @@ func allProviders() []Provider {
 		if _, taken := find(out, a.ID); taken || picks[a.ID].Hidden {
 			continue
 		}
-		pk := picks[a.ID]
-		a.PickedFrom = pk.PickedFrom
-		a.Models, a.Unlisted, a.Off, a.Fallback, a.Routing, a.Affinity, a.KeepLogin, a.KeepLoginAs, a.Contexts, a.Family = pk.Models, pk.Unlisted, pk.Off, pk.Fallback, pk.Routing, pk.Affinity, pk.KeepLogin, pk.KeepLoginAs, pk.Contexts, pk.Family
-		a.Sink = pk.Sink
-		a.Proxy, a.AccountProxies, a.AccountModels = pk.Proxy, pk.AccountProxies, pk.AccountModels
-		a.AccountCaps, a.AccountWindowCaps = pk.AccountCaps, pk.AccountWindowCaps
-		a.AccountNames = pk.AccountNames
-		a.MaxConcurrency, a.PinUpstream = pk.MaxConcurrency, pk.PinUpstream
-		a.AccountConcurrency, a.QueueLimit, a.QueueWait = pk.AccountConcurrency, pk.QueueLimit, pk.QueueWait
-		a.MaxRPM = pk.MaxRPM
+		a = withPicks(a, picks[a.ID])
 		if a.ID == "cursor" { // picked before its efforts were one model
 			a.Models = cursorPicks(a.Models)
 		}
@@ -555,6 +569,25 @@ func allProviders() []Provider {
 		out = append(out, a)
 	}
 	return ordered(out, f.Order)
+}
+
+// withPicks is the signed-in account a with what the user set on its
+// provider (pk, as providers.json keeps it): its models, routing, limits
+// and queue. The account the agent is signed in to gets them in All, and
+// each other account in use beside it in AlsoOn, so that every account of
+// the provider keeps the same settings (#1899: a second WorkBuddy AI
+// account queued 62s with the wait set to 1s).
+func withPicks(a, pk Provider) Provider {
+	a.PickedFrom = pk.PickedFrom
+	a.Models, a.Unlisted, a.Off, a.Fallback, a.Routing, a.Affinity, a.KeepLogin, a.KeepLoginAs, a.Contexts, a.Family = pk.Models, pk.Unlisted, pk.Off, pk.Fallback, pk.Routing, pk.Affinity, pk.KeepLogin, pk.KeepLoginAs, pk.Contexts, pk.Family
+	a.Sink, a.NoModels = pk.Sink, pk.NoModels
+	a.Proxy, a.AccountProxies, a.AccountModels = pk.Proxy, pk.AccountProxies, pk.AccountModels
+	a.AccountCaps, a.AccountWindowCaps = pk.AccountCaps, pk.AccountWindowCaps
+	a.AccountNames = pk.AccountNames
+	a.MaxConcurrency, a.PinUpstream = pk.MaxConcurrency, pk.PinUpstream
+	a.AccountConcurrency, a.QueueLimit, a.QueueWait = pk.AccountConcurrency, pk.QueueLimit, pk.QueueWait
+	a.MaxRPM = pk.MaxRPM
+	return a
 }
 
 // Hidden lists the signed-in accounts the user removed from magpie.
@@ -668,7 +701,7 @@ func Save(p Provider) error {
 		if p.ID == "kiro" {
 			key = p.Key
 		}
-		p = Provider{ID: p.ID, Key: key, Models: p.Models, PickedFrom: p.PickedFrom, Unlisted: p.Unlisted, Off: p.Off, Fallback: p.Fallback, Routing: p.Routing, Sink: p.Sink, Affinity: p.Affinity, KeepLogin: p.KeepLogin, KeepLoginAs: p.KeepLoginAs, Contexts: p.Contexts, Family: p.Family, Proxy: p.Proxy, AccountProxies: p.AccountProxies, AccountModels: p.AccountModels, AccountCaps: p.AccountCaps, AccountWindowCaps: p.AccountWindowCaps, AccountNames: p.AccountNames, MaxConcurrency: p.MaxConcurrency, AccountConcurrency: p.AccountConcurrency, QueueLimit: p.QueueLimit, QueueWait: p.QueueWait, MaxRPM: p.MaxRPM, QuotaRest: p.QuotaRest, PinUpstream: p.PinUpstream, Hidden: hiddenAccount(p.ID), Quiet: quietAccount(p.ID), Tucked: tuckedAccount(p.ID)}
+		p = Provider{ID: p.ID, Key: key, Models: p.Models, NoModels: p.NoModels, PickedFrom: p.PickedFrom, Unlisted: p.Unlisted, Off: p.Off, Fallback: p.Fallback, Routing: p.Routing, Sink: p.Sink, Affinity: p.Affinity, KeepLogin: p.KeepLogin, KeepLoginAs: p.KeepLoginAs, Contexts: p.Contexts, Family: p.Family, Proxy: p.Proxy, AccountProxies: p.AccountProxies, AccountModels: p.AccountModels, AccountCaps: p.AccountCaps, AccountWindowCaps: p.AccountWindowCaps, AccountNames: p.AccountNames, MaxConcurrency: p.MaxConcurrency, AccountConcurrency: p.AccountConcurrency, QueueLimit: p.QueueLimit, QueueWait: p.QueueWait, MaxRPM: p.MaxRPM, QuotaRest: p.QuotaRest, PinUpstream: p.PinUpstream, Hidden: hiddenAccount(p.ID), Quiet: quietAccount(p.ID), Tucked: tuckedAccount(p.ID)}
 	} else {
 		p.AccountProxies = keyProxies(p) // a provider of keys proxies each key apart
 		if subscriptionID(p.ID) && !stored(p.ID) {
@@ -802,7 +835,9 @@ func AddCopy(p Provider, from string) (string, error) {
 	if p.BalanceToken == "" {
 		p.BalanceToken = src.BalanceToken
 	}
-	if p.AccessKeyID == "" && p.SecretAccessKey == "" {
+	// the access key as the copy's editor showed it: the form sends its ID
+	// but never the saved Secret, which went missing from the copy (#1821)
+	if p.SecretAccessKey == "" && (p.AccessKeyID == "" || p.AccessKeyID == src.AccessKeyID) {
 		p.AccessKeyID, p.SecretAccessKey = src.AccessKeyID, src.SecretAccessKey
 	}
 	if p.ZhipuTeam == nil {
@@ -818,6 +853,7 @@ func AddCopy(p Provider, from string) (string, error) {
 	p.Unlisted = p.Unlisted || src.Unlisted
 	p.Searches = p.Searches || src.Searches
 	p.Unredacted = p.Unredacted || src.Unredacted
+	p.PassUserAgent = p.PassUserAgent || src.PassUserAgent
 	if p.Website == "" {
 		p.Website = src.Website
 	}
@@ -1015,6 +1051,9 @@ func normalize(p Provider) Provider {
 	p.AccountCaps = normalAccountCaps(p.AccountCaps)
 	p.AccountWindowCaps = normalWindowCaps(p.AccountWindowCaps)
 	p.AccountNames = normalAccountNames(p.AccountNames)
+	if len(p.Models) > 0 {
+		p.NoModels = false // a pick is no longer Select none
+	}
 	p.ZhipuTeam = p.ZhipuTeam.normal()
 	p.Vertex = p.Vertex.Normal()
 	if !p.IsVertex() {
@@ -1063,8 +1102,8 @@ func normalize(p Provider) Provider {
 	// OpenCode Zen serves its free models (-free) signed out, to the key
 	// OpenCode itself sends then: a Zen provider saved with no key of its
 	// own asks with that one
-	if p.Preset == "opencode-zen" && p.Key == "" {
-		p.Key = OpenCodeAnonymousKey
+	if anon := p.AnonymousKey(); anon != "" && p.Key == "" {
+		p.Key = anon
 	}
 	// a Zen provider saved before its preset had System One for Jev
 	// (01huadalang: its Jev was asked as a chat model, and failed), an

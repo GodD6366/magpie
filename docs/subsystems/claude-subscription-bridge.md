@@ -58,6 +58,15 @@ started a new Claude Code told the whole conversation (#1546).
 A run started anew is told the whole conversation in one user message
 (`renderClaudePrompt`), a prefix the prompt cache has never seen, so the
 conversation is written to the cache again and its images are sent again.
+That message holds the history in blocks of `historyChunk` messages, and
+magpie's one mark (Claude Code keeps three of Anthropic's four) is on the
+last whole block, else on the caller's instructions: a later run started
+anew for the same conversation within the hour reads the history up to an
+earlier run's mark, found within Anthropic's 20-block lookback. A
+conversation with no history (no reply that calls no tool, as a sub-agent's
+loop of tool calls that Claude Code's AgentSummary asks a summary of) has
+its every message but the last chunked instead. The turn to answer after a
+history is not chunked, and image blocks count toward the lookback.
 A turn that goes on in the run that had the last one is told only the
 messages since (`renderClaudeTurn`), and Anthropic reads the rest from the
 cache.
@@ -308,6 +317,50 @@ there and gets a run started anew (`answeredElsewhere` in the log). It is
 never refused: Claude Code doesn't retry a 409, and the agent that sent it
 stops (ylorn on Discord).
 
+## The user's words beside tool results (#872, #1878)
+
+A user message can hold tool results and, after them, text blocks of the
+user's: Claude Code's AgentSummary asks for its sub-agent's progress label
+that way ("Describe your most recent action in 3-5 words. Do not use
+tools.", JinJieBeWater), a fork its directive, and an older Claude Code a
+message sent while a tool ran (#872). The words are the user's, and both
+ways a run is told them keep them apart from the tool's output:
+
+- **A run told the messages as text** (`renderParts`, for a run started
+  anew and for a resumed turn): a text or file part after a tool result in
+  the same message closes the result, `[end of tool result id=…]`, and is
+  marked `[user message]`. Before, it ran on after the tool's last line
+  (`SOURCE_LAST_LINEDescribe your…`), and the model read it as tool output
+  and went on with the task. A result followed by nothing, or by another
+  result, is told as before.
+- **Results that go on in their run** (`match`, `continueWith`): `match`
+  no longer adds the words to the last result's text, which made them part
+  of the MCP result. `saidWithResults` takes them, and `continueWith`
+  writes them to Claude Code's input as a user message (`queue`) before it
+  hands the results over, and waits for Claude Code's `command_lifecycle`
+  "queued" for that message's uuid (at most `queuedWait`, 2s; a version
+  that doesn't say goes on after it). Claude Code then tells its model the
+  message with the result, as one the user sent while it worked ("The user
+  sent a new message while you were working: …"), within the turn. Tried
+  with the real Claude Code 2.1.296 against a local mock of Anthropic: the
+  next request holds the tool's output, then that reminder, and the turn
+  ends with one `result`. Handed over after the results, a message could
+  come after the model's reply and start a turn of its own.
+
+Where the result ends is said by the message's parts alone. A tool whose
+output says "Do not use tools." has it told as its output, inside the
+result. The words of a message that holds images (pi-ai's "Attached
+image(s) from tool result:" over Chat, #1382) still go with the result
+before them, with the images.
+
+A request with words beside the results still takes the run waiting on
+the calls when it comes first (`claimResume`). An AgentSummary that does
+is answered in the sub-agent's run, and the sub-agent's own next request
+then gets a run started anew, as any request after another answered the
+calls does. Starting such a request anew instead would tell the whole
+conversation to a new run, a prefix the cache has never seen (#1716,
+#1717), for every message sent mid-turn.
+
 ## The account's allowance on the reply (#1257)
 
 Claude Code tells a run's account allowance in its stream-json
@@ -333,7 +386,7 @@ carries none.
 
 ```sh
 go test -tags nogui ./internal/claudecode/ -count=1
-go test -tags nogui ./internal/gateway/ -run 'ClaudeSubscriptionRunsTheDownloaded|ClaudeSubscriptionWithoutClaudeCode|ClaudeRewritten|LostMedia|ImagesTakenOut|RunLetGoWhenTheClientRewrote|ClaudeSessionTempFiles|ClaudeLetGo|ClaudeSessionFiles|ClaudeOldSessions|ClaudeSubscriptionReplySaysTheAllowance|ClaudeAllowanceHeaders|ClaudeForksAnsweringTheLeadsCalls|ClaudeTurnGivenUpOn|ClaudeToolResultsGivenUpOn|ClaudePromptMarksEarlierTurns|ClaudeUnloadableSession|ClaudeEndedRunSaysWhy|ClaudeIdle|ClaudeSideQuestion|ClaudeNoRunSaysWhy|ClaudeToolResultsNoRunSaysWhy' -count=1
+go test -tags nogui ./internal/gateway/ -run 'ClaudeSubscriptionRunsTheDownloaded|ClaudeSubscriptionWithoutClaudeCode|ClaudeRewritten|LostMedia|ImagesTakenOut|RunLetGoWhenTheClientRewrote|ClaudeSessionTempFiles|ClaudeLetGo|ClaudeSessionFiles|ClaudeOldSessions|ClaudeSubscriptionReplySaysTheAllowance|ClaudeAllowanceHeaders|ClaudeForksAnsweringTheLeadsCalls|ClaudeTurnGivenUpOn|ClaudeToolResultsGivenUpOn|ClaudePromptMarksEarlierTurns|ClaudeHistoryCachedAcrossNewRuns|ClaudeUnloadableSession|ClaudeEndedRunSaysWhy|ClaudeIdle|ClaudeSideQuestion|ClaudeNoRunSaysWhy|ClaudeToolResultsNoRunSaysWhy|ClaudePromptToldUserText|ClaudePromptKeepsInstructions|ClaudeToolResultsGoOnWithTheUsersWords|ClaudeToolResultsKeepInstructions|ToolResultKeepsUserTextSentMidTurn' -count=1
 ```
 
 `claude_rewritten_test.go` has a case for each relaxation and one for each

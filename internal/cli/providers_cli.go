@@ -31,16 +31,20 @@ const providerUsage = `usage:
   magpie provider <id>                    show one provider and its models
   magpie provider add <preset> <key>      add a preset vendor   e.g. magpie provider add deepseek sk-…
                                           again, it adds another (deepseek-2); k=v pairs too: id, name, header.X-Foo
-  magpie provider add <name> k=v…         add a custom vendor   k: url, anthropic, responses, gemini, decide, key, models, catalog, icon, header.X-Foo, balance, balance.path, balance.token, models.url, search,
+  magpie provider add <name> k=v…         add a custom vendor   k: url, anthropic, responses, gemini, decide, key, models, catalog, icon, header.X-Foo, balance, balance.path, balance.token, models.url, search, user-agent,
                                           access.key, access.secret (a Volcengine access key, or a Tencent Cloud SecretId and SecretKey, for its plan's windows)
   magpie provider set <id> k=v…           change a provider's settings, with the same k=v pairs as add;
                                           codex=as-sent sends Codex's Responses requests as Codex sent them
-                                          (a relay that checks they are Codex's own), codex=default fits them
+                                          (a relay that checks they are Codex's own), codex=default fits them;
+                                          user-agent=agent sends the User-Agent the agent gave (pi, opencode…)
+                                          in place of magpie's, for a plan that serves only agents it names;
+                                          user-agent=magpie, the default, sends magpie's
   magpie provider key <id> <key>          change the API key
   magpie provider icon <id> <file|name>   give a custom provider a picture (PNG, JPEG, SVG…) or a built-in icon
   magpie provider fallback <id> <provider/model>…   where requests go when it's out of quota or down (none clears)
   magpie provider models <id> [ids…]      fetch the vendor's model list, or choose which models to expose:
-                                          ids… replace the list, +id adds one, -id takes one out, all: the default
+                                          ids… replace the list, +id adds one, -id takes one out, all: the default,
+                                          none: serve none of them, its balance and usage still shown
   magpie provider refresh <id>            fetch the vendor's model list again (as the app's Fetch models)
   magpie provider account-models <id> [account|key [ids…|all]]
                                           the models one account or key alone serves; all: every model the provider has
@@ -264,13 +268,15 @@ func models(args []string) error {
 	var hidden []provider.Entry
 	agentID := ""
 	if len(args) > 0 {
-		agentID = strings.ToLower(strings.TrimPrefix(args[0], "--agent="))
-		if agentID == "--agent" && len(args) > 1 {
-			agentID = strings.ToLower(args[1])
+		q := strings.TrimPrefix(args[0], "--agent=")
+		if q == "--agent" && len(args) > 1 {
+			q = args[1]
 		}
-		if agentID = agentOf(agentID); !knownAgent(agentID) {
-			return fmt.Errorf("no agent %q (%s)", agentID, strings.Join(agentIDs(), ", "))
+		a, err := agent.Find(q)
+		if err != nil {
+			return err
 		}
+		agentID = a.ID
 		entries, hidden = provider.CatalogFor(agentID)
 	}
 	if _, only := provider.PickedModels(agentID); len(entries) == 0 && agentID != "" && only {
@@ -313,7 +319,7 @@ func models(args []string) error {
 	// the models a provider's list has that it doesn't expose, which a
 	// group naming one finds "not served" (MOMO on Discord: 35 of 37)
 	for _, p := range provider.All() {
-		if !p.On() || p.Unlisted {
+		if !p.On() || p.Unlisted || p.ServesNone() {
 			continue
 		}
 		if ids, why := notExposed(p); len(ids) > 0 {
@@ -601,11 +607,17 @@ func providerCmd(args []string) error {
 		}
 		if len(rest) > 1 {
 			before := *p
+			// none: no model served at all, the provider kept for its
+			// balance and usage (#1818); all is the vendor's list again
+			none := len(rest) == 2 && rest[1] == "none"
 			picks, err := editPicks(*p, rest[1:])
+			if none {
+				picks, err = nil, nil
+			}
 			if err != nil {
 				return err
 			}
-			p.Models = picks
+			p.Models, p.NoModels = picks, none
 			if err := provider.Save(*p); err != nil {
 				return err
 			}
@@ -739,6 +751,13 @@ func showProvider(p provider.Provider) error {
 	kv("gemini", p.Gemini)
 	if p.Searches {
 		kv("search", "by itself"+muted.Render("  a client's web search goes to it as sent"))
+	}
+	if p.PassUserAgent {
+		why := "  the User-Agent the agent gave, not magpie's"
+		if !p.PassesUserAgent() {
+			why = "  but magpie's: it goes as a client of " + p.Name + "'s own"
+		}
+		kv("user-agent", "agent's"+muted.Render(why))
 	}
 	if p.Unredacted {
 		why := "  local: Settings' redaction leaves its requests as written"
@@ -957,6 +976,23 @@ func applyPairs(p *provider.Provider, pairs []string) error {
 			default:
 				return fmt.Errorf("codex=as-sent|default, not %q", v)
 			}
+		case "user-agent", "ua":
+			// agent: a request goes with the User-Agent the agent that
+			// sent it gave, for a coding plan that serves only agents it
+			// names (#1851); magpie: magpie's own, as by default. A
+			// header.User-Agent the user set stands over both
+			var on bool
+			switch strings.ToLower(v) {
+			case "agent", "pass", "yes", "on":
+				on = true
+			case "magpie", "default", "no", "off":
+			default:
+				return fmt.Errorf("user-agent=agent|magpie, not %q", v)
+			}
+			if on && p.Account != nil {
+				return fmt.Errorf("%s signs in as its own client, which sends the User-Agent it does; user-agent= is for a provider with an API key", p.Name)
+			}
+			p.PassUserAgent = on
 		case "search":
 			// yes: the vendor searches the web by itself, a web search a
 			// client offers going to it as it was sent (a relay in front of
@@ -1653,7 +1689,7 @@ func editPicks(p provider.Provider, args []string) ([]string, error) {
 	}
 	if len(picks) == 0 {
 		// no picks means the default list, not none
-		return nil, fmt.Errorf("that leaves no model exposed · to keep %s's models out of the list: magpie provider listed %s no", p.Name, p.ID)
+		return nil, fmt.Errorf("that leaves no model exposed · to serve none of %s's models: magpie provider models %s none; to keep them for routing groups alone: magpie provider listed %s no", p.Name, p.ID, p.ID)
 	}
 	return picks, nil
 }

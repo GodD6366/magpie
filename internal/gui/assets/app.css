@@ -144,6 +144,9 @@ code { font: var(--code-style, normal) var(--code-weight, 400) 11.5px var(--code
 .ic img { width: 100%; height: 100%; object-fit: contain; display: block; }
 .ic .mask { width: 100%; height: 100%; background: currentColor; -webkit-mask: var(--i) center / contain no-repeat; mask: var(--i) center / contain no-repeat; }
 .ic.generic { color: var(--muted); }
+/* maskSpan's shelf: a hidden user of every mask picture loaded, so a logo drawn again paints at once (#1847) */
+.mask-shelf { position: fixed; top: 0; left: 0; width: 0; height: 0; overflow: hidden; visibility: hidden; pointer-events: none; }
+.mask-shelf .mask { display: block; width: 16px; height: 16px; -webkit-mask: var(--i) center / contain no-repeat; mask: var(--i) center / contain no-repeat; }
 /* a routing group's providers, overlapping discs with the first on top */
 .ic-stack { display: inline-flex; flex: none; align-items: center; }
 .ic-stack .disc { position: relative; width: 20px; height: 20px; border-radius: 50%; display: inline-flex; align-items: center; justify-content: center; background: var(--card); box-shadow: 0 0 0 1px var(--line); }
@@ -825,6 +828,8 @@ body.window .field.solo { grid-column: auto; }
 .quota-track { height: 4px; border-radius: 2px; background: var(--pill); overflow: hidden; }
 .quota-track i { display: block; height: 100%; border-radius: inherit; background: var(--accent); }
 .subscription-error { font-size: 11px; color: var(--faint); }
+/* the way to the provider's settings, on a plan card that needs its access key (#1821) */
+.subscription-error .quota-fix { font: inherit; color: var(--accent); padding: 0; background: none; border: 0; cursor: pointer; }
 /* WorkBuddy's credits a day (#568): the period's sum over a bar a day; a
    day before counting began is an empty slot, not a zero */
 .credit-days { margin-top: 10px; }
@@ -869,6 +874,11 @@ body.window .field.solo { grid-column: auto; }
 /* a remote magpie's gateway key (#1547): its cycle, calls, used up */
 .quota-keyline { margin-top: 7px; font-size: 10.5px; color: var(--muted); font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
 .quota-keyline.spent { color: var(--red); }
+/* magpie's own requests, apart from the agents' (#1839) */
+.own-badge { display: inline-flex; align-items: center; flex: none; margin-left: 6px; font-size: 9.5px; font-weight: 550; line-height: 16px; padding: 0 6px; border: 1px solid color-mix(in srgb, var(--muted) 30%, transparent); border-radius: 5px; color: var(--muted); background: color-mix(in srgb, var(--muted) 8%, var(--card)); white-space: nowrap; vertical-align: 1px; }
+.led .who .own-badge { margin-left: 0; }
+.quota-own { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; margin-top: 7px; font-size: 10.5px; color: var(--muted); font-variant-numeric: tabular-nums; }
+.quota-own .own-badge { margin-left: 0; }
 .subscription-card.several .quota-keyline + .subscription-account { margin-top: 10px; padding-top: 9px; border-top: 1px solid var(--line); }
 .reset-ask .reset-idle { color: var(--amber); }
 /* a WorkBuddy account's daily check-in on its Usage card (#694) */
@@ -943,9 +953,11 @@ body.window .field.solo { grid-column: auto; }
 /* a narrow window, three tabs and the periods beside it: the words after the
    sum give way, never the page sideways */
 .usage-cost span { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+/* how many it couldn't price stays, at every width: a sum never reads as
+   if those cost nothing (#1856) */
 @media (max-width: 640px) {
   .usage-head { gap: 7px; }
-  .usage-cost span:not(.skeleton) { display: none; }
+  .usage-cost span:not(.skeleton):not(.unpriced) { display: none; }
   .usage-cost b { font-size: 14px; }
   /* and the refresh's picker is its figure alone; where the tabs, the periods and
      these are more than a line, the sum goes on a line of its own, at the right */
@@ -959,7 +971,7 @@ body.window .field.solo { grid-column: auto; }
 /* the same, wider, wherever the sum would be cut otherwise (#1599): a
    class app.js sets when the sum runs past its box */
 .usage-head.tight { gap: 7px; flex-wrap: wrap; height: auto; min-height: 34px; row-gap: 2px; }
-.usage-head.tight .usage-cost span:not(.skeleton) { display: none; }
+.usage-head.tight .usage-cost span:not(.skeleton):not(.unpriced) { display: none; }
 .usage-head.tight .usage-cost b { font-size: 14px; }
 .usage-head.tight .usage-cost { margin-left: auto; }
 .usage-head.tight .usage-refresh { margin-right: 0; }
@@ -1050,10 +1062,14 @@ body.window .field.solo { grid-column: auto; }
    narrow for both (#1623, fanbuz: "48 token/秒（781 次）" ran past it) */
 .led-strip .v.parts { white-space: normal; }
 .led-strip .v.parts > span { display: inline-block; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; vertical-align: top; }
+/* a figure's count after it, as a caption: "≥67 tok/s  181 replies" */
+.led-strip .v.parts > span + span { font-size: 13px; font-weight: 500; letter-spacing: 0; color: var(--muted); padding-top: 8px; }
 .led-strip .sub { display: block; margin-top: 3px; font-size: 11px; color: var(--muted); font-variant-numeric: tabular-nums; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .led-strip .sub b { font-weight: 600; color: var(--fg-2); }
 /* a count on the Requests card that lists its requests */
 .led-strip .sub.jumps { white-space: normal; overflow: visible; }
+/* the wait for the first token and its count wrap rather than cut the count off */
+.led-strip .sub.ttft { white-space: normal; }
 .led-strip .led-jump { text-align: start; font: inherit; color: inherit; background: none; border: 0; padding: 0; cursor: pointer; text-decoration: underline dotted; text-underline-offset: 2px; }
 .led-strip .led-jump.bad { color: var(--red); }
 .led-strip .led-jump:hover, .led-strip .led-jump.on { text-decoration-style: solid; }
@@ -1159,9 +1175,10 @@ body.window .field.solo { grid-column: auto; }
 /* over the requests: their sum, and at its right the request archive's switch */
 .led-head { display: flex; align-items: center; flex-wrap: wrap; gap: 4px 8px; margin: 0 2px 7px; min-width: 0; }
 .led-head .led-sum { margin: 0; min-width: 0; }
-/* the two sources the request page counts and their total, in the same block
-   of cells as the totals above them, each one clickable to filter by it */
-.led-vias { grid-template-columns: repeat(3, minmax(0, 1fr)); margin: 0 0 9px; }
+/* the sources the request page counts and their total, in the same block
+   of cells as the totals above them, each one clickable to filter by it; a
+   fourth, the calls apps reported (#1874), only once there are some */
+.led-vias { grid-template-columns: repeat(var(--vias, 3), minmax(0, 1fr)); margin: 0 0 9px; }
 .led-vias[hidden] { display: none; }
 .led-vias .blk { cursor: pointer; text-align: left; border: 0; font: inherit; color: inherit; background: none; }
 .led-vias .blk:hover { background: var(--pill-hover); }
@@ -1262,6 +1279,7 @@ body.window .field.solo { grid-column: auto; }
 .led .src.access-api { --badge-ink: var(--tk-f); }
 .led .src.access-subscription { --badge-ink: var(--tk-k); }
 .led .src.proto { --badge-ink: var(--muted); font-weight: 500; }
+.led .src.reported { --badge-ink: var(--tk-o); }
 .led .duration { font-weight: 550; }
 .led .duration-fast { color: var(--tk-s); }
 .led .duration-slow { color: var(--amber); }
@@ -1668,7 +1686,7 @@ body.panel .profiles #save { height: 25px; } /* the field's: the line keeps its 
 .pq-rings { grid-row: 1 / 3; grid-column: 2; display: flex; gap: 12px; }
 .pq-ring { display: flex; flex-direction: column; align-items: center; gap: 3px; cursor: pointer; }
 .pq-dial { width: 34px; height: 34px; border-radius: 50%; display: grid; place-items: center; background: conic-gradient(var(--fg-2) calc(var(--p) * 1%), color-mix(in srgb, var(--fg) 9%, transparent) 0); }
-.pq-dial b { width: 27px; height: 27px; border-radius: 50%; display: grid; place-items: center; background: var(--card); font-size: 9.5px; font-weight: 600; color: var(--fg-2); font-variant-numeric: tabular-nums; }
+.pq-dial b { width: 28px; height: 28px; border-radius: 50%; display: grid; place-items: center; background: var(--card); font-size: 9.5px; font-weight: 600; color: var(--fg-2); font-variant-numeric: tabular-nums; }
 .pq-ring.full .pq-dial { background: conic-gradient(var(--amber) calc(var(--p) * 1%), color-mix(in srgb, var(--amber) 18%, transparent) 0); }
 .pq-ring.full b { color: var(--fg); }
 .pq-rn { max-width: 44px; font-size: 9.5px; line-height: 1.2; color: var(--faint); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
@@ -2067,10 +2085,14 @@ body.window .ag-sk-icon { width: 22px; height: 22px; border-radius: 6px; }
 @media (max-width: 520px) {
   .connect { grid-template-columns: 48px minmax(0, 1fr); column-gap: 8px; padding-left: 10px; padding-right: 10px; }
 }
-.copy { width: 22px; height: 22px; border-radius: 5px; display: inline-flex; align-items: center; justify-content: center; color: var(--muted); flex: none; transition: background .12s, color .12s; }
-.copy:hover { background: var(--pill-hover); color: var(--fg); }
+/* Change key (#1869) looks like the copy button beside it, but isn't one */
+.copy, .key-edit { width: 22px; height: 22px; border-radius: 5px; display: inline-flex; align-items: center; justify-content: center; color: var(--muted); flex: none; transition: background .12s, color .12s; }
+.copy:hover, .key-edit:hover { background: var(--pill-hover); color: var(--fg); }
 .copy.done { color: var(--green); background: var(--green-soft); animation: copy-pop .36s var(--ease); }
 @keyframes copy-pop { 0% { transform: scale(.55); } 55% { transform: scale(1.16); } 100% { transform: scale(1); } }
+/* the snippet's language, and beside it the shell it is for (#1514);
+   a narrow window puts the shell on a row of its own */
+.snip-tabs { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; min-width: 0; }
 .snip-wrap { position: relative; min-width: 0; }
 .snip { margin: 0; padding: 10px 40px 10px 12px; border-radius: 9px; background: var(--card); border: 1px solid var(--line); overflow-x: auto; line-height: 1.55; }
 .snip code { font-size: 11.5px; color: var(--fg); white-space: pre; user-select: text; -webkit-user-select: text; }
@@ -2305,6 +2327,13 @@ body.window .ag-sk-icon { width: 22px; height: 22px; border-radius: 6px; }
 .accts.weighted .acc .key-weight { display: inline-block; }
 .acc .key-weight-in { width: 64px; flex: none; font-size: 12px; padding: 1px 6px; }
 .acc .key-rest { flex: none; font-size: 11px; padding: 1px 6px; border-radius: 5px; color: var(--amber); background: var(--amber-soft); white-space: nowrap; }
+.acc .key-nourl { flex: none; font-size: 11px; padding: 1px 6px; border-radius: 5px; color: var(--amber); background: var(--amber-soft); white-space: nowrap; }
+/* a resting key's note and Try now (#1869): a line under the key's own,
+   lined up with its name, so the row's controls aren't pushed out of reach */
+.accts .acc.resting { flex-wrap: wrap; row-gap: 3px; }
+.acc .key-rest-line { flex: 1 0 100%; display: flex; align-items: center; gap: 8px; min-width: 0; padding-left: 25px; }
+.acc .key-rest-line .key-rest { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.acc .key-rest-line .key-unrest { flex: none; white-space: nowrap; }
 .acc .proto { flex: none; display: inline-flex; align-items: center; gap: 3px; height: 20px; padding: 0 5px 0 7px; font: inherit; font-size: 11px; color: var(--muted); border: 0; border-radius: 5px; background: var(--pill); white-space: nowrap; cursor: default; transition: opacity .15s, background .12s, color .12s; }
 .acc .proto svg { opacity: .7; transition: transform .15s var(--ease); }
 .acc .proto.open svg { transform: rotate(180deg); }
@@ -2972,13 +3001,17 @@ body.window .ag-sk-icon { width: 22px; height: 22px; border-radius: 6px; }
 #otelList .otel-stacked .segs { margin-left: 0; max-width: 100%; flex-wrap: wrap; }
 #otelList .otel-env { padding: 12px 14px; border-top: 1px solid var(--line-2); font-size: 11.5px; color: var(--muted); }
 
-.session-terminal-select { max-width: min(230px, 45%); height: 29px; color: var(--fg); }
-.session-terminal-select:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.session-terminal-select, .pref-pick { max-width: min(230px, 45%); height: 29px; color: var(--fg); }
+.session-terminal-select:focus-visible, .pref-pick:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 .row.pref .segs { flex: none; margin-left: auto; }
-.proxy-segs { display: flex; align-items: center; gap: 8px; margin-left: auto; min-width: 0; }
-.proxy-segs input.proxy, input.words { width: 180px; min-width: 0; height: 27px; padding: 0 9px; border-radius: 7px; border: 1px solid var(--line); background: var(--card); font-size: 12.5px; outline: none; transition: border-color .12s, box-shadow .12s; }
-.proxy-segs input.proxy:focus, input.words:focus { border-color: var(--accent); box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 22%, transparent); }
-.proxy-segs input.proxy::placeholder, input.words::placeholder { color: var(--faint); }
+.proxy-segs { display: flex; flex-direction: column; align-items: flex-end; gap: 8px; margin-left: auto; min-width: 0; max-width: 100%; }
+.proxy-controls, .proxy-auth { display: flex; align-items: center; justify-content: flex-end; flex-wrap: wrap; gap: 8px; min-width: 0; max-width: 100%; }
+.proxy-auth[hidden] { display: none; }
+.proxy-segs input.proxy, .proxy-segs input.proxy-credential, input.words { width: 180px; max-width: 100%; min-width: 0; height: 27px; padding: 0 9px; border-radius: 7px; border: 1px solid var(--line); background: var(--card); font-size: 12.5px; outline: none; transition: border-color .12s, box-shadow .12s; }
+.proxy-segs input.proxy-credential { width: 140px; }
+.proxy-auth .text { flex: none; }
+.proxy-segs input:focus, input.words:focus { border-color: var(--accent); box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 22%, transparent); }
+.proxy-segs input::placeholder, input.words::placeholder { color: var(--faint); }
 input.words { width: 240px; max-width: 100%; }
 /* Settings → Long conversations: 272K or the size typed, beside it (#876) */
 .compact-at { display: flex; align-items: center; gap: 8px; margin-left: auto; flex: none; }
@@ -2989,6 +3022,7 @@ input.words.compact-num { flex: none; width: 76px; font-variant-numeric: tabular
 .row.pref.rule-row { flex-wrap: wrap; row-gap: 8px; }
 .row.pref.rule-row .who { flex: 1 1 100%; }
 .row.pref.rule-row .sub { white-space: normal; }
+.row.pref.cors-origin .name { white-space: normal; overflow-wrap: anywhere; }
 /* a kind of personal data, under Mask personal data */
 .row.pref.redact-kind .who { padding-left: 14px; min-width: 0; }
 .row.pref.redact-kind .sub { white-space: normal; overflow-wrap: anywhere; line-height: 1.45; }
@@ -3215,7 +3249,8 @@ body.panel .modal { padding: 16px 12px; }
   body.web .row.pref .sub { white-space: normal; }
   body.web .row.pref .segs { margin-left: 0; max-width: 100%; flex-wrap: wrap; }
   body.web .row.pref .warm-at.times { max-width: 100%; }
-  body.web .proxy-segs { margin-left: 0; flex-wrap: wrap; justify-content: flex-start; }
+  body.web .proxy-segs { margin-left: 0; align-items: flex-start; }
+  body.web .proxy-controls, body.web .proxy-auth { justify-content: flex-start; }
   body.web .usage-head { height: auto; min-height: 44px; flex-wrap: wrap; gap: 8px; }
   body.web .usage-head > .segs { max-width: 100%; flex-wrap: wrap; }
   body.web .usage-head > .grow, body.web .sess-tools > .grow { display: none; }
@@ -3672,10 +3707,14 @@ body.window .row + .row.agent.conn > .who { min-height: 41px; } /* the line abov
 .row.agent.conn.unplugged .ag-handle .ic { opacity: .7; }
 /* opened: the settings as named lines on the row's quieter ground */
 .ag-exp { flex: 0 0 calc(100% + 26px); margin: 7px -12px -7px -14px; padding: 4px 16px 14px 50px; border-top: 1px solid var(--line-2); background: var(--card-2); cursor: default; }
-.ag-kv { display: flex; align-items: flex-start; gap: 16px; padding: 11px 0; border-top: 1px solid var(--line-2); }
-.ag-kv:first-child { border-top: 0; }
-.ag-k { width: 112px; flex: none; padding-top: 3px; font-size: 12px; color: var(--muted); }
-.ag-v { flex: 1; min-width: 0; font-size: 12.5px; color: var(--fg-2); display: grid; gap: 4px; }
+/* the labels and values in one grid, the label column as wide as its longest
+   label (#1169); the space between the columns is the label's own padding,
+   so each line over a row runs unbroken across both */
+.ag-settings { display: grid; grid-template-columns: minmax(128px, max-content) minmax(0, 1fr); }
+.ag-kv { display: contents; }
+.ag-k { padding: 14px 16px 11px 0; border-top: 1px solid var(--line-2); font-size: 12px; color: var(--muted); white-space: nowrap; }
+.ag-v { min-width: 0; padding: 11px 0; border-top: 1px solid var(--line-2); font-size: 12.5px; color: var(--fg-2); display: grid; gap: 4px; }
+.ag-kv:first-child > .ag-k, .ag-kv:first-child > .ag-v { border-top: 0; }
 .ag-vl { display: flex; align-items: center; flex-wrap: wrap; gap: 6px 8px; min-height: 24px; }
 .ag-vl > .fields { margin-left: 0; }
 /* the opened row has the whole width under the name to lay its settings out
@@ -3744,7 +3783,11 @@ body.window .row + .row.agent.conn > .who { min-height: 41px; } /* the line abov
   /* the name beside its logo; the link and the switch wrap under it when short of room */
   body.window .row.agent.conn > .who { width: auto; flex: 1 1 160px; min-width: 0; }
   .ag-exp { padding-left: 16px; min-width: 0; }
-  .ag-kv { flex-direction: column; gap: 4px; min-width: 0; }
+  .ag-settings { display: block; }
+  .ag-kv { display: flex; flex-direction: column; gap: 4px; min-width: 0; padding: 11px 0; border-top: 1px solid var(--line-2); }
+  .ag-kv:first-child { border-top: 0; }
+  .ag-k, .ag-v { padding: 0; border-top: 0; }
+  .ag-k { width: auto; padding-top: 3px; }
   /* the pickers take the line, the effort and the squares wrap under them */
   .ag-vl { width: 100%; min-width: 0; }
   #agents .ag-vl > .fields { display: flex; flex-wrap: wrap; width: 100%; min-width: 0; }
@@ -3781,3 +3824,27 @@ input[type="checkbox"]:indeterminate::before { transform: scale(1); -webkit-mask
 input[type="checkbox"]:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
 input[type="checkbox"]:disabled { opacity: .45; }
 .editor .pair .side .key-count { white-space: nowrap; font-size: 11.5px; font-variant-numeric: tabular-nums; }
+
+/* Agent visibility manager: selection stays separate from connection controls. */
+.ag-manage-bar { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, auto) minmax(max-content, 1fr); align-items: center; gap: 6px; padding: 3px 8px; border-top: 1px solid var(--line-2); }
+.ag-manage-bar > .agent-more { grid-column: 2; min-width: 0; border: 0; border-radius: 6px; padding: 6px; }
+.ag-manage-bar > .agent-more > span:first-child { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ag-manage-bar .chev { flex: none; }
+.ag-manage-button { grid-column: 3; justify-self: end; display: inline-flex; align-items: center; gap: 5px; padding: 6px 8px; border: 0; border-radius: 6px; background: none; color: var(--muted); font: inherit; font-size: 12px; white-space: nowrap; transition: color .2s, background-color .2s; }
+.ag-manage-button:hover { color: var(--fg); background: var(--card-2); }
+.ag-manage-button:focus-visible { color: var(--fg); background: var(--card-2); outline: 2px solid var(--accent); outline-offset: -2px; }
+.ag-manage-button:disabled { opacity: .45; }
+.ag-manager .ag-manage-search { width: 100%; box-sizing: border-box; }
+.ag-manage-actions { display: flex; flex-wrap: wrap; gap: 6px; margin: 12px 0; }
+.ag-manage-count, .ag-manage-state { color: var(--fg-2); font-size: 12px; }
+.ag-manage-row { display: flex; align-items: center; gap: 10px; padding: 10px 0; }
+.ag-manage-row > input { flex: none; }
+.ag-manage-row > .ic { width: 22px; height: 22px; flex: none; }
+.ag-manage-name { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+.ag-manage-state { flex: none; }
+.ag-manager > .bar { flex-wrap: wrap; }
+.ag-manage-result { font-size: 13px; overflow-wrap: anywhere; }
+.modal .editor.ag-manager > .ebody { grid-template-columns: minmax(0, 1fr); grid-auto-rows: max-content; }
+
+/* a disabled model's pattern, as typed (#1867): an id or a glob */
+.disabled-model .name { font-family: var(--code); font-size: 12px; overflow-wrap: anywhere; }

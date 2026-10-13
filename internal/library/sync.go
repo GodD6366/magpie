@@ -67,6 +67,7 @@ func (l *Library) sync() *Result {
 	for _, t := range all {
 		l.syncInstructions(t, b, res)
 		l.syncMCP(t, b, res)
+		l.syncHooks(t, b, res)
 	}
 	// an edit made in an agent's copy of a skill goes to the library first,
 	// for the others to get rather than be undone (takeEdits)
@@ -271,11 +272,15 @@ type SkillView struct {
 
 // View is the Library page.
 type View struct {
-	Agents       []AgentView  `json:"agents"`
-	Servers      []ServerView `json:"servers"`
-	FoundServers []Found      `json:"foundServers"`
-	Skills       []SkillView  `json:"skills"`
-	FoundSkills  []FoundSkill `json:"foundSkills"`
+	Agents  []AgentView  `json:"agents"`
+	Servers []ServerView `json:"servers"`
+	// Hooks are the library's hooks, and HookAgents what each agent on
+	// this computer can take of them (hooks.go)
+	Hooks        []HookView      `json:"hooks"`
+	HookAgents   []HookAgentView `json:"hookAgents"`
+	FoundServers []Found         `json:"foundServers"`
+	Skills       []SkillView     `json:"skills"`
+	FoundSkills  []FoundSkill    `json:"foundSkills"`
 	// NewSkills are skills a check found its skills' repositories to have
 	// added beside them, to add or set aside
 	NewSkills    []NewSkill        `json:"newSkills"`
@@ -308,8 +313,12 @@ func Glance(problems []Problem) (*View, error) { return readView(problems, true)
 func readView(problems []Problem, glance bool) (*View, error) {
 	mu.Lock()
 	locked := true
+	// each folder on the way to a path is looked at once while the lock
+	// is held (linkmemo.go, #1771)
+	forget := readParts()
 	defer func() {
 		if locked {
+			forget()
 			mu.Unlock()
 		}
 	}()
@@ -377,6 +386,7 @@ func readView(problems []Problem, glance bool) (*View, error) {
 		}
 		v.Servers = append(v.Servers, sv)
 	}
+	v.Hooks, v.HookAgents = l.hooksView(targets, of)
 	tr := &tracer{}
 	for _, s := range l.Skills {
 		sv := SkillView{Name: s.Name, Agents: append([]string{}, s.Agents...), Icon: skillIcon(s), Problems: of("skill:" + s.Name), Repo: tr.repoOf(s)}
@@ -428,6 +438,7 @@ func readView(problems []Problem, glance bool) (*View, error) {
 	// the agents' skill folders are read through without the lock, so a
 	// change made meanwhile doesn't wait on them: what they show is read
 	// from the library as it was loaded
+	forget()
 	mu.Unlock()
 	locked = false
 	behind := l.behind(targets)

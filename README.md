@@ -14,7 +14,7 @@ and when a quota runs out, it quietly moves on to the next account.
 ![macOS](https://img.shields.io/badge/macOS-000000?logo=apple&logoColor=white) ![Windows](https://img.shields.io/badge/Windows-0078D4?logo=windows&logoColor=white) ![Linux](https://img.shields.io/badge/Linux-FCC624?logo=linux&logoColor=black) ![Docker](https://img.shields.io/badge/Docker-2496ED?logo=docker&logoColor=white) ![Termux](https://img.shields.io/badge/Termux-000000?logo=android&logoColor=white)
 
 <sub>Sponsors</sub><br>
-<a href="https://apinebula.ai/ref/qmXqFGpr"><picture><source media="(prefers-color-scheme: dark)" srcset="site/public/img/sponsor-apinebula-dark.svg"><img src="site/public/img/sponsor-apinebula.svg" height="26" alt="APINEBULA"></picture></a>
+<a href="https://usemagpie.ai/go/apinebula/readme"><picture><source media="(prefers-color-scheme: dark)" srcset="site/public/img/sponsor-apinebula-dark.svg"><img src="site/public/img/sponsor-apinebula.svg" height="36" alt="APINEBULA"></picture></a>
 
 **[Download](https://usemagpie.ai)** &nbsp;·&nbsp; **[Docs](https://usemagpie.ai/docs/start)** &nbsp;·&nbsp; **[Reference](docs/reference.md)** &nbsp;·&nbsp; **[Plugins](https://github.com/magpie-community/plugins)** &nbsp;·&nbsp; **[Discord](https://discord.gg/vGSnD3ZKQF)** &nbsp;·&nbsp; **English** · [简体中文](README.zh-CN.md)
 
@@ -75,7 +75,7 @@ magpie finds the subscriptions your agents are signed in to by reading their sig
 <table>
 <tr><td>
 
-Claude Code · Claude Desktop · Codex · Gemini CLI · Antigravity CLI · OpenCode · OpenChamber · MiMo Code · Pi · oh-my-pi · Aside · OmO · Prime Agent · Goose · Cursor CLI · Cursor Private Inference · Zed · VS Code Chat · VS Code Insiders · VSCodium Chat · JetBrains Air · Copilot (JetBrains) · Copilot CLI · Crush · DeepSeek Harness · Reasonix Studio · Command Code · fx · Devin · Hermes Agent · Mister Morph · Kimi Code · jcode · Qwen Code · Muse Code · Empryo · MiniMax Code · Droid · Cline · Qoder · Qoder CN · Grok Build · Grok App · ZCode · WorkBuddy · WorkBuddy AI · CodeBuddy Code · Pencil · T3 Code · OpenHanako · AtomCode · Snow CLI · Alma · Cindy
+Claude Code · Claude Desktop · Codex · Gemini CLI · Antigravity CLI · OpenCode · OpenChamber · MiMo Code · DevEco Code · Pi · oh-my-pi · StepCode · Aside · OmO · Prime Agent · Goose · Cursor CLI · Cursor Private Inference · Zed · VS Code Chat · VS Code Insiders · VSCodium Chat · JetBrains Air · Copilot (JetBrains) · Copilot CLI · Crush · DeepSeek Harness · Reasonix Studio · Command Code · fx · Devin · Hermes Agent · Mister Morph · Kimi Code · jcode · Qwen Code · Muse Code · Empryo · MiniMax Code · Droid · Cline · Qoder · Qoder CN · Grok Build · Grok App · ZCode · WorkBuddy · WorkBuddy AI · CodeBuddy Code · Pencil · T3 Code · OpenHanako · AtomCode · Snow CLI · Alma · Cindy · Ante · AstrBot
 
 </td></tr>
 </table>
@@ -92,30 +92,10 @@ export GOOGLE_GEMINI_BASE_URL=http://127.0.0.1:3425 GEMINI_API_KEY=magpie
 
 The gateway at `127.0.0.1:3425` speaks OpenAI Chat, OpenAI Responses, Anthropic Messages and Gemini, and translates between them, streaming, tool calls and reasoning included.
 
-```mermaid
-flowchart LR
-  subgraph A["Your agents"]
-    direction TB
-    a1["Claude Code"]
-    a2["Codex"]
-    a3["Gemini CLI"]
-    a4["OpenCode · Zed · Cursor CLI · 40+ more"]
-  end
-  subgraph M["magpie · 127.0.0.1:3425"]
-    direction TB
-    g["Gateway<br/>Chat · Responses · Messages · Gemini"]
-    r["Routing groups<br/>fail-over · smart · pace"]
-    p["Plugins & middleware"]
-    g --> r --> p
-  end
-  subgraph P["Your providers"]
-    direction TB
-    p1["API keys<br/>DeepSeek · Kimi · GLM · OpenRouter …"]
-    p2["Subscriptions<br/>Claude · ChatGPT · Copilot · Gemini · Grok"]
-    p3["Local models<br/>Ollama · LM Studio"]
-  end
-  A --> M --> P
-```
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="site/public/img/architecture-dark.svg">
+  <img src="site/public/img/architecture.svg" alt="How magpie fits together: your agents send requests to the magpie gateway at 127.0.0.1:3425, which routes them through routing groups and plugins to your API keys, subscriptions and local models.">
+</picture>
 
 
 ## What it does

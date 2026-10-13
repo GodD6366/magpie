@@ -21,16 +21,6 @@ import (
 	"time"
 )
 
-// LookPath is exec.LookPath, with a version manager's wrapper script found
-// there given as the program it runs (Unwrap).
-func LookPath(name string) (string, error) {
-	p, err := exec.LookPath(name)
-	if err != nil {
-		return p, err
-	}
-	return Unwrap(name, p), nil
-}
-
 // Unwrap is the program path stands for when it is a small script that
 // runs name through mise (`mise x … -- name`, `mise exec`, rtx's old
 // name): what `mise which name` says. path itself otherwise, and when mise
@@ -172,7 +162,15 @@ func shellWords(line string) []string {
 }
 
 // miseWait is how long mise is given to say where the program is.
-var miseWait = 5 * time.Second
+const miseWait = 5 * time.Second
+
+// miseAsk is the context an ask of mise runs under, ended when mise is
+// given up on: miseWait from now. A var so a test ends it when its fake
+// mise has started rather than at a time a loaded machine can pass before
+// the fake runs its first line (#1838).
+var miseAsk = func() (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.Background(), miseWait)
+}
 
 // miseWhich is the program `mise which name` names, run with magpie's
 // environment (the shell's PATH UserPath took) from the home folder, whose
@@ -190,7 +188,7 @@ func miseWhich(w miseWrapper, name, wrapper string) string {
 	}
 	home, _ := os.UserHomeDir()
 	for _, args := range asks {
-		ctx, cancel := context.WithTimeout(context.Background(), miseWait)
+		ctx, cancel := miseAsk()
 		cmd := ProbeContext(ctx, mise, args...)
 		cmd.Dir = home
 		out, err := cmd.Output()

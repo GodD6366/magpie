@@ -87,6 +87,12 @@ type providerJSON struct {
 	// on this machine or the local network, set to go unmasked by
 	// Settings' redaction (provider.Unredacted)
 	Unredacted bool `json:"unredacted"`
+	// requests go with the agent's own User-Agent, not magpie's
+	// (provider.PassUserAgent, #1851); OwnClient: they go as a client of
+	// the vendor's own whatever is set (provider.OwnClient), so the
+	// editor offers no such choice
+	PassUserAgent bool `json:"passUserAgent"`
+	OwnClient     bool `json:"ownClient,omitempty"`
 	// which header its key goes in on a third-party Anthropic API
 	// (provider.AuthHeader: "" both, "x-api-key", "bearer"), and whether
 	// it is one that sends both by default (provider.BothAuth)
@@ -160,6 +166,10 @@ type providerJSON struct {
 		Masked   string `json:"masked"`
 		Optional bool   `json:"optional"`
 	} `json:"key"`
+	// AnonKey is the key Add another key adds when nothing is pasted
+	// (provider.AnonymousKey: OpenCode Zen's public, #1795), while the
+	// provider doesn't have it yet
+	AnonKey  string   `json:"anonKey,omitempty"`
 	Ready    bool     `json:"ready"`
 	Chosen   []string `json:"chosen"`   // the user's explicit picks, if any
 	Fallback []string `json:"fallback"` // where requests go when this one can't take them
@@ -196,6 +206,7 @@ type providerJSON struct {
 	Draws     int         `json:"draws,omitempty"`   // how many of its models draw images (gateway.Drawers)
 	DrawIDs   []string    `json:"drawIds,omitempty"` // those models' ids, listed apart in its editor
 	Unlisted  bool        `json:"unlisted"`          // its models serve only through routing groups
+	NoModels  bool        `json:"noModels"`          // Select none: none of its models served (#1818)
 	// Groups are the routing groups ("group/<id>") each of its models is
 	// in, by model id: what an unlisted one is still used through, and the
 	// editor names those in none
@@ -362,6 +373,9 @@ type presetJSON struct {
 	// Vertex: it is Google Vertex AI, whose editor asks for a Google Cloud
 	// project and the Google credentials to sign with, not a key
 	Vertex bool `json:"vertex,omitempty"`
+	// OwnClient: its requests go as a client of the vendor's own
+	// (provider.OwnClient), whatever User-Agent the agent gave
+	OwnClient bool `json:"ownClient,omitempty"`
 	// a partner's tagline by language, and the languages it is listed in
 	Notes map[string]string `json:"notes,omitempty"`
 	Langs []string          `json:"langs,omitempty"`
@@ -498,14 +512,21 @@ func agentUses(agents []*agent.Agent, findGroup func(string) (provider.Group, []
 	return out
 }
 
+// presetOwnClient says a provider added from pr goes as a client of its
+// vendor's own (provider.OwnClient): OpenCode's, Cline's, Kilo's, another
+// magpie.
+func presetOwnClient(pr provider.PresetDef) bool {
+	return provider.Provider{Preset: pr.ID, Chat: pr.Chat, Responses: pr.Responses, Anthropic: pr.Anthropic}.OwnClient()
+}
+
 func providerInfo(p provider.Provider, agents []agentUse) providerJSON {
 	out := providerJSON{
 		ID: p.ID, Name: p.Name, Icon: p.Icon, Preset: p.Preset, Host: p.Host(),
 		Chat: p.Chat, Responses: p.Responses, Anthropic: p.Anthropic, Gemini: p.Gemini, Decide: p.Decide, BaseAPI: p.BaseAPI, ModelTest: p.ModelTest(), TestsAs: p.TestClients(), DecideTest: p.AsksDecideModels(),
 		Catalog: p.Catalog, Website: p.Website, KeysURL: p.KeysURL,
-		Proxy: p.Proxy, AccountProxies: p.AccountProxies, AccountModels: p.AccountModels, AccountCaps: p.AccountCaps, AccountWindowCaps: p.AccountWindowCaps, AccountNames: p.AccountNames, Headers: p.Headers, ExtraBody: p.ExtraBody, Searches: p.Searches, Cline: p.ClinePinnable(), PinUpstream: p.PinUpstream, Unredacted: p.Unredacted, AuthHeader: p.AuthHeader, BothAuth: p.BothAuth(), BalanceURL: p.BalanceURL, BalancePath: p.BalancePath, ModelsURL: p.ModelsURL,
+		Proxy: p.Proxy, AccountProxies: p.AccountProxies, AccountModels: p.AccountModels, AccountCaps: p.AccountCaps, AccountWindowCaps: p.AccountWindowCaps, AccountNames: p.AccountNames, Headers: p.Headers, ExtraBody: p.ExtraBody, Searches: p.Searches, Cline: p.ClinePinnable(), PinUpstream: p.PinUpstream, Unredacted: p.Unredacted, PassUserAgent: p.PassUserAgent, OwnClient: p.OwnClient(), AuthHeader: p.AuthHeader, BothAuth: p.BothAuth(), BalanceURL: p.BalanceURL, BalancePath: p.BalancePath, ModelsURL: p.ModelsURL,
 		Ready: p.Ready(), Chosen: p.Picks(), Models: []modelJSON{}, Agents: []providerAgent{},
-		Fallback: p.Fallback, Routing: p.Routing, Sink: p.Sink, Affinity: p.Affinity, KeepLogin: p.KeepLogin, KeepLoginAs: p.KeepLoginAs, Unlisted: p.Unlisted, Off: p.Off, Contexts: p.Contexts,
+		Fallback: p.Fallback, Routing: p.Routing, Sink: p.Sink, Affinity: p.Affinity, KeepLogin: p.KeepLogin, KeepLoginAs: p.KeepLoginAs, Unlisted: p.Unlisted, NoModels: p.ServesNone(), Off: p.Off, Contexts: p.Contexts,
 		MaxConcurrency: p.MaxConcurrency, PluginConcurrency: p.PluginConcurrency(), PriceRate: p.PriceRate,
 		AccountConcurrency: p.AccountConcurrency, QueueLimit: p.QueueLimit, QueueWait: p.QueueWait, MaxRPM: p.MaxRPM,
 		Outputs: provider.OutputsOf(p.ID), Compacts: provider.CompactsOf(p.ID),
@@ -563,6 +584,9 @@ func providerInfo(p provider.Provider, agents []agentUse) providerJSON {
 		if m.State == provider.MoveMoving {
 			out.Move.State = ""
 		}
+	}
+	if anon := p.AnonymousKey(); anon != "" && p.Account == nil && !p.HasKey(anon) {
+		out.AnonKey = anon
 	}
 	out.KeyList = p.KeyList()
 	if out.KeyList == nil {
@@ -769,13 +793,13 @@ func providersState() providersJSON {
 	}
 	// partners first, as the add sheet lists them
 	for _, pa := range provider.Partners() {
-		s.Presets = append(s.Presets, presetJSON{PresetDef: pa.PresetDef, Added: have[pa.ID], Notes: pa.Notes, Langs: pa.Langs, New: !have[pa.ID] && !provider.PartnerNoticed(pa.ID)})
+		s.Presets = append(s.Presets, presetJSON{PresetDef: pa.PresetDef, Added: have[pa.ID], Notes: pa.Notes, Langs: pa.Langs, New: !have[pa.ID] && !provider.PartnerNoticed(pa.ID), OwnClient: presetOwnClient(pa.PresetDef)})
 	}
 	for _, pr := range provider.Presets() {
 		bases := provider.Provider{Chat: pr.Chat, Responses: pr.Responses, Anthropic: pr.Anthropic}
 		team := provider.TakesZhipuTeam(bases)
 		vendor, keyRegions := presetAccessKey(pr)
-		s.Presets = append(s.Presets, presetJSON{PresetDef: pr, Added: have[pr.ID], ZhipuTeam: team, AccessKey: vendor != "", AccessKeyVendor: vendor, AccessKeyRegions: keyRegions, Vertex: pr.ID == provider.VertexPreset})
+		s.Presets = append(s.Presets, presetJSON{PresetDef: pr, Added: have[pr.ID], ZhipuTeam: team, AccessKey: vendor != "", AccessKeyVendor: vendor, AccessKeyRegions: keyRegions, Vertex: pr.ID == provider.VertexPreset, OwnClient: presetOwnClient(pr)})
 	}
 	cat := provider.Catalog()
 	s.Gateway = gatewayJSON{URL: gateway.URL(), OnNetwork: gateway.OnNetwork(), Models: len(cat), Calls: []gateway.Call{}, Groups: []gwGroupJSON{}}
@@ -1096,12 +1120,18 @@ func providerRoutes(mux *http.ServeMux, w Windows) {
 			// Base, for detect: the base URL typed, asked as each API
 			// takes it where the form has no URL of that API's own
 			Base string `json:"base"`
+			// NoModels, for save: the editor's Select none, kept with no
+			// model picked (#1818); a save that leaves it out keeps it
+			NoModels *bool `json:"noModels"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			fail(rw, err)
 			return
 		}
 		in := req.Provider
+		if req.NoModels != nil {
+			in.NoModels = *req.NoModels
+		}
 		if req.Routing != nil {
 			in.Routing = *req.Routing
 		}
@@ -1129,7 +1159,7 @@ func providerRoutes(mux *http.ServeMux, w Windows) {
 			// editor's Try again is pressed with it unticked but not saved
 			// (noting_ever on X: deep-model unticked, and the move failed
 			// on it all the same)
-			if in.Models != nil {
+			if in.Models != nil && !in.NoModels {
 				var err error
 				if moved, err = agent.Reseat(func() error { return provider.SetModels(in.ID, in.Models) }); err != nil {
 					fail(rw, err)
@@ -1184,12 +1214,14 @@ func providerRoutes(mux *http.ServeMux, w Windows) {
 			if pr, err := provider.FromPreset(in.Preset); err == nil && in.Chat == "" && in.Responses == "" && in.Anthropic == "" && in.Gemini == "" {
 				pr.Key, pr.Models, pr.Fallback, pr.Headers, pr.BalanceToken, pr.Contexts = in.Key, in.Models, in.Fallback, in.Headers, in.BalanceToken, in.Contexts
 				pr.ZhipuTeam = in.ZhipuTeam
+				pr.NoModels = in.NoModels
 				pr.ExtraBody = in.ExtraBody
 				pr.SecretAccessKey = in.SecretAccessKey
 				pr.Vertex = in.Vertex
 				pr.Searches = in.Searches
 				pr.PinUpstream = in.PinUpstream
 				pr.Unredacted = in.Unredacted
+				pr.PassUserAgent = in.PassUserAgent
 				pr.AuthHeader = in.AuthHeader
 				if in.Name != "" {
 					pr.Name = in.Name
@@ -1348,9 +1380,15 @@ func providerRoutes(mux *http.ServeMux, w Windows) {
 				if in.ExtraBody == nil && old != nil {
 					in.ExtraBody = old.ExtraBody
 				}
+				// Select none likewise, while nothing is picked (#1818)
+				if req.NoModels == nil && old != nil {
+					in.NoModels = old.NoModels
+				}
 				// a Volcengine access key likewise: its ID kept when left
-				// out, its Secret when sent blank, unless the form dropped it
-				if req.AccessKeyID == nil && old != nil {
+				// out or sent blank (an editor opened before the key was
+				// given sends ""), its Secret when sent blank, unless the
+				// form dropped it (#1821)
+				if in.AccessKeyID == "" && old != nil && !req.ClearAccessKey {
 					in.AccessKeyID = old.AccessKeyID
 				}
 				if in.SecretAccessKey == "" && old != nil && !req.ClearAccessKey {
@@ -1862,6 +1900,8 @@ func providerRoutes(mux *http.ServeMux, w Windows) {
 			moved, err = agent.Reseat(func() (err error) { removed, err = provider.RemoveKeys(in.ID, in.Refs); return err })
 		case "rename":
 			err = provider.RenameKey(in.ID, in.Ref, in.Name)
+		case "replace":
+			err = replaceKey(in.ID, in.Ref, in.Key)
 		case "on", "off":
 			moved, err = agent.Reseat(func() error { return provider.SetKeyOn(in.ID, in.Ref, r.PathValue("action") == "on") })
 		default:

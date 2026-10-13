@@ -128,7 +128,7 @@
     <p>キーは <code>~/.config/magpie/providers.json</code> に保存され、あなただけが読めます。magpie はシェルの環境変数からキーを読みません。追加したものだけが使われます。</p>
 
     <h2 id="agents"><a class="anchor" href="#agents">2 · エージェントごとにモデルを選ぶ</a></h2>
-    <p><span class="ui">Agents</span> タブには、このマシンにインストールまたは設定されているエージェントごとに行があります。magpie が対応しているのは Claude Code、Codex、Gemini CLI、OpenCode、MiMo Code、Pi、Goose、Cursor、Copilot CLI、Crush、DeepSeek Harness、Command Code、omp、OmO、Devin、Hermes Agent、MiniMax Code、Grok Build、ZCode、OpenHanako、Alma です。</p>
+    <p><span class="ui">Agents</span> タブには、このマシンにインストールまたは設定されているエージェントごとに行があります。magpie が対応しているのは Claude Code、Codex、Gemini CLI、OpenCode、MiMo Code、DevEco Code、Pi、Goose、Cursor、Copilot CLI、Crush、DeepSeek Harness、Command Code、omp、OmO、Devin、Hermes Agent、MiniMax Code、Grok Build、ZCode、OpenHanako、Alma です。</p>
 
     <figure class="figure">
       <img class="for-light" src="/img/agents-ja-light.png" width="2080" height="1290" loading="lazy" alt="エージェントタブ：エージェントごとに使用中のモデルを示す行と、下部に保存済みのプロファイル">
@@ -145,7 +145,7 @@
       <tr><th>エージェント</th><th>magpie 経由のモデルで書き込まれる内容</th></tr>
       <tr><td>Claude Code</td><td><code>~/.claude/settings.json</code>：<code>env</code> ブロック内の <code>ANTHROPIC_BASE_URL</code>、<code>ANTHROPIC_AUTH_TOKEN</code> とモデル関連の変数</td></tr>
       <tr><td>Codex</td><td><code>~/.codex/config.toml</code>：<code>[model_providers.magpie]</code> テーブルとモデル、一覧は <code>magpie-models.json</code>。ChatGPT のサインインには手を加えません</td></tr>
-      <tr><td>OpenCode、MiMo Code、Pi、Crush</td><td><code>magpie</code> プロバイダのエントリと <code>magpie/provider/model</code></td></tr>
+      <tr><td>OpenCode、MiMo Code、DevEco Code、Pi、Crush</td><td><code>magpie</code> プロバイダのエントリと <code>magpie/provider/model</code></td></tr>
       <tr><td>AtomCode</td><td><code>~/.atomcode/config.toml</code>：<code>magpie</code> プロバイダアカウントと、カタログ内の各モデルのエントリ</td></tr>
       <tr><td>Snow CLI</td><td><code>~/.snow/profiles/magpie.json</code>：<code>magpie</code> プロファイルを作り、使用中のプロファイルにする（Snow App は「Sync Snow CLI API config」で取り込む）</td></tr>
       <tr><td>Gemini CLI</td><td>ゲートウェイを指す <code>GOOGLE_GEMINI_BASE_URL</code>、API キー認証、そしてモデル</td></tr>
@@ -182,6 +182,7 @@
       <tr><td>セッション <code>session</code></td><td>応答できる限り、セッション全体。</td></tr>
       <tr><td>ターン内 <code>turn</code></td><td>エージェントがツールの結果を返している間。あなたが再び発言すると、ルーティングが改めて決めます。</td></tr>
       <tr><td>オフ <code>off</code></td><td>リクエストごとに改めてルーティングします。</td></tr>
+      <tr><td>厳格 <code>strict</code></td><td>使用量上限を超えても、他のアカウントやキーへは移りません。レート制限や割り当て切れのときは、エラーがそのままエージェントに渡ります。新しい会話は通常どおりルーティングされます。</td></tr>
     </table></div>
     <h3 id="rules">ルール · ターンを指定したモデルへ</h3>
     <p>グループの <span class="ui">Rules</span> は、指定した種類のターンをグループ内の特定のモデルに送ります。種類とは、長いもの（<code>tokens ≥ N</code>）、画像を含むもの、推論を求めるもの（オン、または一定レベル以上）、特定のエージェントからのもの、あなたが記述した内容を求めるもの（<em>インテント</em>）、エージェントがコンテキストを圧縮するもの、特定のフォルダ（プロジェクト）で作業しているもの、です。ルールの条件はすべて満たす必要があるので、「~/work/acme 内で、かつ長い」のようにも書けます。メッセージを送ると上から順に評価され、最初に一致したルールのモデルが先頭になり、失敗したときはグループの他のモデルが後に続きます。どのルールにも一致しないターンは、グループの通常のルーティングに従い、それまでの送り先に留まります。</p>

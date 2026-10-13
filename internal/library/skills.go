@@ -387,13 +387,17 @@ func resolve(p string, depth int) (string, bool) {
 		if cur != "" {
 			next = filepath.Join(cur, part)
 		}
-		if to, ok := linkTarget(next); ok {
+		// one look at each part: whether it is there, and where it points
+		// when it is a link (#1771)
+		e := lookPart(next)
+		if e.link {
+			to := e.to
 			if !filepath.IsAbs(to) {
 				to = filepath.Join(filepath.Dir(next), to)
 			}
 			return resolve(filepath.Join(append([]string{to}, parts[i+1:]...)...), depth+1)
 		}
-		if _, err := os.Lstat(next); err != nil {
+		if !e.there {
 			return "", false
 		}
 		cur = next
@@ -408,18 +412,8 @@ func resolve(p string, depth int) (string, bool) {
 // or on Windows a junction (a mount point, which Go since 1.23 reports as
 // irregular, not as a symlink).
 func linkTarget(p string) (string, bool) {
-	fi, err := os.Lstat(p)
-	if err != nil {
-		return "", false
-	}
-	if !linkEntry(fi) {
-		return "", false
-	}
-	to, err := os.Readlink(p)
-	if err != nil || to == "" {
-		return "", false
-	}
-	return to, true
+	e := lookPart(p)
+	return e.to, e.link
 }
 
 // linkEntry is whether the entry is a link rather than a folder of its own:
@@ -1724,59 +1718,93 @@ func importSkill(l *Library, found []FoundSkill, name string) error {
 // that name (Others): that is another skill.
 func RemoveFoundSkill(name string) (*Result, error) {
 	return change(func(l *Library) error {
+		return removeFound(foundSkills(l), name)
+	})
+}
+
+// RemoveFoundSkills takes the skills named, of those the agents have of
+// their own, out of every agent in one change, each exactly as
+// RemoveFoundSkill takes one (wongxy on Discord: 批量删除). One that can't
+// be taken out stays, and is said in Unremoved; the others go all the
+// same. Only when none went does the change fail, with the first reason.
+func RemoveFoundSkills(names []string) (*Result, error) {
+	if len(names) == 0 {
+		return nil, fmt.Errorf("no skills to remove")
+	}
+	names = slices.Compact(slices.Sorted(slices.Values(names)))
+	var failed []Problem
+	res, err := change(func(l *Library) error {
 		found := foundSkills(l)
-		i := slices.IndexFunc(found, func(f FoundSkill) bool { return f.Name == name })
-		if i < 0 {
-			return fmt.Errorf("no agent has a skill called %s that the library hasn't", name)
-		}
-		f := found[i]
-		type entry struct{ who, p string }
-		var es []entry
-		for _, id := range slices.Concat(f.Agents, f.Copies) {
-			if t := targetByID(id); t != nil && t.Skills != "" {
-				es = append(es, entry{id, filepath.Join(t.Skills, name)})
+		for _, name := range names {
+			if err := removeFound(found, name); err != nil {
+				failed = append(failed, Problem{What: "skill:" + name, Error: err.Error()})
 			}
 		}
-		if f.Shared != "" {
-			es = append(es, entry{"agents", f.Shared})
-		}
-		if f.Library != "" {
-			es = append(es, entry{"library", f.Library})
-		}
-		// links first, so none is left pointing at a folder already set
-		// aside; an agent reading the very same folder as another has its
-		// entry gone already
-		slices.SortStableFunc(es, func(a, b entry) int {
-			la, lb := linked(a.p), linked(b.p)
-			switch {
-			case la == lb:
-				return 0
-			case la:
-				return -1
-			}
-			return 1
-		})
-		seen := map[string]bool{}
-		for _, e := range es {
-			if seen[e.p] {
-				continue
-			}
-			seen[e.p] = true
-			if _, err := os.Lstat(e.p); errors.Is(err, fs.ErrNotExist) {
-				continue
-			}
-			if linked(e.p) {
-				if err := os.Remove(e.p); err != nil {
-					return err
-				}
-				continue
-			}
-			if _, err := setAside(e.who, e.p); err != nil {
-				return err
-			}
+		if len(failed) == len(names) {
+			return errors.New(failed[0].Error)
 		}
 		return nil
 	})
+	if res != nil {
+		res.Unremoved = failed
+	}
+	return res, err
+}
+
+// removeFound takes the skill of that name, of those found in the agents,
+// out of each place it is: links taken away, folders set aside.
+func removeFound(found []FoundSkill, name string) error {
+	i := slices.IndexFunc(found, func(f FoundSkill) bool { return f.Name == name })
+	if i < 0 {
+		return fmt.Errorf("no agent has a skill called %s that the library hasn't", name)
+	}
+	f := found[i]
+	type entry struct{ who, p string }
+	var es []entry
+	for _, id := range slices.Concat(f.Agents, f.Copies) {
+		if t := targetByID(id); t != nil && t.Skills != "" {
+			es = append(es, entry{id, filepath.Join(t.Skills, name)})
+		}
+	}
+	if f.Shared != "" {
+		es = append(es, entry{"agents", f.Shared})
+	}
+	if f.Library != "" {
+		es = append(es, entry{"library", f.Library})
+	}
+	// links first, so none is left pointing at a folder already set
+	// aside; an agent reading the very same folder as another has its
+	// entry gone already
+	slices.SortStableFunc(es, func(a, b entry) int {
+		la, lb := linked(a.p), linked(b.p)
+		switch {
+		case la == lb:
+			return 0
+		case la:
+			return -1
+		}
+		return 1
+	})
+	seen := map[string]bool{}
+	for _, e := range es {
+		if seen[e.p] {
+			continue
+		}
+		seen[e.p] = true
+		if _, err := os.Lstat(e.p); errors.Is(err, fs.ErrNotExist) {
+			continue
+		}
+		if linked(e.p) {
+			if err := os.Remove(e.p); err != nil {
+				return err
+			}
+			continue
+		}
+		if _, err := setAside(e.who, e.p); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // ---- files ----------------------------------------------------------------

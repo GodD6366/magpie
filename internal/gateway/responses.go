@@ -481,6 +481,127 @@ func parseResponses(body []byte) (*Request, error) {
 	return r, nil
 }
 
+// toolCallItem is a Responses input item that makes a tool call, and
+// toolResultItem one that answers a call.
+func toolCallItem(t string) bool {
+	switch t {
+	case "function_call", "custom_tool_call", "tool_search_call":
+		return true
+	}
+	return false
+}
+
+func toolResultItem(t string) bool {
+	switch t {
+	case "function_call_output", "custom_tool_call_output", "tool_search_output":
+		return true
+	}
+	return false
+}
+
+// joinToolRuns moves an item that sits inside a run of tool calls and
+// results — after a result of the run and before the last result that
+// answers one of its calls — to the end of that run. An upstream that
+// checks the exchange, on the chat form it turns a relayed request into or
+// on the Responses input itself, reads the run as ended there and refuses
+// it: Volcengine's coding plan answers 400 "An assistant message with
+// 'tool_calls' must be followed by tool messages responding to each
+// 'tool_call_id'", the same refusal pairToolItems mends a missing result
+// for (#1341), and OpenCode Zen/Go answers "No tool output found for tool
+// call <id>". An agent writes an item between one batch's results itself:
+// Codex writes its <image_resize_notice> right after each result that held
+// an image it resized (image_preparation.rs, prepare_response_items), so a
+// batch of two calls has it between their results (#1752, #1822).
+//
+// An item that carries a call_id is part of an exchange and never moves,
+// whatever its type. Before the run's first result, what the model wrote
+// between its own calls (reasoning, its text, a hosted tool's call) is its
+// step and stays; anything else there (a subagent's agent_message, a note)
+// moves as it would between the results. A call opens the run only when a
+// result after it answers it: a call nothing answers is pairToolItems'
+// (#1341), and one answered before it is not waited on. An item between two
+// whole exchanges stays where it is, and a request with nothing inside a
+// run comes back byte for byte.
+func joinToolRuns(body []byte) []byte {
+	if !bytes.Contains(body, []byte(`_call"`)) {
+		return body
+	}
+	var q map[string]json.RawMessage
+	if decodeJSON(body, &q) != nil {
+		return body
+	}
+	var input []json.RawMessage
+	if decodeJSON(q["input"], &input) != nil {
+		return body
+	}
+	type item struct {
+		Type   string `json:"type"`
+		Role   string `json:"role"`
+		CallID string `json:"call_id"`
+	}
+	items := make([]item, len(input))
+	for i, raw := range input {
+		if decodeJSON(raw, &items[i]) != nil {
+			items[i] = item{}
+		}
+	}
+	result := func(it item) bool { return it.CallID != "" && strings.HasSuffix(it.Type, "_output") }
+	// answeredLater[i]: the call at i has a result after it
+	answeredLater := make([]bool, len(input))
+	ahead := map[string]bool{}
+	for i := len(items) - 1; i >= 0; i-- {
+		switch it := items[i]; {
+		case result(it):
+			ahead[it.CallID] = true
+		case it.CallID != "":
+			answeredLater[i] = ahead[it.CallID]
+		}
+	}
+	modelsOwn := func(it item) bool {
+		return it.Type == "reasoning" || it.Type == "message" && it.Role == "assistant" ||
+			strings.HasSuffix(it.Type, "_call")
+	}
+	out := make([]json.RawMessage, 0, len(input))
+	var held []json.RawMessage
+	moved := false
+	// open: calls of the run in progress whose result is still ahead;
+	// answering: a result of the run has come
+	open := map[string]bool{}
+	answering := false
+	for i, raw := range input {
+		it := items[i]
+		switch {
+		case result(it):
+			if open[it.CallID] {
+				delete(open, it.CallID)
+				answering = true
+			}
+		case it.CallID != "":
+			if answeredLater[i] {
+				open[it.CallID] = true
+			}
+		case len(open) > 0 && (answering || !modelsOwn(it)):
+			held, moved = append(held, raw), true
+			continue
+		}
+		out = append(out, raw)
+		if len(open) == 0 {
+			out = append(out, held...)
+			held, answering = nil, false
+		}
+	}
+	out = append(out, held...)
+	if !moved {
+		return body
+	}
+	q["input"], _ = marshalPlain(out)
+	encoded, err := marshalPlain(q)
+	if err != nil {
+		return body
+	}
+	return encoded
+}
+
 // orphanedToolOutputs turns a tool result with no call ID into a user message.
 // Codex uses standalone outputs for cross-thread notifications. Backends
 // requiring paired outputs still need the delivered text, without a fake call ID.
@@ -537,7 +658,7 @@ func orphanedToolOutputs(body []byte) []byte {
 			content = append(content, map[string]any{"type": "input_text", "text": text})
 		}
 		for _, image := range images {
-			content = append(content, map[string]any{"type": "input_image", "image_url": dataURL(image)})
+			content = append(content, map[string]any{"type": "input_image", "detail": "auto", "image_url": dataURL(image)})
 		}
 		if len(content) == 0 {
 			content = append(content, map[string]any{"type": "input_text", "text": "Tool result received."})
@@ -602,12 +723,7 @@ func pairToolItems(body []byte) []byte {
 		}
 	}
 	exchange := func(t string) bool {
-		switch t {
-		case "function_call", "custom_tool_call", "tool_search_call",
-			"function_call_output", "custom_tool_call_output", "tool_search_output":
-			return true
-		}
-		return false
+		return toolCallItem(t) || toolResultItem(t)
 	}
 	out := make([]json.RawMessage, 0, len(input)+1)
 	var synthetic []json.RawMessage // results owed by the run in progress
@@ -693,18 +809,19 @@ func replaysReasoning(model, host string) bool {
 }
 
 // withReasoningText gives each reasoning item in a Responses request that
-// carries no reasoning_text its summary as one, else noReasoning, and each
-// tool call a step made with no reasoning item one holding noReasoning, for
-// an upstream that wants the reasoning back (replaysReasoning). Codex sends
-// an item back as it got it: one from a turn magpie translated has only a
+// carries no reasoning_text its summary as one, else noReasoning, and has
+// each step that needs one lead with a reasoning item (reasonFirst), for an
+// upstream that wants the reasoning back (replaysReasoning). Codex sends an
+// item back as it got it: one from a turn magpie translated has only a
 // summary, one the ChatGPT backend sealed has only encrypted_content, and a
 // turn another model in a mixed group served may have no reasoning item at
 // all. DeepSeek refuses the whole request over any of them, and over an
 // empty reasoning_text, with "The `reasoning_text` in the thinking mode must
-// be passed back to the API" (#1104, #1592). A body with nothing to give
-// comes back byte for byte.
+// be passed back to the API" (#1104, #1592, #1822). A body with nothing to
+// give comes back byte for byte.
 func withReasoningText(body []byte) []byte {
-	if !bytes.Contains(body, []byte(`"reasoning"`)) && !bytes.Contains(body, []byte(`_call"`)) {
+	if !bytes.Contains(body, []byte(`"reasoning"`)) && !bytes.Contains(body, []byte(`_call"`)) &&
+		!bytes.Contains(body, []byte(`_output"`)) {
 		return body
 	}
 	var q map[string]json.RawMessage
@@ -716,11 +833,8 @@ func withReasoningText(body []byte) []byte {
 		return body
 	}
 	changed := false
-	// thought: the step the model is on (since the last user message or
-	// tool output) has a reasoning item
-	thought := false
-	out := make([]json.RawMessage, 0, len(items))
-	for _, raw := range items {
+	kinds := make([]stepKind, len(items))
+	for i, raw := range items {
 		var it struct {
 			Type    string  `json:"type"`
 			Role    string  `json:"role"`
@@ -728,25 +842,11 @@ func withReasoningText(body []byte) []byte {
 			Content []rText `json:"content"`
 		}
 		if decodeJSON(raw, &it) != nil {
-			out = append(out, raw)
 			continue
 		}
-		switch {
-		case it.Type == "reasoning":
-			thought = true
-		case it.Type == "function_call", it.Type == "custom_tool_call":
-			if !thought {
-				r, _ := json.Marshal(map[string]any{"type": "reasoning", "summary": []any{},
-					"content": []map[string]string{{"type": "reasoning_text", "text": noReasoning}}})
-				out = append(out, r)
-				thought, changed = true, true
-			}
-		case strings.HasSuffix(it.Type, "_output"), it.Type == "message" && it.Role != "assistant", it.Type == "" && it.Role != "" && it.Role != "assistant":
-			thought = false
-		}
+		kinds[i] = stepKindOf(it.Type, it.Role)
 		if it.Type != "reasoning" ||
 			slices.ContainsFunc(it.Content, func(c rText) bool { return c.Type == "reasoning_text" && c.Text != "" }) {
-			out = append(out, raw)
 			continue
 		}
 		var b strings.Builder
@@ -758,24 +858,127 @@ func withReasoningText(body []byte) []byte {
 		}
 		var m map[string]json.RawMessage
 		if decodeJSON(raw, &m) != nil {
-			out = append(out, raw)
 			continue
 		}
 		m["content"], _ = json.Marshal([]map[string]string{{"type": "reasoning_text", "text": b.String()}})
 		if nb, err := json.Marshal(m); err == nil {
-			raw, changed = nb, true
+			items[i], changed = nb, true
 		}
-		out = append(out, raw)
+	}
+	none, _ := json.Marshal(noReasoningItem())
+	if led, ok := reasonFirst(items, kinds, json.RawMessage(none)); ok {
+		items, changed = led, true
 	}
 	if !changed {
 		return body
 	}
-	q["input"], _ = json.Marshal(out)
+	q["input"], _ = json.Marshal(items)
 	nb, err := json.Marshal(q)
 	if err != nil {
 		return body
 	}
 	return nb
+}
+
+// stepKind is what a Responses input item is to a step of the model's: its
+// reasoning, something it said or a call it made, what answered a call, or
+// a message of the user's (or the system's) that starts a turn.
+type stepKind int
+
+const (
+	stepOther stepKind = iota
+	stepReasoning
+	stepSaid
+	stepCall
+	stepOutput
+	stepTurn
+)
+
+func stepKindOf(typ, role string) stepKind {
+	switch {
+	case typ == "reasoning":
+		return stepReasoning
+	case strings.HasSuffix(typ, "_output"):
+		return stepOutput
+	case strings.HasSuffix(typ, "_call"):
+		return stepCall
+	case (typ == "message" || typ == "") && role == "assistant":
+		return stepSaid
+	case typ == "message" || typ == "" && role != "":
+		return stepTurn
+	}
+	return stepOther
+}
+
+// noReasoningItem is the reasoning item a step leads with when it has none
+// of its own (reasonFirst).
+func noReasoningItem() map[string]any {
+	return map[string]any{"type": "reasoning", "summary": []any{},
+		"content": []map[string]any{{"type": "reasoning_text", "text": noReasoning}}}
+}
+
+// reasonFirst has each step of the model's (a run of its reasoning, what it
+// said and the calls it made, between a user message or a tool output and
+// the next) that makes a call, or that follows a tool output, lead with a
+// reasoning item: the step's first one moved ahead of the rest, else none.
+// DeepSeek's /v1/responses reads a step as one assistant message whose
+// thinking is the reasoning item it starts with, and turns the whole
+// request away ("The `reasoning_text` in the thinking mode must be passed
+// back to the API") when a step of the turn being continued starts with
+// anything else: a call (#1592), or what the model said, as Codex sends a
+// step that said something before its call with its reasoning between them,
+// or with none, which magpie put between them (#1822). Checked against
+// api.deepseek.com on 2026-10-12: [text, reasoning, call] and [output,
+// text] are refused, [reasoning, text, call] and [output, reasoning, text]
+// are taken. ok is false, and items comes back as it is, when every such
+// step leads with one already.
+func reasonFirst[T any](items []T, kinds []stepKind, none T) (led []T, ok bool) {
+	step := func(k stepKind) bool { return k == stepReasoning || k == stepSaid || k == stepCall }
+	afterOutput := false
+	for i := 0; i < len(items); {
+		if !step(kinds[i]) {
+			switch kinds[i] {
+			case stepOutput:
+				afterOutput = true
+			case stepTurn:
+				afterOutput = false
+			}
+			if ok {
+				led = append(led, items[i])
+			}
+			i++
+			continue
+		}
+		j, calls, first := i, false, -1
+		for ; j < len(items) && step(kinds[j]); j++ {
+			calls = calls || kinds[j] == stepCall
+			if kinds[j] == stepReasoning && first < 0 {
+				first = j
+			}
+		}
+		if (calls || afterOutput) && first != i {
+			if !ok {
+				led, ok = append(make([]T, 0, len(items)+1), items[:i]...), true
+			}
+			if first < 0 {
+				led = append(led, none)
+			} else {
+				led = append(led, items[first])
+			}
+			for x := i; x < j; x++ {
+				if x != first {
+					led = append(led, items[x])
+				}
+			}
+		} else if ok {
+			led = append(led, items[i:j]...)
+		}
+		i = j
+	}
+	if !ok {
+		return items, false
+	}
+	return led, true
 }
 
 // sealedReasoning is a reasoning item a Responses API sealed, fit to go
@@ -803,8 +1006,6 @@ func buildResponses(r *Request, model, host string, rejectTemp bool) []byte {
 	replay := replaysReasoning(model, host)
 	var input []any
 	for _, m := range r.Messages {
-		// thought: this assistant turn has sent a reasoning item
-		thought := false
 		var content []map[string]any
 		flushMsg := func() {
 			if len(content) == 0 {
@@ -832,7 +1033,7 @@ func buildResponses(r *Request, model, host string, rejectTemp bool) []byte {
 				content = append(content, map[string]any{"type": t, "text": attachmentText(p)})
 			case Image:
 				if m.Role != "assistant" {
-					content = append(content, map[string]any{"type": "input_image", "image_url": dataURL(p)})
+					content = append(content, map[string]any{"type": "input_image", "detail": "auto", "image_url": dataURL(p)})
 				}
 			case Thinking:
 				if !replay && sealedReasoning(p) {
@@ -844,18 +1045,9 @@ func buildResponses(r *Request, model, host string, rejectTemp bool) []byte {
 					flushMsg()
 					input = append(input, map[string]any{"type": "reasoning", "summary": []any{},
 						"content": []map[string]any{{"type": "reasoning_text", "text": p.Text}}})
-					thought = true
 				}
 			case ToolCall:
 				flushMsg()
-				if replay && !thought {
-					// a call with no thinking (another model's turn, or
-					// reasoning sealed by the ChatGPT backend), which
-					// DeepSeek turns the whole request away for (#1592)
-					input = append(input, map[string]any{"type": "reasoning", "summary": []any{},
-						"content": []map[string]any{{"type": "reasoning_text", "text": noReasoning}}})
-					thought = true
-				}
 				id := p.ID
 				if id == "" {
 					id = "call_" + newID()
@@ -875,7 +1067,7 @@ func buildResponses(r *Request, model, host string, rejectTemp bool) []byte {
 						items = append(items, map[string]any{"type": "input_text", "text": p.Text})
 					}
 					for _, im := range p.Images {
-						items = append(items, map[string]any{"type": "input_image", "image_url": dataURL(im)})
+						items = append(items, map[string]any{"type": "input_image", "detail": "auto", "image_url": dataURL(im)})
 					}
 					output = items
 				}
@@ -883,6 +1075,26 @@ func buildResponses(r *Request, model, host string, rejectTemp bool) []byte {
 			}
 		}
 		flushMsg()
+	}
+	if replay {
+		// each step that makes a call, or follows a tool output, leads with
+		// its reasoning, or with a space's (#1592, #1822)
+		kinds := make([]stepKind, len(input))
+		for i, it := range input {
+			var k struct {
+				Type string `json:"type"`
+				Role string `json:"role"`
+			}
+			switch v := it.(type) {
+			case map[string]any:
+				k.Type, _ = v["type"].(string)
+				k.Role, _ = v["role"].(string)
+			case json.RawMessage:
+				decodeJSON(v, &k)
+			}
+			kinds[i] = stepKindOf(k.Type, k.Role)
+		}
+		input, _ = reasonFirst(input, kinds, any(noReasoningItem()))
 	}
 	if input == nil {
 		input = []any{}

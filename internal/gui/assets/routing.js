@@ -149,7 +149,27 @@
   const actHead = el("div", "row-head"), actNote = el("span", "note");
   const acts = el("div", "list rt-acts");
   const actLabel = el("span", "label");
-  actHead.append(actLabel, el("span", "grow"), actNote);
+  // the accounts' allowances read again, by hand only (#1834): an asked
+  // read, as the Usage page's Refresh now is, never on a timer; it turns
+  // while the read is on its way, and the windows each account shows
+  // (winsOf) are drawn again from what comes back
+  const actRead = el("button", "rt-read");
+  actRead.type = "button";
+  actRead.id = "rtReadAllowances";
+  actRead.hidden = true;
+  actRead.innerHTML = '<svg viewBox="0 0 16 16" width="12" height="12" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M13.5 8a5.5 5.5 0 1 1-1.6-3.9M13.5 2.5v3h-3"/></svg>';
+  actRead.onclick = async () => {
+    if (actRead.classList.contains("busy")) return;
+    actRead.classList.add("busy");
+    actRead.setAttribute("aria-busy", "true");
+    try { await loadQuotas(true); } finally {
+      actRead.classList.remove("busy");
+      actRead.removeAttribute("aria-busy");
+      steady(() => renderActs(listed()));
+      render();
+    }
+  };
+  actHead.append(actLabel, actRead, el("span", "grow"), actNote);
   const hist = el("div", "rt-cols");
   const colA = el("div", "rt-col"), colB = el("div", "rt-col");
   const filters = el("div", "rt-filters");
@@ -240,10 +260,15 @@
   }
   const took = (ms = 0) => ms < 1000 ? t("{n} ms", { n: ms }) : t("{n} s", { n: (ms / 1000).toFixed(ms < 10e3 ? 1 : 0) });
   // (the formats made once: made for each call, they were much of what the
-  // accounts' countdowns cost)
-  const HM = new Intl.DateTimeFormat([], { hour: "2-digit", minute: "2-digit" }), WD = new Intl.DateTimeFormat([], { weekday: "short" });
+  // accounts' countdowns cost), made again when the GUI's language changes
+  let fmtLang = null, HM, WD;
   function clock(s) {
     const d = new Date(s), n = new Date();
+    if (fmtLang !== intlLang()) {
+      fmtLang = intlLang();
+      HM = new Intl.DateTimeFormat(fmtLang, { hour: "2-digit", minute: "2-digit" });
+      WD = new Intl.DateTimeFormat(fmtLang, { weekday: "short" });
+    }
     const hm = HM.format(d);
     return d.toDateString() === n.toDateString() ? hm : WD.format(d) + " " + hm;
   }
@@ -261,17 +286,19 @@
   // (usage.DecodeOf, John on Discord: Kimi Code at 2,237 tok/s): its
   // content came in under a quarter of its window (flow), or its answer
   // at over 20 times the pace its reasoning came before its first text.
-  function decodeOf(r, ms, ttft, firstText, flow = r.flow) {
-    const think = reasoningOf(r), n = think > 0 ? r.out - think : r.out, from = think > 0 ? firstText : ttft;
+  function decodeOf(r, ms, ttft, firstText, flow = r.flow, firstReasoning = r.firstReasoning, reasoningHidden = r.reasoningHidden) {
+    if (reasoningHidden && !(firstText > 0)) return null;
+    const think = reasoningOf(r), visible = think > 0 && !(firstText > 0) && firstReasoning >= ttft && flow > 0 && think <= r.out;
+    const n = think > 0 && !visible ? r.out - think : r.out, from = visible ? firstReasoning : think > 0 ? firstText : ttft;
     const w = ms - from;
     if (!(n > 0 && ttft > 0 && from > 0 && w >= 100 && n * 1000 <= 10000 * w)) return null;
     if (flow > 0 && flow * 4 < w) return null;
-    if (think > 0 && n * (firstText - ttft) > 20 * think * w) return null;
+    if (think > 0 && firstText > 0 && n * (firstText - ttft) > 20 * think * w) return null;
     return { n, w };
   }
   const reasoningOf = (r) => r.reasoning ?? (r.usage?.length ? r.usage[r.usage.length - 1].reasoning || 0 : 0);
-  const speedOf = (r, ms = r.ms, ttft = r.ttft, firstText = r.firstText, flow = r.flow) => {
-    const d = decodeOf(r, ms, ttft, firstText, flow);
+  const speedOf = (r, ms = r.ms, ttft = r.ttft, firstText = r.firstText, flow = r.flow, firstReasoning = r.firstReasoning, reasoningHidden = r.reasoningHidden) => {
+    const d = decodeOf(r, ms, ttft, firstText, flow, firstReasoning, reasoningHidden);
     return d ? d.n / (d.w / 1000) : 0;
   };
   function promptOf(r) {
@@ -317,7 +344,7 @@
       cache: ["cache-hit", "Cache", prompt ? pct(100 * read / prompt) : "—",
         t("Cache hit rate") + ": " + t("The share of the prompt read from the cache")],
       speed: ["speed", "Speed", speed ? t("{n} tok/s", { n: Math.round(speed) }) : "—",
-        t("Output tokens a second after the first, over the streamed replies") + ". " + t("A reply that reasoned counts only its answer, from its first text: the reasoning was written before the stream showed it")],
+        t("Output tokens a second after the first, over the streamed replies") + ". " + t("A reply that reasoned counts only its answer, from its first text: the reasoning was written before the stream showed it") + ". " + t("No answer text: speed includes reasoning only when visible reasoning streamed; hidden reasoning has no speed")],
       cost: ["cost", "Cost", routeCost(r), r.priced ? costNote() : t("No known price or token counts for this request")],
     };
     return visibleMetrics.map((key) => values[key]).filter((metric) => metric[2] !== "—");
@@ -333,7 +360,7 @@
   function firstNote(r, tr) {
     let s = tr.ttft ? " · " + t("first token in {ms}", { ms: took(tr.ttft) }) : "";
     if (tr.ttft && tr.firstText > tr.ttft) s += " · " + t("first text in {ms}", { ms: took(tr.firstText) });
-    const v = speedOf(r, tr.ms, tr.ttft, tr.firstText, tr.flow);
+    const v = speedOf(r, tr.ms, tr.ttft, tr.firstText, tr.flow, tr.firstReasoning || 0, tr.reasoningHidden || false);
     if (v) s += " · " + t("{n} tok/s", { n: Math.round(v) });
     const { prompt, read } = promptOf(r);
     if (prompt) s += " · " + t("request cache hit rate {p}", { p: pct(100 * read / prompt) });
@@ -348,7 +375,7 @@
   // (WorkBuddy's credits, #659): "355 / 500 credits · 71% used"
   const quota = (w, used, left, vars) => (w.limit > 0 ? quotaCount(w) + " · " : "") + t(quotaLeft ? left : used, { n: pct(share(w)), ...vars });
   const fill = (w) => Math.max(0, Math.min(100, share(w))) + "%";
-  const FAIL = { rate: "rate limited", credit: "out of credit", quota: "quota used up", other: "failed", auth: "sign-in required", canceled: "canceled", foreign: "another account's reasoning", floor: "reply too short", verify: "needs verification", refused: "refused (safety filter)", shape: "request not understood", proxy: "proxy not reachable", effort: "reasoning effort not in its plan", overflow: "too long for its model", slow: "slow to start", prompt: "agent's prompt turned away" };
+  const FAIL = { rate: "rate limited", credit: "out of credit", quota: "quota used up", other: "failed", auth: "sign-in required", canceled: "canceled", foreign: "another account's reasoning", floor: "reply too short", verify: "needs verification", refused: "refused (safety filter)", shape: "request not understood", proxy: "proxy not reachable", effort: "reasoning effort not in its plan", overflow: "too long for its model", slow: "slow to start", prompt: "agent's prompt turned away", restricted: "account restricted by the vendor" };
   const failWord = (why) => t(FAIL[why] || "failed");
   // a try that answered: one whose reply broke off after it began (its 200
   // sent, then the vendor's error, #733) didn't, and has a fail
@@ -382,6 +409,9 @@
   // or the user set the account or key to serve other models only (#474)
   // or it is held at the usage cap the user set on the account
   const unlistedWord = (w) => w.held ? t("not an account the gateway key may use") : w.noCredits ? t("held: its allowance used up, set not to spend credits") : w.capped ? t("held at its {cap}% usage cap", { cap: w.capped }) : w.barred ? t("set to serve other models, not {model}", { model: w.model }) : w.kind === "key" ? t("{name}'s list for this key has no {model}", { name: w.name, model: w.model }) : t("its plan doesn't list {model}", { model: w.model });
+  // noURLWord: its keys are all set to a protocol its provider has no URL
+  // for, so it went out on the URLs it has (#1702)
+  const noURLWord = (w) => t("key set to {api} only, no {api} URL · sent on the others", { api: API[w.noURL] || w.noURL });
   const group = (w) => w.used >= 98 ? "spent" : w.used >= 90 ? "low" : "fine";
   const renews = (w) => (w.renews || []).map((s) => known0(s) ? at(s) : 0);
   // usedRenews is when the window w.used is the share of renews: a row
@@ -427,6 +457,9 @@
       case "resets": return t("It rests until {time}, when the vendor says the limit resets", { time });
       case "quota": return t("It rests 15 minutes: out of quota, with no word of when it resets");
       case "verify": return t("The vendor wants the account verified first: it rests half an hour, or until you say it's verified");
+      // the vendor restricted the account itself (#1849): only its lifting,
+      // which the vendor's appeal asks for, brings it back
+      case "restricted": return t("The vendor restricted the account: it rests {d}, as only the vendor lifting the restriction brings it back. Appeal with the vendor; once it's lifted, try it again here", { d });
       case "backoff": return rest.why === "rate"
         ? t("It was rate limited again as soon as it was back ({n} times in a row): it rests {d}, longer each time until it answers", { n: rest.failures, d })
         : rest.failures > 1
@@ -664,6 +697,9 @@
     if (!c) return x?.pick ? t("Turn {turn} reasons at {level}, as the classifier picked when it began.", { turn: x.turn, level: x.pick }) : null;
     const r = { rule: x };
     const by = c.by || t("the classifier"), kinds = (c.intents || []).map((x) => `“${x}”`).join(", ");
+    // it couldn't say, and the turn keeps the intent the turn before had
+    // (#1826), rather than going with none
+    if (c.error && c.fallback === "previous" && c.intent) return t("{by} was to tell which of {kinds} turn {turn} is, but couldn't — {err} — so the turn keeps “{intent}”, as turn {prev} was.", { by, kinds, turn: r.rule.turn, err: c.error, intent: c.intent, prev: r.rule.turn - 1 });
     if (c.error) return c.intents?.length
       ? t("{by} was to tell which of {kinds} turn {turn} is, but couldn't — {err} — so no rule with an intent matches it.", { by, kinds, turn: r.rule.turn, err: c.error })
       : t("{by} was to rate how hard turn {turn} is, but couldn't — {err} — so it reasons as the agent asked.", { by, turn: r.rule.turn, err: c.error });
@@ -682,7 +718,7 @@
   function condText(c) {
     let m;
     if ((m = /^intent "(.*)"$/.exec(c))) return t("asks for “{intent}”", { intent: m[1].replace(/\\"/g, '"').replace(/\\\\/g, "\\") });
-    if ((m = /^tokens ≥ (\d+)$/.exec(c))) return t("≥ {n} tokens", { n: Number(m[1]).toLocaleString() });
+    if ((m = /^tokens ≥ (\d+)$/.exec(c))) return t("≥ {n} tokens", { n: Number(m[1]).toLocaleString(intlLang()) });
     if (c === "images") return t("has an image");
     if (c === "reasoning") return t("reasoning on");
     if (c === "compacting") return t("compacting");
@@ -768,7 +804,10 @@
   // what it adds to Antigravity's 429 for Claude Code's and the Agent SDK's
   // system prompt (antigravityTurnedAwayHint, #666, #1425)
   const AG_TURNED_AWAY = "Antigravity answers this 429 to the system prompt of Claude Code and the Claude Agent SDK (Claude Desktop's chats) whatever quota is left, so it is not a quota and waiting won't help; use another provider for these chats, or put one after Antigravity in a routing group";
-  const HINTS = [WB_REFUSED, BLOCKED, ZCODE_BLOCKED, AG_TURNED_AWAY];
+  // what it adds to WorkBuddy's 403 11140 for an account it restricted
+  // (provider.WBRestrictedHint, #1849)
+  const WB_RESTRICTED = "WorkBuddy restricted this account for unusual activity; it stays out until WorkBuddy lifts that, which an appeal (Submit feedback in WorkBuddy) asks for";
+  const HINTS = [WB_REFUSED, BLOCKED, ZCODE_BLOCKED, AG_TURNED_AWAY, WB_RESTRICTED];
 
   function trySaid(r, i) {
     const tr = r.tries[i], w = tried(r, tr), agent = agentName(r.agent);
@@ -832,6 +871,11 @@
       return r.tries[i + 1]
         ? t("{who}: the proxy magpie goes through didn't take the connection, so the request never reached the vendor and goes on to the next. Nothing is wrong with {who}, so it doesn't rest: once the proxy is up it is asked first again.", { who: name })
         : t("{who}: the proxy magpie goes through didn't take the connection, so the request never reached the vendor, and nobody is left to try: {agent} gets the error. Start the proxy, or change it in Settings.", { who: name, agent });
+    // the agent left while magpie waited to ask again (#1894): the
+    // story ends there, not on a retry that never came
+    if (tr.gone)
+      return t("{who} answered {status} · {fail}, and was to be asked again in {d}, but {agent} canceled the request before then, so nobody is asked again.",
+        { who: name, status: tr.status, fail: failWord(tr.fail), d: took(tr.again), agent });
     if (tr.replan)
       return t("{who} answered {status} · {fail}, and every member had failed with an error that may pass, so after {d} the {n} of them are asked again, in turn, before any of the reply reaches {agent}. The group waits up to {p} for one to answer.",
         { who: name, status: tr.status, fail: failWord(tr.fail), d: took(tr.again), n: tr.replan, p: took((tr.patience || 0) * 1000), agent });
@@ -892,6 +936,14 @@
   const src = () => rp ? rp.routes : routes; // the routes the stage plays from
   const LINGER = 12e3;      // how long an agent's last request stays on the stage
   let gen = 0, trips = [], waiters = [];
+  // a dot let go at an account waits there while it answers: it stays at
+  // the end of the wire to it as the stage is laid out again, the window
+  // resized or the view coming back narrow then wide (#1859: posed once,
+  // it stayed where the account had been)
+  const holds = new Map(); // packet → the row it waits at
+  function holdAll() {
+    for (const [dot, row] of holds) pose({ dot, legs: wiresTo(row).map((p) => ({ p })) }, 1);
+  }
   let capQ = [], capAt = -1e9, capLo = false, flipUntil = 0;
 
   // fly carries a dot along paths one after another, as one flight — and
@@ -996,6 +1048,7 @@
       const up = f?.open ? f : row.up && subs.get(row.up), a = b(row.li);
       row.wire.setAttribute("d", up ? fromSub(up, a) : fromHub(a));
     }
+    holdAll();
   }
 
   // rankOf is an account's or key's place in its provider's own list, the
@@ -1075,12 +1128,15 @@
   // hueOf is the colour an agent's requests and answers fly in, and it is
   // marked with: its maker's own where it has one, else one of the rest
   // picked by its id, so it stays the same from one request to the next.
+  // None is red: red on this page is a failure, and an agent marked in it
+  // read as one (zhouatie on X: "openai" drew rose, its dot and wire red).
+  // routing-agent-hue-not-red.test.cjs holds every colour here away from it.
   const HUES = {
     claude: "#d97757", codex: "#6366f1", gemini: "#0ea5e9", copilot: "#a855f7", cursor: "#14b8a6", opencode: "#eab308",
-    crush: "#ec4899", goose: "#84cc16", pi: "#10b981", omp: "#f43f5e", omo: "#7c3aed", dsh: "#06b6d4", commandcode: "#f97316",
-    mimocode: "#3b82f6",
+    crush: "#ec4899", goose: "#84cc16", pi: "#10b981", omp: "#d946ef", omo: "#7c3aed", dsh: "#06b6d4", commandcode: "#f97316",
+    mimocode: "#3b82f6", deveco: "#3c99cc",
   };
-  const SPARE = ["#8b5cf6", "#22c55e", "#e11d48", "#0891b2", "#ca8a04", "#db2777", "#2563eb", "#65a30d"];
+  const SPARE = ["#8b5cf6", "#22c55e", "#0d9488", "#0891b2", "#ca8a04", "#db2777", "#2563eb", "#65a30d"];
   function hueOf(id) {
     if (HUES[id]) return HUES[id];
     let h = 0;
@@ -1459,6 +1515,7 @@
       else if (trying.has(id)) s = r.id !== cur.id && agents.size <= 1 ? t("answering another request…") : t("answering…");
       else if (answered.has(id)) s = agents.size > 1 ? t("answered {agent}", { agent: agentName(r.agent) }) : t("answered this request");
       else if (gave.has(id)) s = t("{status} · {fail} · passed to {agent}", { status: gave.get(id).status, fail: failWord(gave.get(id).fail), agent: agentName(r.agent) });
+      else if (w.noURL) s = noURLWord(w);
       else if (w.sunk) s = t("rate limited at {time} · at the back", { time: clock(w.sunk) });
       else if (w.known) {
         const soon = usedRenews(w);
@@ -1471,6 +1528,12 @@
       else if (w.speaks) s = t("{api} only", { api: API[w.speaks] || w.speaks });
       else s = w.kind === "key" ? t("API key") : t("one key");
       if (row.st.textContent !== s) row.st.textContent = s;
+      // an account's windows each, with when they reset, in its tooltip
+      // (#1835): the row says the fullest one while idle and what it is
+      // doing while it answers, and a second line on every seat would
+      // crowd the stage. Live only, as the list's are (winsOf).
+      const tip = [w.id, ...(day ? [] : winsOf(w))].join("\n");
+      if (row.li.title !== tip) row.li.title = tip;
       const bar = w.known;
       row.li.classList.toggle("nobar", !bar);
       row.bi.style.width = bar ? fill(w) : "0";
@@ -1712,13 +1775,31 @@
     const key = JSON.stringify([r.kind, items.map(([s, c, tr]) => [s, c, tr?.model, tr?.served]), r.order.map(logoOf)]);
     if (stepsKey === key) return;
     stepsKey = key;
-    steps.replaceChildren(...items.map(([s, c, tr]) => {
+    // A line that says the same stays the very node it was, and a new line
+    // takes its logo from one going: a logo made afresh loads its picture
+    // again and, in WebKit, blinks out for a frame, and the story is drawn
+    // again on every request that comes in and at each of its steps, so
+    // with an agent at work every logo in it blinked on and off
+    const logos = r.order.map(logoOf);
+    const was = new Map([...steps.children].map((li) => [li.dataset.k, li]));
+    const lis = items.map(([s, c, tr]) => {
+      const k = JSON.stringify([r.kind, s, c, tr?.model, tr?.served, logos]);
+      const old = was.get(k);
+      if (old) { was.delete(k); return { li: old }; }
+      return { k, s, c, tr };
+    });
+    keepIcons(...was.values());
+    replaceKeeping(steps, lis.map((x) => {
+      if (x.li) return x.li;
+      const { k, s, c, tr } = x;
       const li = el("li", c);
+      li.dataset.k = k;
       li.append(...(/^(why|ok|bad|wait|aside)$/.test(c) ? logoed(s, r) : [s]));
       if (c === "aside kind") li.prepend(kindTag(r), " ");
       if (c === "swap") li.prepend(swapTag(tr), " ");
       return li;
     }));
+    keptIcons = null;
   }
 
   // pick sets the stage to a past request, or back to live with the newest.
@@ -1821,6 +1902,19 @@
       : t("{agent} requested a subagent on {model}.", { agent, model: r.model });
     if (purposeOf(r.kind) === "kind:ambient_suggestions") return t("{agent} drafted the suggested prompts on its home page by itself, in the background, searching the project's files and connected apps, and checked them for safety. Not a turn of the conversation; Codex's Settings › Configuration › Suggested prompts turns it off.", { agent });
     if (r.kind === "luna_reserve") return t("{agent} sent this turn on Luna Reserve, which it turns to once the plan's own allowance is used up; it picks the model itself.", { agent });
+    // the searcher asked first failed or found nothing, and this one
+    // searched in its place: say which and why, not just who searched
+    // (Gearclickist on Discord: Grok picked, Codex's model searched)
+    if (r.kind === "web_search" && r.for?.instead) {
+      const f = r.for;
+      const whom = f.mcp ? t("{agent}'s call to magpie's web_search MCP tool", { agent: agentName(f.agent) })
+        : f.model ? t("{agent}'s {model}", { agent: agentName(f.agent), model: f.model })
+        : t("a model that can't search the web by itself");
+      const why = f.notSearched ? t("it answered without searching the web, so its account or plan may not offer web search") : f.nothingFound ? t("its reply named no page it found") : f.why || t("it failed");
+      return f.picked
+        ? t("{failed}, the searcher picked in Settings › Models › Web search, didn't search for {whom}: {why}. So magpie had {searcher}, the next searcher it can use, search in its place. Not a turn of the conversation.", { failed: f.instead, whom, why, searcher: r.model })
+        : t("{failed}, the searcher magpie picked, didn't search for {whom}: {why}. So magpie had {searcher}, the next searcher it can use, search in its place. Not a turn of the conversation.", { failed: f.instead, whom, why, searcher: r.model });
+    }
     // the agent called magpie's web search MCP server itself, for no model
     if (r.kind === "web_search" && r.for?.mcp) return t("{agent} called magpie's web_search MCP tool: {searcher} searched for it. Not a turn of the conversation.", { agent: agentName(r.for.agent), searcher: r.model });
     if (r.kind === "web_search") return r.for
@@ -1841,6 +1935,11 @@
     return t("{agent} made this call itself ({kind}), not as a turn of the conversation, and picks its model itself.", { agent, kind: kindName(r.kind) });
   }
 
+  // how a request that wasn't answered ended: its status and its last
+  // try's failure, or that its agent left in the pause before the next
+  // try (#1894)
+  const endWord = (r, last) => `${r.status} · ${failWord(last.gone ? "canceled" : last.fail)}`;
+
   // who answered a request, or what its agent got
   function outcome(r) {
     if (!r.done) {
@@ -1853,7 +1952,7 @@
     // fail. Bad is a reply that broke off, or every try failing
     if (r.status < 400 && (ok || !r.tries.length)) return [w ? `${who(w)} · ${w.model}` : r.provider, r.tries.length > 1 ? "moved" : "ok", ok];
     const last = r.tries[r.tries.length - 1];
-    return [last ? `${r.status} · ${failWord(last.fail)}` : `${r.status || ""} ${r.error || ""}`.trim(), "bad"];
+    return [last ? endWord(r, last) : `${r.status || ""} ${r.error || ""}`.trim(), "bad"];
   }
 
   // a request's row's title: the way it went, to the one that took it
@@ -1906,7 +2005,7 @@
   const dayName = (d) => {
     const x = new Date(d + "T12:00:00"), n = new Date(), y = new Date(n.getTime() - 864e5);
     return x.toDateString() === n.toDateString() ? t("today") : x.toDateString() === y.toDateString() ? t("yesterday")
-      : x.toLocaleDateString([], { month: "short", day: "numeric", weekday: "short" });
+      : x.toLocaleDateString(intlLang(), { month: "short", day: "numeric", weekday: "short" });
   };
   async function loadDays(d) {
     try {
@@ -2097,7 +2196,7 @@
       if (g.key && visibleMetrics.includes("cache") && total.prompt) meta.push(metricElement(["cache-hit", "Avg. cache", pct(100 * total.read / total.prompt),
         t("Total cache reads divided by total prompt tokens; larger prompts carry more weight") + "\n" + coverage(total.cached)]));
       if (g.key && visibleMetrics.includes("speed") && total.decodeMs) meta.push(metricElement(["speed", "Avg. speed", t("{n} tok/s", { n: Math.round(total.decodeOut * 1000 / total.decodeMs) }),
-        t("Total output tokens divided by total decode time; excludes waiting and replies without usable timing") + ". " + t("A reply that reasoned counts only its answer, from its first text: the reasoning was written before the stream showed it") + "\n" + coverage(total.timed)]));
+        t("Total output tokens divided by total decode time; excludes waiting and replies without usable timing") + ". " + t("A reply that reasoned counts only its answer, from its first text: the reasoning was written before the stream showed it") + ". " + t("No answer text: speed includes reasoning only when visible reasoning streamed; hidden reasoning has no speed") + "\n" + coverage(total.timed)]));
       const metaSig = JSON.stringify([bits, tokenHelp, meta.map((e) => [e.textContent, e.title])]);
       if (x.meta.dataset.sig !== metaSig) { x.meta.replaceChildren(...meta); x.meta.dataset.sig = metaSig; }
       setText(x.cost, total.priced ? "≈" + fmtCost({ cost: total.cost, unpriced: 0 }) + (total.unpriced ? "+" : "") : "");
@@ -2211,7 +2310,7 @@
   }
   function reqRow(r, said, how, tr, ag, meta, metrics, title) {
     const b = el("button", "rt-req " + how);
-    const when = el("span", "at", new Date(r.time).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" }));
+    const when = el("span", "at", new Date(r.time).toLocaleTimeString(intlLang(), { hour: "2-digit", minute: "2-digit", second: "2-digit" }));
     const asked = el("span", "asked");
     const sw = el("i", "ag");
     sw.style.setProperty("--agent", hueOf(r.agent));
@@ -2255,6 +2354,28 @@
     return b;
   }
 
+  // cardOf: the Usage page's reading of a subscription account the stage
+  // or the list shows (#1833): its card by the agent it is signed in to
+  // (a plugin's by its provider) and its user, this computer's own; null
+  // when there is none, or it holds no windows. Nothing is read for it:
+  // the readings are app.js's quotas, as the Usage page has them.
+  function cardOf(w) {
+    if (w.kind !== "account" || !Array.isArray(quotas)) return null;
+    const user = (w.who || "").trim().toLowerCase();
+    const mine = quotas.filter((q) => !q.from && q.kind === "subscription" && (q.provider === w.agent || q.provider === w.provider));
+    const q = mine.find((q) => (q.user || "").trim().toLowerCase() === user) || (mine.length === 1 && !mine[0].user ? mine[0] : null);
+    return q && !q.error && q.windows?.length ? q : null;
+  }
+  // winsOf: each of an account's windows, as the Usage page's card names
+  // it: "5 hours 40% used · resets in 2h"
+  function winsOf(w) {
+    const q = cardOf(w);
+    return q ? (familyWindows(q.windows) || []).map((x) => t(x.name) + " " + quotaText(x)
+      + (x.resetsAt ? " · " + resetInText(new Date(x.resetsAt)) : "")) : [];
+  }
+
+  // when each rest was lifted by hand, by the key it rests by (#1869)
+  const liftedAt = new Map();
   // each account or key the kept requests weighed: how often it was
   // tried, answered and failed in them, and how the latest found it
   function renderActs(rs) {
@@ -2285,9 +2406,19 @@
         if (tr.rest && end >= a.restAt) { a.rest = tr.rest; a.restAt = end; }
       }
     }
+    // a rest lifted by hand since the request that found it (#1869): the
+    // kept requests still say it, until the next one asks it again
+    for (const a of by.values()) if (a.rest?.key && (liftedAt.get(a.rest.key) || 0) >= a.restAt) a.rest = null;
     const list = [...by.values()].sort((x, y) => (x.w.name || "").localeCompare(y.w.name || "") || x.w.provider.localeCompare(y.w.provider) || rankOf(x.w) - rankOf(y.w) || x.pos - y.pos);
     setText(actLabel, t("Accounts and keys"));
     setText(actNote, t("over those requests"));
+    // live, with a subscription account listed: a kept day's were weighed
+    // by readings long gone, and a key has no allowance to read
+    actRead.hidden = !!day || !list.some((a) => a.w.kind === "account");
+    if (actRead.title !== t("Read the accounts' allowances again")) {
+      actRead.title = t("Read the accounts' allowances again");
+      actRead.setAttribute("aria-label", t("Refresh now"));
+    }
     const n = now();
     let prov = "";
     const out = [];
@@ -2327,6 +2458,7 @@
       const resting = a.rest && at(a.rest.until) > n;
       if (resting) { st = `${failWord(a.rest.why)} · ${restWhen(a.rest)}`; cls = "rest"; }
       else if (w.unlisted) { st = unlistedWord(w); cls = "left"; }
+      else if (w.noURL) st = noURLWord(w);
       else if (w.known) {
         const soon = usedRenews(w);
         st = soon && soon <= n ? quota(w, "{n} used at {time}; it has renewed since", "{n} left at {time}; it has renewed since", { time: clock(a.at) })
@@ -2340,7 +2472,18 @@
         el("span", "ok", t("answered {n}", { n: a.ok })),
         ...(fails.length ? [el("span", "bad", fails.join(", "))] : []),
         ...(a.last ? [el("span", "", t("last answered {time}", { time: clock(a.last) }))] : []));
-      row.append(name, el("div", "st " + cls, st), tally);
+      row.append(name, el("div", "st " + cls, st));
+      // a subscription account's windows each, with when they reset, as
+      // the Usage page read them (#1833): the figure above is the one
+      // window routing went by. Live only: a kept day's requests were
+      // weighed by readings long gone.
+      const ws = day ? [] : winsOf(w);
+      if (ws.length) {
+        const line = el("div", "wins");
+        line.append(...ws.map((s) => el("span", "", s)));
+        row.append(line);
+      }
+      row.append(tally);
       // the models it answered, on a line of their own, not wrapped in
       // among the numbers; a provider's one model is already its name
       const mdls = [...a.models].filter((m) => !(w.kind === "provider" && m === w.model));
@@ -2349,14 +2492,20 @@
         ms.append(...mdls.map((m) => el("code", "mdl", m)));
         row.append(ms);
       }
-      if (resting && a.rest.why === "verify") {
-        // the vendor wants the account verified (#152): where, and a way to
-        // stop its rest once it is
+      if (resting && a.rest.key) {
+        // any rest can be lifted by hand (#1869): a quota, a backoff, a
+        // Retry-After, a network blip read as down. It only ends the rest;
+        // the vendor refusing again rests it again as before. The vendor
+        // wants the account verified (#152), or restricted it until an
+        // appeal lifts it (#1849): where, and the way to stop its rest
+        // once it is
         const fix = el("div", "fix"), rest = a.rest;
         if (rest.link) { const b = el("button", "link", t("Verify the account ↗")); b.onclick = () => api("open", { url: rest.link }).catch(() => {}); fix.append(b); }
-        const go = el("button", "link", t("It's verified — try it again"));
+        const go = el("button", "link", t(rest.why === "restricted" ? "The restriction is lifted — try it again"
+          : rest.why === "verify" ? "It's verified — try it again" : "Try now"));
+        if (rest.why !== "restricted" && rest.why !== "verify") go.title = t("Ends the rest: the next request asks it again. Refused again, it rests again.");
         go.onclick = async () => {
-          try { await api("gateway/unrest", { key: rest.key }); rest.until = new Date().toISOString(); render(); } catch (e) { go.textContent = e.message; }
+          try { await api("gateway/unrest", { key: rest.key }); liftedAt.set(rest.key, Date.now()); render(); } catch (e) { go.textContent = e.message; }
         };
         fix.append(go);
         row.append(fix);
@@ -2542,7 +2691,10 @@
         away(carrier);
         carrier = null;
         dot.classList.add("held");
+        holds.set(dot, row);
+        holdAll();
         await until(() => g !== gen || rt().tries[i].done);
+        holds.delete(dot);
         if (g !== gen) break;
         r = rt();
         if (!routes.has(id)) break;
@@ -2571,7 +2723,7 @@
         renderAll();
         dot.classList.add("back", "err");
         back = bird("res");
-        if (!tr.rest && !tr.again) { // that was the answer: the agent gets the error
+        if (!tr.rest && (!tr.again || tr.gone)) { // that was the answer: the agent gets the error, or has gone
           await fly(dot, back, home(row, A), 1350);
           flying.delete(dot);
           away(back);
@@ -2590,6 +2742,7 @@
       away(carrier);
       away(back);
       flying.delete(dot);
+      holds.delete(dot);
       dot.remove();
       if (playing.get(id) === g) playing.delete(id);
       renderAll();
@@ -2605,7 +2758,7 @@
   // stopPlays ends whatever is flying: each play sees its gen gone and
   // clears up after itself
   function stopPlays() {
-    gen++; flying.clear(); playing.clear();
+    gen++; flying.clear(); holds.clear(); playing.clear();
     for (const p of sky.querySelectorAll(".pkt, .rt-flier")) p.remove();
     wake();
   }
@@ -2695,8 +2848,8 @@
   }
   function replayBar(p, fast) {
     const d = new Date(p.real);
-    rClock.textContent = d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false }) + "." + Math.floor(d.getMilliseconds() / 100);
-    const day = d.toDateString() === new Date().toDateString() ? t("today") : d.toLocaleDateString([], { weekday: "short", month: "short", day: "numeric" });
+    rClock.textContent = d.toLocaleTimeString(intlLang(), { hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false }) + "." + Math.floor(d.getMilliseconds() / 100);
+    const day = d.toDateString() === new Date().toDateString() ? t("today") : d.toLocaleDateString(intlLang(), { weekday: "short", month: "short", day: "numeric" });
     setText(rDay, day);
     // a quiet stretch cut short: the clock runs fast through it, whatever
     // the speed picked
@@ -2723,7 +2876,7 @@
       const [said] = outcome(r);
       row.append(el("span", "rp-n", t("request {i} of {n}", { i: g.n, n: p.plan.length })), sw,
         el("b", "", agentName(r.agent)), el("code", "mdl", r.model), ...(r.kind ? [kindTag(r)] : []), el("span", "rp-to", "→ " + said),
-        el("span", "rp-at", t("sent {time}", { time: new Date(r.time).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false }) })));
+        el("span", "rp-at", t("sent {time}", { time: new Date(r.time).toLocaleTimeString(intlLang(), { hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false }) })));
       row.onclick = () => { cur = r; renderLog(); };
       return row;
     }) : [el("span", "rp-wait", t("starting…"))]));
@@ -2947,6 +3100,16 @@
         } else {
           if (cur && routes.has(cur.id) && !rp) cur = routes.get(cur.id);
           if (pinned && routes.has(pinned.id)) pinned = routes.get(pinned.id);
+          // a request picked (in the list, or the tray panel's row that
+          // opened the window) goes back to live once it has left the list,
+          // as a filter that leaves it out does: the stage stayed on one
+          // provider's request for hours while every request since went to
+          // another (#1389, Creat55)
+          else if (pinned && !day) {
+            pinned = null;
+            cur = newest();
+            if (cur) { sync(true); say(affWhy(cur, true) || ruleWhy(cur, true) || firstWhy(cur)); }
+          }
           if (!pinned && !rp) {
             cur = newest();
             if (cur) sync();
@@ -3007,7 +3170,7 @@
   // a group may also be routed by hand: every request to the member the
   // user picks on its card (provider.Manual, #317) — a provider's keys can't
   const GROUP_ROUTE_OPTS = [...ROUTE_OPTS, ["manual", "Manual"]];
-  const AFF_OPTS = [["", "Auto"], ["session", "Session"], ["turn", "Within a turn"], ["off", "Off"]];
+  const AFF_OPTS = [["", "Auto"], ["session", "Session"], ["turn", "Within a turn"], ["off", "Off"], ["strict", "Strict"]];
   // what one rate limited with quota left does then (provider.Sink), as in
   // a provider's editor (app.js SINKS)
   const SINK_OPTS = [["", "Keeps its place"], ["sink", "Goes to the back"]];
@@ -3038,6 +3201,7 @@
     session: "A conversation stays with the account or key that answered it for the whole session, while it can answer.",
     turn: "A conversation stays put within a turn, while the agent sends tool results back; when you speak again, routing decides afresh.",
     off: "Every request is routed afresh, whoever answered its conversation before.",
+    strict: "A conversation stays with the account or key that answered it and never moves to another, even past its usage cap: when that one is rate limited or out of quota, the error goes to the agent. New conversations are routed as usual.",
   };
   const GROUP_HINT = {
     "": "Smart, over the members' accounts and keys together: of the subscriptions with quota to spare, the one whose allowance renews soonest goes first — the week decides, and an account with five hours and no week (Claude Enterprise) goes by its five hours, so ahead of every week renewing later; one resting after a failure goes last.",
@@ -3055,7 +3219,7 @@
   // what a rule matches, in words
   function ruleText(r) {
     const bits = [];
-    if (r.tokens) bits.push(t("≥ {n} tokens", { n: r.tokens.toLocaleString() }));
+    if (r.tokens) bits.push(t("≥ {n} tokens", { n: r.tokens.toLocaleString(intlLang()) }));
     if (r.images) bits.push(t("has an image"));
     if (r.effort) bits.push(r.effort === "on" ? t("reasoning on") : t("reasoning ≥ {level}", { level: r.effort }));
     if (r.agents?.length) bits.push(r.agents.map((id) => (state.clients || state.agents || []).find((a) => a.id === id)?.name || id).join(" / "));
@@ -4153,10 +4317,10 @@
       ctxIn.setAttribute("aria-invalid", String(!!ctxErr));
       const big = ns.length ? Math.max(...ns) : 0, small = ns.length ? Math.min(...ns) : 0;
       ctxHint.textContent = ctxErr || (mode === "custom"
-        ? t("Agents are told the group takes {n} tokens; a longer conversation still goes on to a member with room for it.", { n: (d.context || 0).toLocaleString() })
+        ? t("Agents are told the group takes {n} tokens; a longer conversation still goes on to a member with room for it.", { n: (d.context || 0).toLocaleString(intlLang()) })
         : mode === "smallest"
-          ? (small ? t("Agents are told {n} tokens, its smallest model's, so they compact before any member would turn the conversation away.", { n: small.toLocaleString() }) : t("Agents are told its smallest model's window, so they compact before any member would turn the conversation away."))
-          : (big ? t("Agents are told {n} tokens, its largest model's; a conversation too long for one member goes on to one with room for it.", { n: big.toLocaleString() }) : t("Agents are told its largest model's window; a conversation too long for one member goes on to one with room for it.")));
+          ? (small ? t("Agents are told {n} tokens, its smallest model's, so they compact before any member would turn the conversation away.", { n: small.toLocaleString(intlLang()) }) : t("Agents are told its smallest model's window, so they compact before any member would turn the conversation away."))
+          : (big ? t("Agents are told {n} tokens, its largest model's; a conversation too long for one member goes on to one with room for it.", { n: big.toLocaleString(intlLang()) }) : t("Agents are told its largest model's window; a conversation too long for one member goes on to one with room for it.")));
     };
     const CTX_OPTS = [["largest", "Largest model's"], ["smallest", "Smallest model's"], ["custom", "Custom"]];
     ctxW.append(segs(CTX_OPTS.map(([id, n]) => [id, t(n)]), ctxMode(), (v) => {
@@ -4333,9 +4497,9 @@
           const m = infoOf(r.use), bits = [];
           if (r.pause) bits.push(t("left out of the group then: not tried, not a fallback"));
           if (!r.pause && r.images && m && m.ready && !m.images) bits.push(t("it doesn't take images"));
-          if (!r.pause && r.tokens && m?.context && m.context < r.tokens) bits.push(t("it takes {n} tokens", { n: m.context.toLocaleString() }));
+          if (!r.pause && r.tokens && m?.context && m.context < r.tokens) bits.push(t("it takes {n} tokens", { n: m.context.toLocaleString(intlLang()) }));
           // a summary longer than it takes goes by the next rule, or the group
-          if (!r.pause && r.compact && m?.context && d.members.some((id) => (infoOf(id)?.context || 0) > m.context)) bits.push(t("longer conversations skip it: it takes {n} tokens", { n: m.context.toLocaleString() }));
+          if (!r.pause && r.compact && m?.context && d.members.some((id) => (infoOf(id)?.context || 0) > m.context)) bits.push(t("longer conversations skip it: it takes {n} tokens", { n: m.context.toLocaleString(intlLang()) }));
           const from = clockOf(r.time?.from), to = clockOf(r.time?.to);
           if (from && to && to < from) bits.push(t("runs past midnight, into the next day"));
           hint.textContent = bits.join(" · ");
@@ -4390,6 +4554,16 @@
     cw.append(cls);
     const deciders = groups.deciders || [];
     const isJev = (id) => deciders.some((x) => x.id === id);
+    // the subscription a classifier asks as every turn begins, by its
+    // model's name and provider: the model's own, or a group's first
+    // member's (the one asked first); "" when it is none
+    const classifierSub = (m, sg) => {
+      if (sg) {
+        const first = sg.members?.[0] || "";
+        m = groups.models.find((x) => x.id === first || first.startsWith(x.id + ":"));
+      }
+      return m?.sub ? `${m.name || m.id} · ${m.providerName}` : "";
+    };
     const drawClassifier = () => {
       const auto = d.effort === "auto";
       const intents = d.rules.some((r) => r.intent?.trim() || (r === asking && d.rules.includes(r)));
@@ -4421,6 +4595,16 @@
           : auto
           ? "As a turn begins, this model is asked which of the intents the message is and how hard the turn is, each once; a small, fast one without reasoning is best. If it can't say, no intent matches and the turn reasons as the agent asked. Its calls show in the usage as magpie’s own."
           : "As a turn begins, this model is asked which of the intents the message is — once; a small, fast one without reasoning is best. If it fails or can't say, no intent matches. Its calls show in the usage as magpie’s own.")));
+      // a subscription asked as every turn begins spends its allowance
+      // on it, beside the agent's own requests (#1839): said beside the
+      // pick, once for a model, for a group when the one it asks first is
+      const subWarn = classifierSub(m, sg);
+      if (subWarn) {
+        const two = auto && intents && !isJev(d.classifier);
+        cls.append(el("div", "hint rt-cls-sub", t(two
+          ? "Every turn starts with two requests to {name}, a subscription: they count against its allowance as the agent's own do. A free model or one on an API key leaves the subscription to the agents."
+          : "Every turn starts with a request to {name}, a subscription: it counts against its allowance as the agent's own do. A free model or one on an API key leaves the subscription to the agents.", { name: subWarn })));
+      }
       // picking the effort alone, the classifier can pick the model too
       if (!intents && d.members.length > 1) {
         const more = el("button", "text rt-cls-more", t("It can pick the model too: add a rule with an intent"));
@@ -4662,11 +4846,15 @@
 
   // ---- the stage: agents → magpie → providers ----
   // Three a side at most, each kept where it is while it stays: one that
-  // comes takes the place of the one heard of longest ago. A request plays
-  // as a dot in its agent's colour: to magpie, on to the account it was
-  // routed to, waiting there while that answers; a try that failed turns
-  // red and comes back for the next, and the answer flies home green (red
-  // when nobody could answer). Still, with reduced motion or the tab hidden.
+  // comes takes the place of the one heard of longest ago. On the right a
+  // place is a provider, naming the account its latest try went to: a place
+  // an account let one provider, its requests trying account after account,
+  // fill all three, and the providers other sessions used were left off
+  // (#1389, Creat55). A request plays as a dot in its agent's colour: to
+  // magpie, on to the provider it was routed to, waiting there while that
+  // answers; a try that failed turns red and comes back for the next, and
+  // the answer flies home green (red when nobody could answer). Still,
+  // with reduced motion or the tab hidden.
   const P_SIDE = 3;
   const pStage = el("div", "pr-stage");
   const pWires = document.createElementNS(NS, "svg"), pSky = document.createElementNS(NS, "svg");
@@ -4677,15 +4865,16 @@
   pStage.append(pWires, pFrom, pHub, pTo, pSky);
   pStage.setAttribute("aria-hidden", "true");
   let pAg = [], pDst = [];          // the keys on the stage, in their places
-  const pNodes = new Map();         // "a:<agent>" / "d:<seat>" → { node, wire }
+  const pNodes = new Map();         // "a:<agent>" / "d:<provider>" → { node, wire }
   const pPlays = new Set();         // the requests flying
   let pTrips = [], pWait = [], pRaf = 0;
-  // pSeat is where a try went: a provider, and the account or key there
+  // pSeat is where a try went: its place, the provider, and the account
+  // or key there
   function pSeat(r, tr) {
     const w = tr && tried(r, tr);
     if (!w) return { key: r.provider || "?", name: r.provider || "?", sub: "" };
     const sub = w.kind === "provider" ? "" : w.who || "";
-    return { key: `${w.provider}|${sub}`, name: w.name || w.provider, sub };
+    return { key: w.provider || r.provider || "?", name: w.name || w.provider, sub };
   }
   // pPlace keeps those on the stage that are still wanted where they are,
   // the newcomers taking the free places
@@ -4708,11 +4897,12 @@
       const tr = r.tries[r.tries.length - 1];
       if (tr) { const s = pSeat(r, tr); if (!dst.has(s.key) && dst.size < P_SIDE) dst.set(s.key, s); }
     }
-    // each account on the stage says how its latest try there went
+    // each provider on the stage names the account its latest try went
+    // to, and says how that went
     for (const r of recent) {
       for (const x of r.tries.slice().reverse()) {
-        const d = dst.get(pSeat(r, x).key);
-        if (d && !d.how) d.how = !x.done ? "wait" : tryOk(x) ? "ok" : "bad";
+        const s = pSeat(r, x), d = dst.get(s.key);
+        if (d && !d.how) { d.how = !x.done ? "wait" : tryOk(x) ? "ok" : "bad"; d.sub = s.sub; }
       }
     }
     pAg = pPlace(pAg, ags.slice(0, P_SIDE));
@@ -4820,10 +5010,15 @@
     dot.style.setProperty("--agent", hueOf(r.agent));
     pSky.appendChild(dot);
     const home = () => pNodes.get("a:" + r.agent);
+    // rt: the route as the gateway has it now — or, dropped from the 60
+    // kept while it flew, over: its dot goes, as nothing more will be heard
+    // of it. Waiting on it held the dot and its place for three minutes
+    const rt = () => routes.get(id) || { ...r, done: true, gone: true };
     try {
       await pFly(dot, home(), false, 420);
       for (let i = 0; ; i++) {
-        await pUntil(() => { r = routes.get(id) || r; return r.tries.length > i || r.done; });
+        await pUntil(() => { r = rt(); return r.tries.length > i || r.done; });
+        if (r.gone) break;
         const tr = r.tries[i];
         if (!tr) break;
         const k = "d:" + pSeat(r, tr).key;
@@ -4833,15 +5028,17 @@
         // it waits at the account while that answers
         if (n) n.lit++;
         dot.classList.add("wait");
-        await pUntil(() => { r = routes.get(id) || r; return r.tries[i]?.done || r.done; });
+        await pUntil(() => { r = rt(); return r.tries[i]?.done || r.done; });
         dot.classList.remove("wait");
         if (n && !--n.lit) n.wire.classList.remove("on");
+        if (r.gone) break;
         const t2 = r.tries[i];
         if (t2 && !tryOk(t2)) {
           dot.classList.add("bad");
           await pRest(260);
           await pFly(dot, n, true, 360);
-          await pUntil(() => { r = routes.get(id) || r; return r.tries.length > i + 1 || r.done; });
+          await pUntil(() => { r = rt(); return r.tries.length > i + 1 || r.done; });
+          if (r.gone) break;
           if (r.tries.length > i + 1) { dot.classList.remove("bad"); continue; }
           await pFly(dot, home(), true, 420); // nobody left: the error goes home
           break;
@@ -4904,7 +5101,7 @@
     const asked = el("span", "pr-a");
     asked.append(icon(ag?.icon || "generic"), el("span", "pr-who", agentName(r.agent)), el("code", "m", r.model));
     if (r.kind) asked.append(kindTag(r));
-    const when = el("span", "at", new Date(r.time).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit", hourCycle: "h23" }));
+    const when = el("span", "at", new Date(r.time).toLocaleTimeString(intlLang(), { hour: "2-digit", minute: "2-digit", second: "2-digit", hourCycle: "h23" }));
     // where it went: the provider, the account or key, and the model that
     // answered — marked when the reply names another than the one sent
     const to = el("span", "pr-to");
@@ -4913,7 +5110,7 @@
     if (!r.done) to.append(el("span", "pr-where", w ? t("{who} is answering…", { who: place }) : t("routing…")));
     else if (how === "bad") {
       const last = r.tries[r.tries.length - 1];
-      to.append(el("span", "pr-where", last ? `${r.status} · ${failWord(last.fail)}` : `${r.status || ""} ${r.error || ""}`.trim()));
+      to.append(el("span", "pr-where", last ? endWord(r, last) : `${r.status || ""} ${r.error || ""}`.trim()));
     } else {
       to.append(el("span", "pr-where", place));
       const model = tr?.model || w?.model;

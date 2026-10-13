@@ -258,10 +258,14 @@ func flattenContent(m map[string]json.RawMessage, whole bool) bool {
 
 // chatWhole mends a Chat Completions reply that came whole, not streamed:
 // a message whose content is typed parts (Mistral's thinking, #483) goes
-// on with a string content and its thinking in reasoning_content. It is
-// held until it ends; any other reply passes byte for byte.
+// on with a string content and its thinking in reasoning_content, and,
+// when the request offered tools (names), calls the model wrote into its
+// text are made the calls they are, as textCallTidy makes them in a
+// stream (#1845). It is held until it ends; any other reply passes byte
+// for byte.
 type chatWhole struct {
-	buf []byte
+	names map[string]bool
+	buf   []byte
 }
 
 func (t *chatWhole) write(b []byte) []byte {
@@ -272,7 +276,8 @@ func (t *chatWhole) write(b []byte) []byte {
 func (t *chatWhole) flush() []byte {
 	b := t.buf
 	t.buf = nil
-	if !bytes.Contains(b, contentParts) && !bytes.Contains(b, contentPartsSpace) {
+	parts := bytes.Contains(b, contentParts) || bytes.Contains(b, contentPartsSpace)
+	if !parts && !mayWriteCalls(b, t.names) {
 		return b
 	}
 	var reply map[string]json.RawMessage
@@ -286,17 +291,27 @@ func (t *chatWhole) flush() []byte {
 	changed := false
 	for _, c := range choices {
 		var msg map[string]json.RawMessage
-		if decodeJSON(c["message"], &msg) != nil || !flattenContent(msg, true) {
+		if decodeJSON(c["message"], &msg) != nil {
 			continue
 		}
-		c["message"], _ = json.Marshal(msg)
+		mended := parts && flattenContent(msg, true)
+		if wrote, called := wholeTextCalls(msg, t.names); wrote {
+			if called {
+				c["finish_reason"] = json.RawMessage(`"tool_calls"`)
+			}
+			mended = true
+		}
+		if !mended {
+			continue
+		}
+		c["message"], _ = marshalPlain(msg)
 		changed = true
 	}
 	if !changed {
 		return b
 	}
-	reply["choices"], _ = json.Marshal(choices)
-	nb, err := json.Marshal(reply)
+	reply["choices"], _ = marshalPlain(choices)
+	nb, err := marshalPlain(reply)
 	if err != nil {
 		return b
 	}
@@ -347,17 +362,30 @@ func reasoningText(m map[string]json.RawMessage) string {
 const noReasoning = " "
 
 // withReasoningOnToolTurns gives each assistant message of a Chat request
-// that has tool calls and no reasoning_content one: the thinking it sent
-// back in another field (reasoning, reasoning_details), else noReasoning.
-// A message with reasoning_content of its own keeps it, a reply without
-// tool calls is left as it is (DeepSeek doesn't ask for its thinking), and
-// a body with no tool calls comes back byte for byte.
+// that has tool calls, or that follows a tool message of its turn, and no
+// reasoning_content one: the thinking it sent back in another field
+// (reasoning, reasoning_details), else noReasoning. DeepSeek turns away a
+// reply after a tool result with none as it does a call (checked against
+// api.deepseek.com on 2026-10-12, #1822). A message with reasoning_content
+// of its own keeps it, any other reply is left as it is (DeepSeek doesn't
+// ask for its thinking), and a body with no tool calls comes back byte for
+// byte.
 func withReasoningOnToolTurns(body []byte) []byte {
+	afterTool := false
 	return editMessages(body, []string{"tool_calls"}, func(m map[string]json.RawMessage) bool {
 		var role string
 		var calls []json.RawMessage
-		if decodeJSON(m["role"], &role) != nil || role != "assistant" ||
-			decodeJSON(m["tool_calls"], &calls) != nil || len(calls) == 0 {
+		decodeJSON(m["role"], &role)
+		switch role {
+		case "tool":
+			afterTool = true
+		case "user":
+			afterTool = false
+		}
+		if raw, ok := m["tool_calls"]; ok && decodeJSON(raw, &calls) != nil {
+			return false
+		}
+		if role != "assistant" || len(calls) == 0 && !afterTool {
 			return false
 		}
 		var own *string

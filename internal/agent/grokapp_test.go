@@ -11,6 +11,7 @@ import (
 	toml "github.com/pelletier/go-toml/v2"
 
 	"github.com/yetone/magpie/internal/catalog"
+	"github.com/yetone/magpie/internal/edit"
 	"github.com/yetone/magpie/internal/provider"
 )
 
@@ -118,7 +119,7 @@ func grokAppSections(t *testing.T, path string) map[string]map[string]string {
 
 // Connecting Grok App adds magpie as one of its provider channels — the
 // gateway, with a key naming Grok App, and every one of magpie's models in
-// the App's own app_models form — and makes it the route. The App's own
+// the App's own app_models form — and leaves the route alone. The App's own
 // channel stays in the file, and Disconnect gives the file back byte for
 // byte.
 func TestGrokApp(t *testing.T) {
@@ -148,8 +149,8 @@ func TestGrokApp(t *testing.T) {
 	if err := toml.Unmarshal(b, &m); err != nil {
 		t.Fatalf("not TOML (Grok Build reads it as TOML): %v\n%s", err, b)
 	}
-	if d := m["models"].(map[string]any); d["default"] != "magpie" || d["max_retries"] != int64(3) {
-		t.Fatalf("[models]: %v", d)
+	if d := m["models"].(map[string]any); d["default"] != "deepseek" || d["max_retries"] != int64(3) {
+		t.Fatalf("[models] route changed: %v", d)
 	}
 	ch := m["model"].(map[string]any)["magpie"].(map[string]any)
 	// Grok Build reads these two bare: a quoted context window is what the
@@ -288,24 +289,125 @@ func TestGrokAppSyncKeepsTheirs(t *testing.T) {
 	}
 }
 
-// A route of the App's own picked while it is on magpie takes magpie out:
-// the channel goes, and the App is on the route picked.
-func TestGrokAppOwnRouteTakesMagpieOut(t *testing.T) {
+// Picking the App's own route in magpie does not take the App over and does
+// not remove the custom provider. The route stays the one the App had.
+func TestGrokAppOwnRouteStays(t *testing.T) {
 	home, path := grokAppHome(t, grokAppConfig)
 	a := grokApp(home)
 	if err := a.Pick("model", "magpie/kimi/k2"); err != nil {
 		t.Fatal(err)
 	}
+	def, _, rerr := grokAppRead(path)
+	if rerr != nil || def != "deepseek" {
+		t.Fatalf("connecting moved the route: %q err %v", def, rerr)
+	}
+	// one of the App's own routes the picker offers is taken: it is the
+	// route, and magpie's channel goes, as picking another provider leaves
+	// magpie on every other agent
 	if err := a.Pick("model", "grok"); err != nil {
-		t.Fatal(err)
+		t.Fatalf("picking the official route: %v", err)
 	}
 	secs := grokAppSections(t, path)
-	if _, on := secs["magpie"]; on || a.Field("model").Get() != "grok" || a.Wired() {
-		t.Fatalf("magpie still in:\n%v", secs)
+	if _, ok := secs["magpie"]; ok || a.Field("model").Get() != "grok" {
+		t.Fatalf("magpie's channel stayed: model %q\n%v", a.Field("model").Get(), secs["magpie"])
+	}
+	def, _, rerr = grokAppRead(path)
+	if rerr != nil || def != "grok" {
+		t.Fatalf("route %q err %v", def, rerr)
 	}
 	if secs["deepseek"]["api_key"] != "sk-test" {
-		t.Fatalf("the user's channel went: %v", secs)
+		t.Fatalf("the user's channel went: %v", secs["deepseek"])
 	}
+}
+
+// Disconnect puts back the route the App was on before Connect through the
+// model field (connect.was) when unwire left none: a route Use set to
+// magpie with nothing stashed to put back. Set refused an own route, so
+// Disconnect failed half done.
+func TestGrokAppDisconnectPutsTheRouteBack(t *testing.T) {
+	home, path := grokAppHome(t, grokAppConfig)
+	a := grokApp(home)
+	if err := a.Connect(); err != nil {
+		t.Fatal(err)
+	}
+	if err := edit.SetTOMLKey(path, "models", "default", magpieID); err != nil { // Use on magpie
+		t.Fatal(err)
+	}
+	forget("grok-app:" + path + ":default")
+	if err := a.Disconnect(); err != nil {
+		t.Fatalf("disconnect: %v", err)
+	}
+	def, ch, err := grokAppRead(path)
+	if err != nil || def != "deepseek" || ch != nil {
+		t.Fatalf("after disconnect: route %q channel %v err %v", def, ch, err)
+	}
+}
+
+// A sync with nothing of magpie's in the App writes nothing, not even to
+// magpie's own stash; one whose route is magpie with the channel gone is
+// told, since the App reaches nothing.
+func TestGrokAppSyncUnconnected(t *testing.T) {
+	home, path := grokAppHome(t, grokAppConfig)
+	a := grokApp(home)
+	before := mustRead(t, path)
+	if err := a.Sync(); err != nil {
+		t.Fatal(err)
+	}
+	st := stashLoad()
+	if mustRead(t, path) != before || st["grok-app:"+path+":default"] != "" || st[grokAppReleased] != "" {
+		t.Fatalf("an unconnected sync wrote: %v", st)
+	}
+	if c := a.Check(); c != "" {
+		t.Fatalf("check: %q", c)
+	}
+	stash(map[string]string{grokAppReleased: "1"}) // a Use after the one put back
+	if err := os.WriteFile(path, []byte(strings.Replace(before, `default = "deepseek"`, `default = "magpie"`, 1)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if c := a.Check(); !strings.Contains(c, "no longer reaches magpie") {
+		t.Fatalf("route magpie without the channel: check %q", c)
+	}
+}
+
+// An older magpie that set the route to itself is put back once. A Use the
+// user presses after that is the App's choice and stays.
+func TestGrokAppReleasesATakeover(t *testing.T) {
+	home, path := grokAppHome(t, grokAppConfig)
+	a := grokApp(home)
+	stash(map[string]string{"grok-app:" + path + ":default": "deepseek"})
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(strings.Replace(string(b), `default = "deepseek"`, `default = "magpie"`, 1)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.Sync(); err != nil {
+		t.Fatal(err)
+	}
+	def, _, err := grokAppRead(path)
+	if err != nil || def != "deepseek" {
+		t.Fatalf("after sync: route %q err %v", def, err)
+	}
+	if err := os.WriteFile(path, []byte(strings.Replace(string(mustRead(t, path)), `default = "deepseek"`, `default = "magpie"`, 1)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.Sync(); err != nil {
+		t.Fatal(err)
+	}
+	def, _, err = grokAppRead(path)
+	if err != nil || def != "magpie" {
+		t.Fatalf("Use was undone: %q err %v", def, err)
+	}
+}
+
+func mustRead(t *testing.T, path string) string {
+	t.Helper()
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(b)
 }
 
 // With no channel of the user's and no route set (a fresh install, Grok's

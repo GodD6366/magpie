@@ -304,6 +304,9 @@ type Call struct {
 	// it was streamed (#196)
 	TTFT      int64 `json:"ttft,omitempty"`
 	FirstText int64 `json:"firstText,omitempty"`
+	// FirstReasoning is the start of paced visible reasoning, absent for hidden reasoning.
+	FirstReasoning  int64 `json:"firstReasoning,omitempty"`
+	ReasoningHidden bool  `json:"reasoningHidden,omitempty"`
 	// Flow: the ms its content took to come, from where its speed is
 	// counted (firstToken.flowMs): next to none for a reply that came in
 	// a burst, so it tells no speed
@@ -367,8 +370,8 @@ func New() *Server {
 	return &Server{
 		// a request counted against a MaxRPM waits for room in its minute
 		// first (rpm.go); the ChatGPT backend is spoken to over HTTP/1.1
-		// (codex_http1.go)
-		client:       &http.Client{Transport: rpmTransport{newCodexHTTP1(upstreamTransport(nil))}},
+		// (netproxy.HTTP1, which provider/codex_http1.go sets)
+		client:       &http.Client{Transport: rpmTransport{upstreamTransport()}},
 		unfit:        make(map[string]bool),
 		subscription: newSubscriptionBridge(),
 		debug:        os.Getenv("MAGPIE_DEBUG") != "",
@@ -534,6 +537,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /v1/magpie/quotas", s.quotas)
 	mux.HandleFunc("GET /v1/magpie/usage", s.usageSummary)
 	mux.HandleFunc("GET /v1/magpie/usage/requests", s.usageRequests)
+	mux.HandleFunc("POST /v1/magpie/usage/requests", s.usageIngest)
 	mux.HandleFunc("GET /v1/magpie/quotas/history", s.quotasHistory)
 	mux.HandleFunc("GET "+provider.RemoteCardsPath, s.quotaCards)
 	mux.HandleFunc("POST "+provider.RemoteRefreshPath, s.quotaCardsRefresh)
@@ -1027,6 +1031,10 @@ func (s *Server) countTokens(w http.ResponseWriter, r *http.Request) {
 	if countHeld(w, r, provider.Anthropic, id) {
 		return
 	}
+	// nor on one the user disabled (#1867)
+	if countOff(w, provider.Anthropic, id) {
+		return
+	}
 	// and counts the unmasked one where generation sends that
 	if _, ms, isGroup := provider.FindGroup(id); ok && unredactedRoute(p, isGroup, ms) {
 		body = plain
@@ -1156,10 +1164,17 @@ func (s *Server) handle(from provider.Protocol) http.HandlerFunc {
 			return
 		}
 		var err error
-		body, _, err = requestModel(body)
+		var model string
+		body, model, err = requestModel(body)
 		if err != nil {
 			writeError(w, from, 400, err.Error())
 			return
+		}
+		// Codex with magpie as its provider: spawn_agent names every
+		// model a subagent may be put on, not only Codex's first five
+		// (Gearclickist on Discord)
+		if from == provider.Responses && (fromCodex(r.Header) || agentOf(r) == "codex") {
+			body = spawnAgentModels(r, body, model, false)
 		}
 		if from == provider.Chat {
 			body = thinkingEffort(body)
@@ -1169,6 +1184,10 @@ func (s *Server) handle(from provider.Protocol) http.HandlerFunc {
 		if from == provider.Responses {
 			if to := codexTitlesTo(r.Header, body, true); to != "" {
 				s.codexTitle(w, r, body, to)
+				return
+			}
+			if to := codexDescriptionsTo(r.Header, body, true); to != "" {
+				s.codexDescription(w, r, body, to)
 				return
 			}
 			// Codex compacts remotely, a compaction_trigger here, on a
@@ -1224,6 +1243,9 @@ func (s *Server) gemini(w http.ResponseWriter, r *http.Request) {
 		// a gateway key held to some models (#882) counts no tokens on one
 		// it may not use, as it would be refused serving it
 		if countHeld(w, r, provider.Gemini, model) {
+			return
+		}
+		if countOff(w, provider.Gemini, model) { // nor a disabled one (#1867)
 			return
 		}
 		s.geminiCount(w, model, body)
@@ -1418,6 +1440,16 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 		call.Model, asked = subagent.Asked, subagent.To
 	}
 	p, model, ok := provider.Resolve(asked)
+	// a model the user disabled (#1867) — asked by its id, the model a
+	// sub-agent was put on, a group with every model in it disabled — is
+	// refused here, before anything is sent anywhere; a group with one
+	// left goes on without the rest (provider.membersIn)
+	if msg, off := idOff(asked); off {
+		call.Status, call.Error = 403, "model disabled"
+		writeError(w, from, 403, msg)
+		turnedAway()
+		return
+	}
 	if ok {
 		s.rememberCodexTurn(r, call.Agent, agent, call.Kind, asked)
 	}
@@ -1693,11 +1725,16 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 		}
 		cands, pl, accountHeld = allowedCandidates(who, cands, pl, members)
 	}
+	// a conversation that stays strictly where it is goes on on its
+	// account past the usage cap set on it, and is refused there, not
+	// moved, while the account is held as it won't spend its credits
+	// (#1797)
+	cands, pl, strictHeld := strictKeep(scope, mode, r.Header, body, cands, pl)
 	// a Codex reset spent before any try, on an account held as it won't
 	// spend its credits
 	var resetFirst *AutoReset
 	if len(cands) == 0 && len(pl.held) > 0 && strings.TrimSpace(r.Header.Get(AccountHeader)) == "" &&
-		!slices.ContainsFunc(pl.left, func(w Weighed) bool { return !w.Barred && !w.Held && w.Capped == 0 }) {
+		(strictHeld != nil || !slices.ContainsFunc(pl.left, func(w Weighed) bool { return !w.Barred && !w.Held && w.Capped == 0 })) {
 		// every account there is is held, and one held only as it won't
 		// spend its credits is out of its allowance at the vendor's own
 		// 100%: one that spends its resets by itself, its week used up,
@@ -1708,15 +1745,23 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 			resetFirst = &AutoReset{Who: pick.p.Account.User, Text: out.Text(), Agent: pick.p.Account.Agent}
 		}
 	}
-	if len(cands) == 0 && slices.ContainsFunc(pl.left, func(w Weighed) bool { return w.Capped > 0 }) &&
-		!slices.ContainsFunc(pl.left, func(w Weighed) bool { return !w.Barred && !w.Held && w.Capped == 0 }) {
+	if len(cands) == 0 && (strictHeld != nil || slices.ContainsFunc(pl.left, func(w Weighed) bool { return w.Capped > 0 }) &&
+		!slices.ContainsFunc(pl.left, func(w Weighed) bool { return !w.Barred && !w.Held && w.Capped == 0 })) {
 		// every account there is is held at its usage cap: used up, as far
-		// as routing goes, until a window renews
-		msg, back := cappedError(call.Model, pl.left, time.Now())
+		// as routing goes, until a window renews — or the one a strict
+		// conversation stays on is
+		held := pl.left
+		if strictHeld != nil {
+			held = strictHeld
+		}
+		msg, back := cappedError(call.Model, held, time.Now())
+		if strictHeld != nil {
+			msg += ". The conversation stays strictly on that account (Stays: Strict), so magpie doesn't move it to another"
+		}
 		if d := time.Until(back); d > 0 {
 			w.Header().Set("Retry-After", strconv.Itoa(int(d.Seconds())+1))
 		}
-		call.Status, call.Error = 429, cappedRecord(pl.left)
+		call.Status, call.Error = 429, cappedRecord(held)
 		writeError(w, from, 429, msg)
 		turnedAway()
 		return
@@ -1749,7 +1794,12 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 	// key or account added while the conversation runs doesn't take it over
 	// (#63): its reasoning, sealed by the account that wrote it, is refused
 	// by another.
+	before := len(cands)
 	cands, pl, aff, stuck := affine(scope, mode, rotate, r.Header, from, body, cands, pl)
+	// a strict conversation left with its own account of several: its
+	// failure rests the account as it would with the others still there,
+	// for new conversations to go elsewhere meanwhile (#1797)
+	strictAlone := aff.Why == "strict" && len(cands) < before
 	defer opened(stuck)
 	leadAccount := ""
 	if sealedTask && !aff.Kept {
@@ -1853,8 +1903,8 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 	all := cands
 	cands = probeOne(cands)
 	shown := aff
-	if len(cands) == 1 {
-		shown = nil // nobody else to stay away from
+	if len(cands) == 1 && aff.Why != "strict" {
+		shown = nil // nobody else to stay away from; strict left one alone (#1797)
 	}
 	link := s.titlePrompts.observe(r, body, metadata, call.Kind, start)
 	turn, tools := agentTurnOf(r, call.Kind)
@@ -2277,11 +2327,18 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 		asName := provider.SentNameOnIn(wiresOf(r.Context()), c.p.ID, accountAgent(c.p), c.model, sent)
 		try.Swapped, try.Routed = swapped(asName, call.Usage.Served), usage.GroupRouted(asName, call.Usage.Served)
 		try.TTFT, try.FirstText = hw.first.ms()
+		try.FirstReasoning = hw.first.reasoningMs(call.To)
+		try.ReasoningHidden = hw.first.hidesReasoning(call.To)
+		call.ReasoningHidden = try.ReasoningHidden
 		try.Flow = hw.first.flowFor(call.Usage.Reasoning)
 		call.Flow = try.Flow
 		// the request's, from when it came as its ms are: the time before
 		// this try, the ones that failed first, is in it
 		call.TTFT, call.FirstText = sinceStart(began.Sub(start), hw.first.first), sinceStart(began.Sub(start), hw.first.text)
+		call.FirstReasoning = 0
+		if try.FirstReasoning > 0 {
+			call.FirstReasoning = sinceStart(began.Sub(start), hw.first.reasoning)
+		}
 		sentMs, ownMs, retriedMs, queuedMs = 0, 0, 0, 0
 		if at := wrote.Load(); at > 0 && call.TTFT > 0 {
 			sentMs = min(max(time.Unix(0, at).Sub(start).Milliseconds(), 1), call.TTFT)
@@ -2301,7 +2358,7 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 			// rest, a long prompt being slow to start anywhere
 			call.Status, call.Error = http.StatusGatewayTimeout, fmt.Sprintf("%s: no first token in %ds", c.p.Name, g.FirstToken)
 			try.Status, try.Error, try.Fail = call.Status, call.Error, failSlow
-			call.TTFT, call.FirstText, call.Flow = 0, 0, 0
+			call.TTFT, call.FirstText, call.Flow, call.FirstReasoning = 0, 0, 0, 0
 			telemetry.attempt(call, try, c.p.ID, sent, hw, capture)
 			s.trace.update(tr, func(t *Route) { t.Tries[len(t.Tries)-1] = try })
 			if other == nil {
@@ -2391,7 +2448,7 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 					Requested: call.Model, Served: call.Usage.Served, Upstream: call.Usage.Upstream,
 					Input: call.Usage.Input, Output: call.Usage.Output, CacheRead: call.Usage.CacheRead,
 					CacheWrite: call.Usage.CacheWrite, CacheWrite1h: call.Usage.CacheWrite1h, Reasoning: call.Usage.Reasoning, Effort: wentAt, Millis: time.Since(began).Milliseconds(), Status: call.Status,
-					TTFT: try.TTFT, FirstText: try.FirstText, Flow: try.Flow, Session: sessionOf(r.Header), NativeSession: nativeSessionOf(r.Header), Kind: call.Kind,
+					TTFT: try.TTFT, FirstText: try.FirstText, FirstReasoning: try.FirstReasoning, ReasoningHidden: try.ReasoningHidden, Flow: try.Flow, Session: sessionOf(r.Header), NativeSession: nativeSessionOf(r.Header), Kind: call.Kind,
 					RequestID: call.Usage.RequestID, Endpoint: endpointOf(r, from, call.To, c.p, c.model), Archive: call.archiveName(), HandedOn: true}
 				failedWith(&rec, call.Status, call.Error, call.Usage.ErrType)
 				// what this account answered is its refusal, the reply
@@ -2434,7 +2491,7 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 					Requested: call.Model, Served: call.Usage.Served,
 					Input: call.Usage.Input, Output: call.Usage.Output, CacheRead: call.Usage.CacheRead,
 					CacheWrite: call.Usage.CacheWrite, CacheWrite1h: call.Usage.CacheWrite1h, Reasoning: call.Usage.Reasoning, Effort: wentAt, Millis: time.Since(began).Milliseconds(), Status: call.Status,
-					TTFT: try.TTFT, FirstText: try.FirstText, Flow: try.Flow, Session: sessionOf(r.Header), NativeSession: nativeSessionOf(r.Header), Kind: call.Kind,
+					TTFT: try.TTFT, FirstText: try.FirstText, FirstReasoning: try.FirstReasoning, ReasoningHidden: try.ReasoningHidden, Flow: try.Flow, Session: sessionOf(r.Header), NativeSession: nativeSessionOf(r.Header), Kind: call.Kind,
 					RequestID: call.Usage.RequestID, Endpoint: endpointOf(r, from, call.To, c.p, c.model), Archive: call.archiveName(), HandedOn: true}
 				failedWith(&rec, call.Status, call.Error, call.Usage.ErrType)
 				// what this account answered is its refusal, the reply
@@ -2588,6 +2645,8 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 				continue
 			case <-r.Context().Done():
 				call.Status, call.Error = 499, "the agent canceled the request"
+				try.Gone = true
+				s.trace.update(tr, func(t *Route) { t.Tries[len(t.Tries)-1] = try })
 			}
 			break
 		}
@@ -2604,6 +2663,20 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 			try.Fail = failOther
 			s.trace.update(tr, func(t *Route) { t.Tries[len(t.Tries)-1] = try })
 			skipped = append(skipped, c.label()+": "+call.Error)
+			continue
+		}
+		if !last && hw.failed() && strings.Contains(call.Error, emptyReply) {
+			// a reply that said nothing is a failure of the model or
+			// request, not the account (#1221): the account doesn't rest,
+			// and mates of the same model, likely to end empty too, are
+			// asked last
+			if other == nil {
+				other = &Try{Status: call.Status, Error: call.Error}
+			}
+			try.Fail = failOther
+			s.trace.update(tr, func(t *Route) { t.Tries[len(t.Tries)-1] = try })
+			skipped = append(skipped, c.label()+": "+call.Error)
+			matesLast(cands[i+1:], c)
 			continue
 		}
 		if !last && hw.failed() {
@@ -2648,6 +2721,8 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 					continue
 				}
 				call.Status, call.Error = 499, "the agent canceled the request"
+				try.Gone = true
+				s.trace.update(tr, func(t *Route) { t.Tries[len(t.Tries)-1] = try })
 				break
 			}
 		}
@@ -2665,6 +2740,8 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 				continue
 			case <-r.Context().Done():
 				call.Status, call.Error = 499, "the agent canceled the request"
+				try.Gone = true
+				s.trace.update(tr, func(t *Route) { t.Tries[len(t.Tries)-1] = try })
 			}
 			break
 		}
@@ -2790,7 +2867,7 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 			try.Fail = failPrompt
 		} else {
 			try.Fail = failureOf(c, call.Status, []byte(call.Error))
-			if try.Fail == failVerify && !held {
+			if try.Fail == failVerify && !held || strictAlone {
 				// the last one left rests too, for the app to show and the
 				// next requests to be held
 				rest := s.restAfter(c, call.Status, hw.header, []byte(call.Error))
@@ -2833,6 +2910,7 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 			t.Usage = append(t.Usage, routeUsage(call.Provider, model, call.Usage)...)
 		}
 		t.Tokens = call.Usage.Input + call.Usage.Output + call.Usage.CacheRead + call.Usage.CacheWrite
+		t.FirstReasoning, t.ReasoningHidden = call.FirstReasoning, call.ReasoningHidden
 		t.Output, t.Reasoning, t.TTFT, t.FirstText, t.Flow = call.Usage.Output, call.Usage.Reasoning, call.TTFT, call.FirstText, call.Flow
 		if prompt != nil {
 			t.Prompt = prompt.calibrated(promptCounted(t.Usage), window)
@@ -2849,7 +2927,7 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 			Requested: call.Model, Served: call.Usage.Served, Upstream: call.Usage.Upstream,
 			Input: call.Usage.Input, Output: call.Usage.Output, CacheRead: call.Usage.CacheRead,
 			CacheWrite: call.Usage.CacheWrite, CacheWrite1h: call.Usage.CacheWrite1h, Reasoning: call.Usage.Reasoning, Effort: wentAt, Millis: call.Millis, Status: call.Status,
-			TTFT: call.TTFT, FirstText: call.FirstText, Flow: call.Flow, Sent: sentMs, Own: ownMs, Retried: retriedMs, Queued: queuedMs, Session: sessionOf(r.Header), NativeSession: nativeSessionOf(r.Header), Kind: call.Kind,
+			TTFT: call.TTFT, FirstText: call.FirstText, FirstReasoning: call.FirstReasoning, ReasoningHidden: call.ReasoningHidden, Flow: call.Flow, Sent: sentMs, Own: ownMs, Retried: retriedMs, Queued: queuedMs, Session: sessionOf(r.Header), NativeSession: nativeSessionOf(r.Header), Kind: call.Kind,
 			RequestID: call.Usage.RequestID, ResponseID: call.Usage.ResponseID, Endpoint: endpointOf(r, from, call.To, lastTried, model), Stop: call.Usage.Stop, Archive: call.archiveName()}
 		if tries > 1 {
 			// answered, or not, after a try that failed first: the ledger
@@ -2883,6 +2961,7 @@ func (s *Server) attempt(w http.ResponseWriter, r *http.Request, from provider.P
 	// Normalize for the actual destination, separately on each fallback.
 	// Native ChatGPT accounts accept standalone tool outputs themselves.
 	if from == provider.Responses && (p.Account == nil || p.Account.Agent != "codex") {
+		body = joinToolRuns(body)
 		body = orphanedToolOutputs(body)
 		body = pairToolItems(body)
 	}
@@ -3042,29 +3121,18 @@ func autoPicks(c candidate) bool {
 	return c.model == provider.CopilotAuto && c.p.Account != nil && c.p.Account.Agent == "copilot"
 }
 
-// lastUserText is the text of the request's last user turn, which
-// Copilot's Auto picks a model for.
+// lastUserText is what the user said last (userSaid), which Copilot's Auto
+// picks a model for — not a notice or reminder the agent put in after it.
 func lastUserText(from provider.Protocol, body []byte) string {
 	req, err := parse(from, body)
 	if err != nil {
 		return ""
 	}
 	for i := len(req.Messages) - 1; i >= 0; i-- {
-		m := req.Messages[i]
-		if m.Role != "user" {
-			continue
-		}
-		var b strings.Builder
-		for _, p := range m.Parts {
-			if p.Kind == Text {
-				if b.Len() > 0 {
-					b.WriteString("\n")
-				}
-				b.WriteString(p.Text)
+		if m := req.Messages[i]; m.Role == "user" {
+			if said := userSaid(m); said != "" {
+				return said
 			}
-		}
-		if b.Len() > 0 {
-			return b.String()
 		}
 	}
 	return ""
@@ -3196,7 +3264,11 @@ func (s *Server) forwardOnce(ctx context.Context, p provider.Provider, to provid
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json, text/event-stream")
-	req.Header.Set("User-Agent", "magpie/"+Version)
+	// magpie's, or the agent's own where the provider is set to pass it
+	// on (#1851); a signed-in account's signing, a client the vendor
+	// serves (OpenCode's, Cline's, Kilo's) and the user's own header put
+	// theirs on after
+	req.Header.Set("User-Agent", userAgentFor(p, in.Get("User-Agent")))
 	if to == provider.Anthropic {
 		req.Header.Set("anthropic-version", "2023-06-01")
 		for _, h := range []string{"anthropic-version", "anthropic-beta"} {
@@ -3341,13 +3413,14 @@ func claudeCodeHeader(k string) bool {
 	return false
 }
 
-// fromCodex is a request Codex sent — its CLI, exec, the IDE extension or
-// the desktop app — by the User-Agent (codex_cli_rs/0.159.2 (Mac OS 26.6.0;
-// arm64) kitty, Codex Desktop/0.162.3 …) or the originator it gives
-// (codex_cli_rs, codex_exec, codex_vscode, Codex Desktop).
+// fromCodex is a request Codex sent — its CLI, exec, the IDE extension,
+// desktop app or ACP adapter — by the User-Agent (codex_cli_rs/0.159.2
+// (Mac OS 26.6.0; arm64) kitty, Codex Desktop/0.162.3 …) or the originator it gives
+// (codex_cli_rs, codex_exec, codex_vscode, Codex Desktop, acp-extension-codex).
 func fromCodex(in http.Header) bool {
 	for _, v := range []string{in.Get("User-Agent"), in.Get("originator")} {
-		if strings.HasPrefix(strings.ToLower(v), "codex") {
+		v = strings.ToLower(v)
+		if strings.HasPrefix(v, "codex") || strings.HasPrefix(v, "acp-extension-codex") {
 			return true
 		}
 	}
@@ -3499,6 +3572,14 @@ func (s *Server) passthrough(w http.ResponseWriter, r *http.Request, p provider.
 		}
 		if effortInOutputConfig.MatchString(model) {
 			body = withOutputEffort(body, p.Efforts(model))
+		}
+		if !s.fits(p.ID, offRefused(model), proto) {
+			// a model that refused thinking turned off before (below):
+			// left to the model from the start, not refused again on
+			// every request (auto mode's classifier asks on every action)
+			if nb, ok := withoutThinkingOff(body); ok {
+				body = nb
+			}
 		}
 	}
 	// the effort as the agent sent it, fitted to the model's levels: Qoder's
@@ -3714,7 +3795,7 @@ func (s *Server) passthrough(w http.ResponseWriter, r *http.Request, p provider.
 	}
 	if proto == provider.Anthropic && res.StatusCode == http.StatusBadRequest {
 		// a model that always thinks refuses thinking turned off: asked
-		// again with it left to the model
+		// again with it left to the model, and so from then on
 		b, _ := io.ReadAll(io.LimitReader(res.Body, 1<<20))
 		res.Body.Close()
 		res.Body = io.NopCloser(bytes.NewReader(b))
@@ -3724,7 +3805,8 @@ func (s *Server) passthrough(w http.ResponseWriter, r *http.Request, p provider.
 			if res, err = s.forward(r.Context(), p, proto, path, p.Prepare(nb), r.Header); err != nil {
 				return writeError(w, proto, 502, p.Name+": "+err.Error()), err.Error(), true
 			}
-		} else if nb, ok := withoutThinkingOff(body); ok && (alwaysThinks.Match(b) || mandatoryReasoning.Match(b) || thinkingOffRefused.Match(b)) {
+		} else if nb, ok := withoutThinkingOff(body); ok && refusesThinkingOff(b) {
+			s.markUnfit(p.ID, offRefused(model), proto)
 			if res, err = s.forward(r.Context(), p, proto, path, p.Prepare(nb), r.Header); err != nil {
 				return writeError(w, proto, 502, p.Name+": "+err.Error()), err.Error(), true
 			}
@@ -3780,9 +3862,11 @@ func (s *Server) passthrough(w http.ResponseWriter, r *http.Request, p provider.
 	if names := chatToolNames(body); proto == provider.Chat && sse && names != nil {
 		written = &textCallTidy{names: names}
 	}
+	// a reply that came whole: JSON, or one under text/plain or no type
+	// that eventStream found isn't a stream
 	var whole *chatWhole
-	if proto == provider.Chat && !sse && strings.Contains(res.Header.Get("Content-Type"), "json") {
-		whole = &chatWhole{}
+	if ct := res.Header.Get("Content-Type"); proto == provider.Chat && !sse && (strings.Contains(ct, "json") || ct == "" || strings.HasPrefix(ct, "text/plain")) {
+		whole = &chatWhole{names: chatToolNames(body)}
 	}
 	var sigs *sigTidy
 	if proto == provider.Chat && geminiCompat(p.Host(), model) {
@@ -4126,6 +4210,14 @@ func (s *Server) forwardTranslated(ctx context.Context, p provider.Provider, to 
 			r := *req
 			r.Tier, req = "priority", &r
 		}
+		// Anthropic's API needs a reply limit: one the client didn't name
+		// is the model's own, not a flat 16384 (#1792, askedOutput)
+		if to == provider.Anthropic && req.MaxTokens <= 0 {
+			if n := askedOutput(p, model); n > 0 {
+				r := *req
+				r.MaxTokens, req = n, &r
+			}
+		}
 		wire := provider.UpstreamNameIn(wires, p.ID, model)
 		sent := req
 		if dropsBillingLine(p, to, model, wire) && billingHeader.MatchString(req.System) {
@@ -4192,8 +4284,7 @@ func (s *Server) forwardTranslated(ctx context.Context, p provider.Provider, to 
 			req = &r
 			continue
 		}
-		if to == provider.Anthropic && req.ThinkOff && res.StatusCode == http.StatusBadRequest &&
-			(alwaysThinks.Match(b) || mandatoryReasoning.Match(b) || thinkingOffRefused.Match(b)) {
+		if to == provider.Anthropic && req.ThinkOff && res.StatusCode == http.StatusBadRequest && refusesThinkingOff(b) {
 			// a vendor's model that always thinks (GLM-5.3, #699) refuses
 			// the thinking off a client asked for (#1636): asked again
 			// thinking at its least, as it was before, and so from then on
@@ -5417,8 +5508,12 @@ var effortLevelsNamed = regexp.MustCompile(`(?i)\blow\b\W+(?:medium|high)\b`)
 // quote comes escaped), so a "None" in a sentence isn't it.
 var otherOffNamed = map[string]*regexp.Regexp{
 	"none":    regexp.MustCompile(`(?i)['"]minimal\\?['"]`),
-	"minimal": regexp.MustCompile(`(?i)['"]none\\?['"]`),
+	"minimal": noneQuoted,
 }
+
+// noneQuoted is reasoning effort none named in an error, quoted, as
+// errors listing levels quote them (in JSON a double quote comes escaped).
+var noneQuoted = regexp.MustCompile(`(?i)['"]none\\?['"]`)
 
 // bodyEffort is the reasoning effort a Chat or Responses request asks for,
 // or an Anthropic one in its output_config.
@@ -5669,7 +5764,7 @@ func writeError(w http.ResponseWriter, proto provider.Protocol, status int, msg 
 		}
 	}
 	if h, held := w.(*holdWriter); status == http.StatusRequestEntityTooLarge && (!held || !h.hold) {
-		const hint = "This is a request-body byte limit; reduce images or large tool results, or start a new conversation with a short summary."
+		const hint = "This is a request-body byte limit, not the model's context: compact the conversation (/compact in Codex or Claude Code), or start a new one with a short summary; fewer images or smaller tool results also help."
 		if !strings.Contains(msg, hint) {
 			msg += " — " + hint
 		}
@@ -5713,7 +5808,8 @@ var tooLongRe = regexp.MustCompile(`(?i)context_length_exceeded|prompt is too lo
 // overflowed says a refused request was too long for the model — a
 // request error (400, 413, 422) whose words say so.
 func overflowed(status int, body []byte) bool {
-	return (status == 400 || status == 413 || status == 422) && tooLong(status, string(body))
+	// the words are matched decoded, too (#1669): 上下文 escaped as \uXXXX
+	return (status == 400 || status == 413 || status == 422) && tooLong(status, string(wordsOf(body)))
 }
 
 // tooLong is whether a vendor's error says the conversation no longer

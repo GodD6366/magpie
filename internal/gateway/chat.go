@@ -36,7 +36,9 @@ type cRequest struct {
 	Messages []struct {
 		Role             string          `json:"role"`
 		Content          json.RawMessage `json:"content"`
-		ReasoningContent string          `json:"reasoning_content,omitempty"`
+		ReasoningContent json.RawMessage `json:"reasoning_content,omitempty"`
+		Reasoning        json.RawMessage `json:"reasoning,omitempty"`
+		ReasoningDetails json.RawMessage `json:"reasoning_details,omitempty"`
 		ToolCalls        []cToolCall     `json:"tool_calls,omitempty"`
 		ToolCallID       string          `json:"tool_call_id,omitempty"`
 	} `json:"messages"`
@@ -94,8 +96,15 @@ func parseChat(body []byte) (*Request, error) {
 			r.Messages = append(r.Messages, Message{Role: "user", Parts: chatParts(m.Content)})
 		case "assistant":
 			msg := Message{Role: "assistant"}
-			if m.ReasoningContent != "" {
-				msg.Parts = append(msg.Parts, Part{Kind: Thinking, Text: m.ReasoningContent})
+			// an earlier turn's thinking comes back in any of
+			// messageReasoning's spellings, and every upstream that
+			// thinks wants it as the thinking part
+			if think := reasoningText(map[string]json.RawMessage{
+				"reasoning_content": m.ReasoningContent,
+				"reasoning":         m.Reasoning,
+				"reasoning_details": m.ReasoningDetails,
+			}); think != "" {
+				msg.Parts = append(msg.Parts, Part{Kind: Thinking, Text: think})
 			}
 			msg.Parts = append(msg.Parts, chatParts(m.Content)...)
 			for _, tc := range m.ToolCalls {
@@ -279,6 +288,9 @@ func buildChat(r *Request, model, host string, rejectTemp bool) []byte {
 		}
 	}
 	turns := joinSplitCalls(r.Messages)
+	// afterTool: the last message sent is a tool result, with no message
+	// of the user's after it
+	afterTool := false
 	for i, m := range turns {
 		if m.Role == "assistant" {
 			showSeen()
@@ -344,11 +356,13 @@ func buildChat(r *Request, model, host string, rejectTemp bool) []byte {
 				}
 			} else if think != "" && replay {
 				am["reasoning_content"] = think
-			} else if replay && len(calls) > 0 {
-				// a tool call with no thinking (another model's turn), which
-				// DeepSeek turns the whole request away for (#1462)
+			} else if replay && (len(calls) > 0 || afterTool) {
+				// a tool call with no thinking (another model's turn), or a
+				// reply to a tool result with none, which DeepSeek turns the
+				// whole request away for (#1462, #1822)
 				am["reasoning_content"] = noReasoning
 			}
+			afterTool = false
 			msgs = append(msgs, am)
 			continue
 		}
@@ -404,6 +418,7 @@ func buildChat(r *Request, model, host string, rejectTemp bool) []byte {
 			}
 		}
 		msgs = append(msgs, tools...)
+		afterTool = len(tools) > 0 && len(content) == 0 && len(seen) == 0
 		flush()
 	}
 	showSeen()
@@ -922,7 +937,15 @@ func (d *chatDecoder) decode(data string, emit func(Event)) error {
 	}
 	if !d.started {
 		d.started, d.tool = true, -1
-		emit(Event{Kind: KStart, MsgID: ch.ID, Model: ch.Model})
+		// most streams count the prompt only at their end, but one that
+		// counts it on its first chunk tells it at the start, as
+		// Anthropic's message_start does (#1887)
+		var prompt Usage
+		if ch.Usage != nil && ch.Usage.PromptTokens > 0 {
+			u := ch.Usage.usage()
+			prompt = Usage{Input: u.Input, CacheRead: u.CacheRead, CacheWrite: u.CacheWrite}
+		}
+		emit(Event{Kind: KStart, MsgID: ch.ID, Model: ch.Model, Usage: prompt})
 	}
 	for _, c := range ch.Choices {
 		// Translation has one reply: lock onto the first readable choice

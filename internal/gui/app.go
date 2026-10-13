@@ -157,7 +157,7 @@ func inDock(s settings.Settings, shown, fullscreen bool) bool {
 func (h *host) Quit()                        { h.app.Quit() }
 func (h *host) OpenURL(url string)           { _ = h.app.Browser.OpenURL(url) }
 func (h *host) OpenFolder(path string) error { return openFolder(h.app, path) }
-func (h *host) Copy(text string) bool        { return h.app.Clipboard.SetText(text) }
+func (h *host) Copy(text string) bool        { return copyText(h.app, text) }
 func (h *host) ChooseFolder(title string) (string, error) {
 	d := h.app.Dialog.OpenFile().CanChooseDirectories(true).CanChooseFiles(false).CanCreateDirectories(true).SetTitle(title)
 	if w := application.InvokeSyncWithResult(func() *application.WebviewWindow { return h.main }); w != nil {
@@ -481,7 +481,7 @@ func Run(version string, showMain bool, link string) error {
 	go h.lighten()
 	h.watchAlerts()
 	// the quick panel by the icon, or the main window if the user would
-	// rather (Settings → Tray icon)
+	// rather (Settings → Click the tray icon to)
 	h.tray.OnClick(func() {
 		if cmdClick() {
 			return // Command-drag moves the icon; the system handles it
@@ -510,7 +510,7 @@ func Run(version string, showMain bool, link string) error {
 		h.main.OnWindowEvent(events.Windows.WebViewNavigationCompleted, func(*application.WindowEvent) { markReady() })
 	} else {
 		h.app.Event.OnApplicationEvent(events.Common.ApplicationStarted, func(*application.ApplicationEvent) {
-			plainTitlebar(h.main) // Linux: the page's header is the title bar
+			plainTitlebar(h.main) // Linux: the page's header is the title bar; the Mac: a plain one's corners
 			nameWindow(h.panel, panelTitle)
 			ownFrame(h.panel) // KDE: no title bar of KWin's on it (#1283)
 			markReady()

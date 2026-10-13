@@ -305,7 +305,7 @@
       default: return t("npm answered with an error: {error}", { error: c.error || "" });
     }
   }
-  const checkedAt = () => checked ? new Date(checked.at).toLocaleTimeString(document.documentElement.lang || undefined, { hour: "2-digit", minute: "2-digit" }) : "";
+  const checkedAt = () => checked ? new Date(checked.at).toLocaleTimeString(intlLang(), { hour: "2-digit", minute: "2-digit" }) : "";
 
   // the built-ins with accounts this plugin could run in their place
   const movableOf = (pkg) => (mine?.movable || []).filter((c) => c.package === pkg);
@@ -485,7 +485,7 @@
     if (l.npm?.weekly) {
       const d = el("span", "pm-dl");
       d.append(glyph(DOWN, 11, 1.5), el("span", "", t("{n}/week", { n: count(l.npm.weekly) })));
-      d.title = t("{n} downloads on npm last week", { n: l.npm.weekly.toLocaleString() });
+      d.title = t("{n} downloads on npm last week", { n: l.npm.weekly.toLocaleString(intlLang()) });
       meta.append(d);
     }
     if (l.npm?.version) {
@@ -517,7 +517,7 @@
   function stars(n) {
     const d = el("span", "pm-dl");
     d.append(glyph(STAR, 11, 1.4), el("span", "", count(n)));
-    d.title = t("{n} stars on GitHub", { n: (n || 0).toLocaleString() });
+    d.title = t("{n} stars on GitHub", { n: (n || 0).toLocaleString(intlLang()) });
     return d;
   }
 
@@ -540,6 +540,80 @@
     for (const l of list) g.append(card(l));
     box.append(h, g);
     return box;
+  }
+
+  // The repositories on GitHub are many and of every kind (the owner: 这里
+  // 应该有分类以及搜索框方便用户筛选), so their section has its own kinds
+  // to pick from, each with how many there are, and a field that narrows
+  // them by name, author or description as it is typed, once there are
+  // more than a few to look through (counted before the page's search, so
+  // they don't go away under someone typing). Both narrow what the page's
+  // search has already found; only the section is drawn again.
+  // The section, its head and its field are made once and kept in the
+  // page, as the page's search field is (#1055).
+  let ghKind = "";       // "" (all) | "pv" | "mw" | "ag"
+  let ghQuery = "";
+  let ghList = [];       // what the page's search left of the repositories
+  const ghSec = el("section", "pm-sec pm-ghsec");
+  const ghHead = el("div", "pm-sechead");
+  const ghBar = el("div", "pm-ghbar");
+  const ghGrid = el("div", "pm-grid");
+  const ghFind = el("label", "pm-find pm-ghfind");
+  const ghQ = el("input");
+  ghQ.type = "search";
+  ghQ.spellcheck = false;
+  ghQ.autocomplete = "off";
+  ghQ.oninput = () => { ghQuery = ghQ.value; drawGh(); };
+  ghQ.onkeydown = (ev) => { ev.stopPropagation(); if (ev.key === "Escape" && ghQ.value) { ghQ.value = ""; ghQ.oninput(); } };
+  ghFind.append(glyph(SEARCH, 13, 1.6), ghQ);
+  const ghMatch = (l) => {
+    const f = ghQuery.trim().toLowerCase();
+    return !f || [l.name, l.github.repo, l.github.owner, l.package, summary(l)].join(" ").toLowerCase().includes(f);
+  };
+  function ghSection(list) {
+    ghList = list;
+    const h = [el("h3", "", t("Unofficial, on GitHub")), el("span", "", t("repositories their authors tagged {topic} — nobody has reviewed them; read the code before you install one", { topic }))];
+    ghHead.replaceChildren(...h);
+    drawGh();
+    return ghSec;
+  }
+  function drawGh() {
+    if ((tagged || []).length <= 6) {
+      ghGrid.replaceChildren(...ghList.map(card));
+      replaceKeeping(ghSec, [ghHead, ghGrid]);
+      return;
+    }
+    // the kinds there are, in the market's order, each with how many the
+    // field leaves of it; one kind alone needs no picking
+    const found = ghList.filter(ghMatch);
+    const kinds = ["pv", "mw", "ag"].filter((k) => ghList.some((l) => kindOf(l) === k));
+    if (!kinds.includes(ghKind)) ghKind = "";
+    const n = (k) => found.filter((l) => !k || kindOf(l) === k).length;
+    const bar = [];
+    if (kinds.length > 1) {
+      const pick = segs([["", t("All") + " · " + n("")], ...kinds.map((k) => [k, t(KINDS[k][1]) + " · " + n(k)])], ghKind, (k) => { ghKind = k; drawGh(); });
+      pick.classList.add("pm-ghkinds");
+      pick.setAttribute("role", "group");
+      pick.setAttribute("aria-label", t("Kind of plugin"));
+      bar.push(pick);
+    }
+    bar.push(el("span", "grow"), ghFind);
+    ghQ.placeholder = t("Filter by name, author or description");
+    ghQ.setAttribute("aria-label", t("Filter the plugins on GitHub"));
+    if (ghQ.value !== ghQuery) ghQ.value = ghQuery;
+    replaceKeeping(ghBar, bar);
+    const shown = found.filter((l) => !ghKind || kindOf(l) === ghKind);
+    if (shown.length) {
+      ghGrid.replaceChildren(...shown.map(card));
+      replaceKeeping(ghSec, [ghHead, ghBar, ghGrid]);
+      return;
+    }
+    const none = el("div", "pm-ghnone");
+    const all = el("button", "text", t("Show all"));
+    all.type = "button";
+    all.onclick = () => { ghKind = ""; ghQuery = ""; drawGh(); ghQ.focus(); };
+    none.append(el("span", "", t("No plugin on GitHub matches")), all);
+    replaceKeeping(ghSec, [ghHead, ghBar, none]);
   }
 
   // the head and its search field are made once and drawn again in
@@ -633,7 +707,8 @@
   let body = null;
   function draw() {
     const scroll = page.scrollTop;
-    body = el("div", "lib-body pm-body");
+    // the body is made once, so the GitHub section's field stays in the page
+    body = body || el("div", "lib-body pm-body");
     replaceKeeping(page, [head(), body]);
     drawBody();
     page.scrollTop = scroll;
@@ -644,8 +719,9 @@
     const key = tab + (query ? ":q" : "");
     body.classList.toggle("enter", shown !== key);
     shown = key;
-    body.replaceChildren();
-    // the search field keeps its focus: only the body is redrawn while typing
+    // the search field keeps its focus: only the body is redrawn while
+    // typing, and the GitHub section's field is kept in it
+    if (tab === "installed" || !listings) body.replaceChildren();
     if (tab === "installed") return drawInstalled();
     if (failedList && !listings) {
       body.append(el("p", "pm-empty", t("Couldn't load the plugins: {error}", { error: failedList })));
@@ -661,21 +737,24 @@
     // a tagged repository the market already lists is the market's card
     const listed = new Set(listings.map((l) => l.package));
     const gh = (tagged || []).filter((l) => !(l.github.package && listed.has(l.github.package)) && match(l));
+    // put in place around the GitHub section, which stays in the page
+    const out = [];
     if (!f) {
-      body.append(intro());
+      out.push(intro());
       // magpie's community's alone: others' plugins are found by a search
       const ours = ls.filter((l) => l.community && kindOf(l) === "pv");
       const mws = ls.filter((l) => l.community && kindOf(l) === "mw");
       const ags = ls.filter((l) => l.community && kindOf(l) === "ag");
-      if (ours.length) body.append(section(t("Subscriptions"), t("written for magpie, checked against its own sign-ins"), ours));
-      if (mws.length) body.append(section(t("Gateway middleware"), t("runs in magpie's gateway on what every agent sends and gets back, whichever provider serves it"), mws));
-      if (ags.length) body.append(section(t("Agents"), t("agents magpie has no setup of its own for, connected to it as its own are"), ags));
-      if (gh.length) body.append(section(t("Unofficial, on GitHub"), t("repositories their authors tagged {topic} — nobody has reviewed them; read the code before you install one", { topic }), gh));
-      body.append(manual());
+      if (ours.length) out.push(section(t("Subscriptions"), t("written for magpie, checked against its own sign-ins"), ours));
+      if (mws.length) out.push(section(t("Gateway middleware"), t("runs in magpie's gateway on what every agent sends and gets back, whichever provider serves it"), mws));
+      if (ags.length) out.push(section(t("Agents"), t("agents magpie has no setup of its own for, connected to it as its own are"), ags));
+      if (gh.length) out.push(ghSection(gh));
+      out.push(manual());
+      replaceKeeping(body, out);
       return;
     }
-    if (ls.length) body.append(section(t("Suggested"), "", ls));
-    if (gh.length) body.append(section(t("Unofficial, on GitHub"), t("repositories their authors tagged {topic} — nobody has reviewed them; read the code before you install one", { topic }), gh));
+    if (ls.length) out.push(section(t("Suggested"), "", ls));
+    if (gh.length) out.push(ghSection(gh));
     const known = new Set([...listings.map((l) => l.package), ...(tagged || []).map((l) => l.github.package).filter(Boolean)]);
     const box = el("section", "pm-sec");
     const h = el("div", "pm-sechead");
@@ -691,7 +770,8 @@
       for (const x of list) g.append(card({ package: x.package, name: x.package, npm: x }));
       box.append(g);
     }
-    body.append(box);
+    out.push(box);
+    replaceKeeping(body, out);
   }
 
   function intro() {
@@ -861,7 +941,7 @@
     } else if (e.autoUpdated && e.autoUpdated.to === e.version) {
       // magpie updated it by itself lately: the row says so, quietly
       const c = el("span", "pm-chip soft", t("Auto-updated"));
-      c.title = t("magpie updated it from v{from} to v{to} on {date}", { from: e.autoUpdated.from, to: e.autoUpdated.to, date: new Date(e.autoUpdated.at).toLocaleDateString(document.documentElement.lang || undefined, { month: "short", day: "numeric" }) });
+      c.title = t("magpie updated it from v{from} to v{to} on {date}", { from: e.autoUpdated.from, to: e.autoUpdated.to, date: new Date(e.autoUpdated.at).toLocaleDateString(intlLang(), { month: "short", day: "numeric" }) });
       nm.append(c);
     } else if ((ck?.status === "current" || ck?.status === "update") && e.version) {
       const c = el("span", "pm-chip soft", t("Up to date"));
@@ -1096,7 +1176,7 @@
       d.title = m.error;
       return d;
     }
-    const lang = document.documentElement.lang || undefined;
+    const lang = intlLang();
     let s = t("Gateway middleware: {hooks}", { hooks: m.hooks.join(t(", ")) });
     if (m.calls) s += " · " + t("{n} calls, {us} µs each", { n: m.calls.toLocaleString(lang), us: m.avgMicros < 10 ? m.avgMicros.toFixed(1) : Math.round(m.avgMicros).toLocaleString(lang) });
     d.append(el("span", "", s));
@@ -1189,7 +1269,7 @@
     try {
       const p = await api("plugins/page?name=" + encodeURIComponent(l.package));
       const at = l.github && !entryOf(l.package) ? l.github.pushed : p.updated;
-      upd.textContent = at && !at.startsWith("0001") ? new Date(at).toLocaleDateString(document.documentElement.lang || undefined, { year: "numeric", month: "short", day: "numeric" }) : "—";
+      upd.textContent = at && !at.startsWith("0001") ? new Date(at).toLocaleDateString(intlLang(), { year: "numeric", month: "short", day: "numeric" }) : "—";
       readme.replaceChildren(markdown(p.readme || t("No README")));
     } catch (e) {
       upd.textContent = "—";

@@ -49,6 +49,10 @@ type candidate struct {
 	rank int
 	// capped is set on an account left out as held at its usage cap
 	capped *capHold
+	// noURL is the protocol its provider's keys are all set to that the
+	// provider has no URL for (#1702): the provider is tried whole, on the
+	// URLs it has, and the routing trace says why
+	noURL provider.Protocol
 }
 
 // capHold is how an account is held at its usage cap: the cap of the
@@ -154,6 +158,9 @@ func perKeyOf(p provider.Provider, model string, from provider.Protocol) (out, a
 // serve the model (provider.AccountModels, #474): never tried, whatever
 // else there is — none, when every one of them is.
 func perKeyBarred(p provider.Provider, model string, from provider.Protocol) (out, aside, left, barred []candidate) {
+	if _, off := provider.ModelDisabled(p.ID, model); off || provider.DisabledUnknown() {
+		return nil, nil, nil, nil // the user disabled it (#1867): never planned, a fallback no more than the model asked
+	}
 	if p.Account != nil {
 		also := p.AlsoOn()
 		var all []candidate
@@ -217,9 +224,13 @@ func perKeyBarred(p provider.Provider, model string, from provider.Protocol) (ou
 	}
 	keys := p.KeysOn()
 	var unlisted []candidate
+	var noURL provider.Protocol
 	for i, k := range keys {
 		q := p.WithKey(k)
 		if len(q.Speaks()) == 0 && !q.DecidesModel(model) {
+			if noURL == "" {
+				noURL = k.Protocol
+			}
 			continue // made for a protocol this provider has no endpoint for
 		}
 		rest := p.ID
@@ -244,7 +255,10 @@ func perKeyBarred(p provider.Provider, model string, from provider.Protocol) (ou
 		return nil, nil, nil, barred
 	}
 	if len(out) == 0 {
-		return []candidate{{p: p, model: model, rest: p.ID}}, nil, nil, nil
+		// every key is set to a protocol the provider has no URL for (or
+		// it has none on): the provider as it is, on the URLs it has,
+		// marked so Routing says so rather than sending it there quietly
+		return []candidate{{p: p, model: model, rest: p.ID, noURL: noURL}}, nil, nil, nil
 	}
 	sort.SliceStable(out, func(i, j int) bool { return keyFit(out[i].p, model, from) < keyFit(out[j].p, model, from) })
 	pool := out[:0:0]
@@ -314,6 +328,7 @@ func (s *Server) plan(p provider.Provider, model string, from provider.Protocol)
 		cs, aside, left, barred := perKeyBarred(q, m, from)
 		pl.left = append(pl.left, barredOf(barred, q, fallback, from, nil)...)
 		pl.held = append(pl.held, creditsHeld(barred)...)
+		pl.capped = append(pl.capped, capHeldOnly(barred)...)
 		cs, wg := weigh(q, cs, m, from)
 		for i, c := range cs {
 			w := weighed(c, q, wg, fallback, from)
@@ -373,15 +388,16 @@ func (s *Server) planGroup(g provider.Group, ms []provider.Member, from provider
 func planLevel(g provider.Group, ms []provider.Member, depth int, from provider.Protocol, pl *planned, asides *[]candidate, wAsides *[]Weighed) []candidate {
 	keys := func(m provider.Member) []candidate {
 		cs, aside, left, barred := perKeyBarred(m.Provider, m.Model, from)
-		pl.left = append(pl.left, barredOf(barred, m.Provider, false, from, m.Groups())...)
-		pl.held = append(pl.held, creditsHeld(barred)...)
 		// the effort the member is fixed at goes with each of its keys:
 		// the same model at another effort is another member's
-		for _, l := range [][]candidate{cs, aside, left} {
+		for _, l := range [][]candidate{cs, aside, left, barred} {
 			for i := range l {
 				l[i].effort, l[i].fast = m.Effort, m.Fast
 			}
 		}
+		pl.left = append(pl.left, barredOf(barred, m.Provider, false, from, m.Groups())...)
+		pl.held = append(pl.held, creditsHeld(barred)...)
+		pl.capped = append(pl.capped, capHeldOnly(barred)...)
 		*asides = append(*asides, aside...)
 		for _, w := range asideOf(aside, m.Provider, false, from) {
 			w.Via = m.Groups()
@@ -420,6 +436,7 @@ func planLevel(g provider.Group, ms []provider.Member, depth int, from provider.
 				var sub planned
 				cs := planLevel(m.Via[depth], ms[i:j], depth+1, from, &sub, asides, wAsides)
 				pl.left = append(pl.left, sub.left...)
+				pl.capped = append(pl.capped, sub.capped...)
 				if len(cs) > 0 {
 					add(unit{cs: cs, order: sub.order}, firstAwake(cs))
 				}
@@ -619,6 +636,19 @@ func creditsHeld(cs []candidate) []candidate {
 	return out
 }
 
+// capHeldOnly are those of cs held at the usage cap the user set on them,
+// not for credits they won't spend: a conversation kept strictly on one
+// goes on there past the cap (provider.AffinityStrict, #1797).
+func capHeldOnly(cs []candidate) []candidate {
+	var out []candidate
+	for _, c := range cs {
+		if c.capped != nil && !c.capped.noCredits {
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
 // barredOf is how the trace tells the accounts or keys the user set not
 // to serve the model: left out, as those not listing it are.
 func barredOf(cs []candidate, q provider.Provider, fallback bool, from provider.Protocol, via []string) []Weighed {
@@ -807,6 +837,42 @@ func spentAfter(cs []candidate) bool {
 	return len(cs) > 0
 }
 
+// spentModel says whether every account or key routing would try for
+// p's model is out of its allowance as last known: held at its usage cap,
+// resting after the vendor said it is out of quota or credit (the
+// account's, or its model's own pool), or with a window that counts the
+// model used up. back is when the first of them is, zero when none says.
+// A model magpie picks for a call of its own (AutoVision, autoSearcher)
+// is one routing would still try: a turn's own model goes to the one
+// candidate it has all the same, but the describer or searcher picked in
+// its place can be another (#1801). Unknown allowance, or a rest for a
+// rate limit or an error, is not spent.
+func spentModel(p provider.Provider, model string, from provider.Protocol, now time.Time) (back time.Time, spent bool) {
+	out, aside, _, barred := perKeyBarred(p, model, from)
+	soonest := func(t time.Time) {
+		if !t.IsZero() && (back.IsZero() || t.Before(back)) {
+			back = t
+		}
+	}
+	for _, c := range barred {
+		if c.capped != nil {
+			soonest(c.capped.back)
+		}
+	}
+	for _, c := range append(out, aside...) {
+		if r, ok := restingOf(c); ok && (r.Why == failQuota || r.Why == failCredit) {
+			soonest(r.Until)
+			continue
+		}
+		if t := c.full(now); !t.IsZero() {
+			soonest(t)
+			continue
+		}
+		return time.Time{}, false
+	}
+	return back, true
+}
+
 var restingUntil = struct {
 	sync.Mutex
 	m    map[string]time.Time
@@ -855,6 +921,8 @@ func modelRefused(status int, body []byte) bool {
 	default:
 		return false
 	}
+	// the words are matched decoded, too (#1669)
+	body = wordsOf(body)
 	return unservedWords.Match(body) && !quotaWords.Match(body) && !refusedWords.Match(body)
 }
 
@@ -879,6 +947,8 @@ func modelRetired(status int, body []byte) bool {
 	default:
 		return false
 	}
+	// the words are matched decoded, too (#1669)
+	body = wordsOf(body)
 	return retiredWords.Match(body) && !quotaWords.Match(body)
 }
 
@@ -907,13 +977,19 @@ func promptRefused(status int, body []byte) bool {
 // shapeWords are how a vendor says it can't read the request's shape — an
 // item, field or parameter it doesn't know, which another vendor's API may
 // take: xAI's 422 "Failed to deserialize the JSON body …: unknown item type"
-// (#350), OpenAI's "Unknown parameter". A request missing what every API
-// requires ("field required") or too long for the model isn't one.
-var shapeWords = regexp.MustCompile(`(?i)failed to deserialize|unknown (item |content |input )?(type|variant|field|parameter)|unknown_parameter|unrecognized (request argument|field|parameter)|extra (inputs|fields) are not permitted|additional properties are not allowed`)
+// (#350), OpenAI's "Unknown parameter", and a limit of its own on a tool's
+// JSON schema: OpenCode Go's 400 "JSON schema exceeds the maximum nesting
+// depth of 10 levels" on muse-spark-1.3-contributor for Claude Code's MCP
+// tools (#1870), which another member's model may take as they are. A
+// request missing what every API requires ("field required") or too long
+// for the model isn't one.
+var shapeWords = regexp.MustCompile(`(?i)failed to deserialize|unknown (item |content |input )?(type|variant|field|parameter)|unknown_parameter|unrecognized (request argument|field|parameter)|extra (inputs|fields) are not permitted|additional properties are not allowed|schema exceeds the maximum (nesting )?depth|schema[^"]{0,60}\bnesting depth\b`)
 
 // shapeRefused says a request failed over its shape alone: the next
 // member is asked, and this one doesn't rest, as nothing is wrong with it.
 func shapeRefused(status int, body []byte) bool {
+	// the words are matched decoded, too (#1669)
+	body = wordsOf(body)
 	return (status == 400 || status == 422) && shapeWords.Match(body) &&
 		!quotaWords.Match(body) && !unservedWords.Match(body) && !refusedWords.Match(body)
 }
@@ -967,6 +1043,8 @@ func elsewhere(left []candidate, c candidate) []candidate {
 // that failed this way: the vendor was busy, out of quota or failing, or
 // this key or provider can't serve it — not the request itself at fault.
 func retryable(status int, body []byte) bool {
+	// the words are matched decoded, too (#1669)
+	body = wordsOf(body)
 	switch {
 	case overflowed(status, body):
 		// a conversation too long for the model is as long on every
@@ -991,9 +1069,10 @@ func retryable(status int, body []byte) bool {
 // error, was the vendor failing (#733): unreachable, overloaded, out of
 // quota. A conversation grown too long for the model, or a request the
 // vendor turned away as it reads, would fail the same at the next asked:
-// nobody rests for it.
+// nobody rests for it. Nor does an account rest when a model generated
+// empty output (#1221).
 func lateRests(msg string) bool {
-	return !tooLong(http.StatusBadRequest, msg) && !refusedWords.MatchString(msg) && !protectionWords.MatchString(msg)
+	return !tooLong(http.StatusBadRequest, msg) && !refusedWords.MatchString(msg) && !protectionWords.MatchString(msg) && !strings.Contains(msg, emptyReply)
 }
 
 // unsaidMargin is how far past a model's window a request's estimate
@@ -1018,6 +1097,8 @@ func tooLongUnsaid(p provider.Provider, model string, tokens, status int, body [
 	default:
 		return "", false
 	}
+	// the words are matched decoded, too (#1669)
+	body = wordsOf(body)
 	if overflowed(status, body) || failure(status, body) != failOther || quotaWords.Match(body) ||
 		unservedWords.Match(body) || refusedWords.Match(body) || provider.EdgeBlocked(body) || regionRefused(status, body) {
 		return "", false
@@ -1379,17 +1460,13 @@ func (h *holdWriter) Write(b []byte) (int, error) {
 		if sse, sure := sseStart(head); sure {
 			h.wholeUnsure = false
 			if sse {
-				// a stream under a type that doesn't say so: through as it
-				// comes, with what was held of its start
-				h.whole = false
-				h.held.Reset()
-				h.pass()
-				h.refusalAfter(head)
-				h.sent(head)
-				if _, err := h.w.Write(head); err != nil {
-					return 0, err
-				}
-				return len(b), nil
+				// a stream under a type that doesn't say so: held as a
+				// stream from here, its events read as they come, so an
+				// error before anything is said still goes to the next
+				// candidate. It went through at once before, and a 200
+				// that only framed a reply and then failed reached the
+				// agent (#1418)
+				h.whole, h.stream, h.since = false, true, time.Now()
 			}
 		}
 	}
@@ -2136,7 +2213,9 @@ func (p streamPart) thought() bool {
 }
 
 // said tells whether a part says anything an agent would show or act on:
-// text, reasoning, a call. What isn't known is taken as saying something.
+// text, reasoning, a call. Of what isn't known, a call or a tool's part
+// (web_search_call, mcp_tool_use, server_tool_use, ...) says something;
+// anything else only frames the reply until something does (#1418).
 func (p streamPart) said() bool {
 	switch p.Type {
 	case "text", "output_text", "summary_text", "reasoning_text":
@@ -2165,7 +2244,7 @@ func (p streamPart) said() bool {
 		}
 		return false
 	}
-	return true
+	return strings.Contains(p.Type, "call") || strings.Contains(p.Type, "tool") || strings.HasPrefix(p.Type, "mcp_")
 }
 
 // streamEvent says what one server-sent event of a reply is, in any of the
@@ -2374,7 +2453,39 @@ func streamEvent(ev []byte) (kind, status int, msg string) {
 		}
 		return eventLead, 0, ""
 	}
-	return eventContent, 0, ""
+	if replyEvent(typ) {
+		return eventContent, 0, ""
+	}
+	// what isn't known to carry a reply only frames it: it lets the
+	// stream through no more than a ping does. Taken for content, a 200
+	// that sent only such frames went through, and the overloaded error
+	// after them reached Codex with five candidates never asked
+	// (Aliceonly on #1418). A stream that ends well is released whole
+	return eventLead, 0, ""
+}
+
+// replyEvent tells whether an event, past the cases streamEvent tells
+// apart, is one of a protocol's events that carry a reply or end it:
+// Anthropic's blocks and stop, Responses' text, refusal, items, parts,
+// calls and audio, and its end.
+func replyEvent(typ string) bool {
+	switch typ {
+	case "content_block_start", "content_block_delta", "message_delta", "message_stop",
+		"response.completed", "response.incomplete", "response.done":
+		return true
+	}
+	rest, ok := strings.CutPrefix(typ, "response.")
+	if !ok {
+		return false
+	}
+	for _, p := range []string{"output_text.", "refusal.", "output_item.", "content_part.", "audio", "output_audio"} {
+		if strings.HasPrefix(rest, p) {
+			return true
+		}
+	}
+	// a call's arguments or a hosted tool's progress: function_call_
+	// arguments, custom_tool_call_input, web_search_call, mcp_call, ...
+	return strings.Contains(rest, "_call") || strings.HasPrefix(rest, "mcp_")
 }
 
 // anthropicDeltaThinks tells whether an Anthropic content_block_delta is

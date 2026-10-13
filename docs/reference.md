@@ -94,6 +94,7 @@ line; agents connected to magpie lose it when it quits.
 | OpenClaw     | `~/.openclaw/openclaw.json` (`$OPENCLAW_HOME`, `$OPENCLAW_STATE_DIR`, `$OPENCLAW_CONFIG_PATH`) | model (default primary; magpie's provider and catalog in `/model`) |
 | OpenChamber  | `~/.config/openchamber/preferences.json` (`$OPENCHAMBER_DATA_DIR`; magpie's provider in OpenCode's config) | model, small (its own defaults, over OpenCode's) |
 | MiMo Code    | `~/.config/mimocode/mimocode.json(c)` | model, small |
+| DevEco Code  | `~/.config/deveco/deveco.json(c)` (`$DEVECO_CONFIG_DIR`; its key is `magpie-deveco`, as parts of it send OpenCode's User-Agent) | model, small |
 | Pi           | `~/.pi/agent/settings.json`       | model           |
 | StepCode     | `~/.stepcode/config.toml` (+ `models.json`; `$STEP_CODING_AGENT_DIR`, `$STEPCODE_CONFIG_DIR`) | model |
 | Aside        | `~/.aside/u/0/settings.json` (+ `models.json`; the first account, the only one magpie wires) | model, effort, fast, standard, deep, visual, image |
@@ -115,7 +116,7 @@ line; agents connected to magpie lose it when it quits.
 | fx           | `~/.fx/settings.json`             | model (a keyless `magpie` provider) |
 | omp (oh-my-pi) | `~/.omp/agent/config.yml` (+ `models.yml`) | model |
 | Devin        | `~/.config/devin/config.json` (`%APPDATA%\devin\config.json` on Windows) | model |
-| Hermes Agent | `~/.hermes/config.yaml` (`$HERMES_HOME`) | model |
+| Hermes Agent | `~/.hermes/config.yaml` (`%LOCALAPPDATA%\hermes` on Windows; `$HERMES_HOME`), and each profile's under `profiles/` | model |
 | Mister Morph | `~/.morph/config.yaml` (`$MISTER_MORPH_CONFIG`) | model, effort (`llm` on the gateway as `openai_response_compatible`, the Responses API; what it had comes back when you switch away) |
 | Kimi Code    | `~/.kimi/config.toml` (`$KIMI_SHARE_DIR`) | model (a `magpie` provider; magpie's models in Kimi's /model) |
 | Qwen Code    | `~/.qwen/settings.json` (`$QWEN_HOME`) | model (magpie's models as `modelProviders.openai` entries on a `MAGPIE_QWEN_API_KEY` env var; settings.model; `security.auth.selectedType` openai while wired) |
@@ -130,7 +131,7 @@ line; agents connected to magpie lose it when it quits.
 | Qoder (CLI)  | `~/.qoder/settings.json` (`$QODER_CONFIG_DIR`) | model, effort (a `magpie` custom provider; needs a Qoder plan with BYOK) |
 | Qoder CN (CLI) | `~/.qoder-cn/settings.json` (`$QODERCN_CONFIG_DIR`) | model, effort (as Qoder; its own accounts, a Qoder CN plan with BYOK) |
 | Grok Build   | `~/.grok/config.toml` (`$GROK_HOME`) | model, effort |
-| Grok App     | `agent-home/config.toml` in its data folder (`$GROK_APP_HOME`, else `~/Library/Application Support/com.grokapp.grok-app`, `%APPDATA%\grokapp\grok-app\data`, `$XDG_DATA_HOME/grok-app`, or `~/.grok-app`) | model (a `[model.magpie]` provider channel as the App's Providers page writes one, with magpie's models and their effort levels in `app_models`; `[models] default = "magpie"`, what was there put back on Disconnect; a model or default effort picked in the App kept; effort is picked in the App's composer; MCP servers and skills reach it through Grok Build's row) |
+| Grok App     | `agent-home/config.toml` in its data folder (`$GROK_APP_HOME`, else `~/Library/Application Support/com.grokapp.grok-app`, `%APPDATA%\grokapp\grok-app\data`, `$XDG_DATA_HOME/grok-app`, or `~/.grok-app`) | model (a `[model.magpie]` custom provider under Accounts, with magpie's models and their effort levels in `app_models`; the route, `[models] default`, stays until the user presses Use on magpie there (one of the App's own routes picked in magpie is written as the route, and magpie's channel goes); a route an older magpie set to `magpie` is put back once; Disconnect drops the channel and puts the route back only if it is still `magpie`, else the one it was on before Connect if none is left; a model or default effort picked in the App kept; instructions, MCP and skills are the Library's Grok App row on agent-home; RTK has no hook for it or for Grok Build) |
 | ZCode        | `~/.zcode/v2/config.json`         | provider (magpie's models in ZCode's picker) |
 | WorkBuddy    | `~/.workbuddy/models.json` (`$WORKBUDDY_CONFIG_DIR`) | provider (magpie's models in WorkBuddy's picker) |
 | WorkBuddy AI | `~/.workbuddy-ai/models.json` (the international build) | provider (magpie's models in WorkBuddy AI's picker) |
@@ -141,7 +142,7 @@ line; agents connected to magpie lose it when it quits.
 | Snow CLI     | `~/.snow/profiles/magpie.json` (`$SNOW_CONFIG_DIR`), made the active profile and copied to `config.json` | model (the user's other profiles' models too; Snow App takes the profile in with "Sync Snow CLI API config") |
 | Alma         | Alma's local API (`localhost:23001`, while Alma runs; alma-server's data in `$ALMA_DATA_DIR`, `$XDG_DATA_HOME/alma` or `~/.local/share/alma` on Linux) | model (Alma's default; magpie's models as a provider), and Image Generation's model when it is Auto: the one magpie draws with |
 
-Provider-scoped agents (OpenCode, OpenClaw, MiMo Code, Pi, OmO, StepCode, Aside, Goose, Crush, omp, Hermes Agent) take `provider/model`.
+Provider-scoped agents (OpenCode, OpenClaw, MiMo Code, DevEco Code, Pi, OmO, StepCode, Aside, Goose, Crush, omp, Hermes Agent) take `provider/model`.
 Only agents that are installed or configured are shown.
 
 ### Notes on some agents
@@ -264,6 +265,19 @@ agent's; any other of yours is always sent. The beta of the agent's own
 sign-in (`oauth-2025-04-20`, which Claude Code signed in to claude.ai asks)
 never goes, as the sign-in never does; one you set yourself does.
 
+Requests go to a vendor with magpie's own User-Agent (`magpie/<version>`).
+A coding plan that serves only the agents it names knows them by theirs:
+`magpie provider set <id> user-agent=agent` (the editor's "Send the
+agent's own User-Agent") sends a key+URL provider the User-Agent the agent
+sent magpie, as it sent it, on every API (chat, Anthropic, Responses,
+Gemini, count_tokens, embeddings, images, videos). A request the agent
+sent without one, and magpie's own (its classifier's, the image tool's),
+still go as magpie. A `header.User-Agent` you set wins over both.
+`user-agent=magpie` turns it off again; off is the default. A signed-in
+account, a plugin's and a vendor whose own client magpie goes as
+(OpenCode, Cline, Kilo, another magpie) keep the User-Agent their sign-in
+sends, and don't take it.
+
 `magpie usage` also lists **upstream provider keys** to help check upstream bills.
 Each request records the fingerprint and saved name of the key that actually
 served it, including image calls and account/key failover. The CSV adds
@@ -326,27 +340,38 @@ item to its last, never from the output of a tool the call itself ran,
 which an older rollout writes before the call's token count. OpenCode's rows
 show none.
 A call whose session file timed it (a Codex turn of one call) shows its own
-speed as before. When that call reasoned, the file has its first token but
-not its first text, so no speed is measured; it shows the least its answer
-wrote at instead: its output less the reasoning, all written after the first
-token, over the time from the first token to its end. Its whole output over
-that time would count reasoning written before the first token and read
-high. A floor never mixes into a measured speed: the Speed trend and
+speed when the time after its first token is a second or more and it wrote
+100 tokens or more in it (`usage.CodexWindowMs`, `usage.CodexBodyTokens`).
+That time can be one network push rather than the writing: a reply whose
+first token came at 6.8 s and the rest 0.2 s later read 1,900 tok/s. When
+that call reasoned, the file has its first token but not its first text, so
+no speed is measured; it shows the least its answer wrote at instead: its
+output less the reasoning, all written after the first token, over the time
+from the first token to its end, held to the same second and 100 tokens. Its
+whole output over that time would count reasoning written before the first
+token and read high. A Codex turn of one call that tells neither shows the
+least it wrote at over the whole turn, the wait for the first token in it
+(`≥120 tok/s` for 1,200 tokens in 10 s), by the same rule as any floor over
+a whole time: 1,000 tokens or more over a second or more. Under that the
+wait is too much of the time to tell anything, so an 11-token answer in
+2.75 s shows none, as an 815-token Claude Code reply does. Gateway rows and other agents' keep their own
+speed. A floor never mixes into a measured speed: the Speed trend and
 `magpie usage` count timed calls only.
 
 A group's speed (a row of the Usage page's ranking, by model, provider or
 agent, its Output speed card, and the overview's lists) says how many
 replies it is of, by one rule: with replies whose speed was measured, their
-speed and how many they are (`125 tok/s (1)`, not beside "260 requests"
-alone); with rows that tell a floor, the least those wrote at and how many
-(`≥100 tok/s (30)`); with both, both, the measured first
-(`125 tok/s (1) · ≥50 tok/s (259)`), as a few measured replies may not
-stand for the rest and a floor is no measure; with neither, nothing. The
-Output speed card shows the measured speed as its figure and the floor
-under it. The tooltip says what each is of. A ranking by speed orders and
-bars a group by its measured speed, or its floor when it has none
-(`usage.Totals` `decode_n`, `floor_out`, `floor_ms`, `floor_n`;
-`usage.Row.Floor`).
+speed and how many they are (`62 tok/s · 2 timed replies`, not beside "260
+requests" alone); with rows that tell a floor, the least those wrote at and
+how many (`≥100 tok/s · 30 replies`); with both, both, the one of more
+replies first (`≥50 tok/s · 259 replies; 125 tok/s · 1 timed reply`), as a
+few measured replies may not stand for the rest; with neither, nothing.
+Counts are words, never a bare number in parentheses. The Output speed card
+shows the first as its figure, its count beside it, the other under it, and
+the mean wait for the first token on a line of its own with how many timed
+replies it is of. The tooltip says what each is of. A ranking by speed
+orders and bars a group by the figure it shows first (`usage.Totals`
+`decode_n`, `floor_out`, `floor_ms`, `floor_n`; `usage.Row.Floor`).
 
 It lists **accounts** too: each Codex, Claude or other subscription account's
 tokens and cost, by the account that actually answered — the one that took
@@ -591,6 +616,19 @@ and can't be told from an agent here: point it at this computer's LAN
 address with sharing on, not at loopback. A proxy here that signs its
 clients in itself can be trusted with `MAGPIE_TRUST_PROXY=1`, which keeps
 what it forwards local, as before.
+
+To let other computers in only from some addresses, list them as IPs and
+CIDR ranges in **Settings → Network and sharing → Allowed addresses**, or in
+`MAGPIE_ALLOW_IPS` (`203.0.113.7,10.0.0.0/8,2001:db8::/32`), which comes
+first. A request from any other address is refused 403, even with an
+enabled gateway key, and the refusal names the address it came from. This
+computer is always let in. The address is the connection's own, never a
+forwarding header, so behind a proxy or tunnel every client has the proxy's
+address: limit them at the proxy. A mistyped entry in `MAGPIE_ALLOW_IPS`
+lets nothing in rather than everything. When settings.json can't be read, or
+doesn't parse and has no good backup, the list read last stays in force; if
+none was read since magpie started, only this computer is let in until the
+file is repaired. `magpie web`'s page honours the same list.
 
 **Usage → Overview → Gateway keys** groups calls by the client's key, never
 the provider's credential. **Usage → Requests** offers the same filter;
@@ -918,6 +956,14 @@ relay that sells `kimi-k3` as `moonshot-kimi-k3` answers as `kimi-k3`, so its
 calls are counted at `relay-a/kimi-k3`'s price. A model with a price of its
 own, `0` included, keeps it whatever its reply says.
 
+A call with no price at all is left out of a total's cost, never counted as
+free: the Usage page's sum says how many calls it couldn't price beside it
+("≈$1.20+", then "3 calls unpriced"; Sessions, which prices by model, says how
+many models), and `magpie usage` and the terminal app's Usage page say the
+same after their totals. magpie doesn't guess a variant's price from a
+similar name (`-auto`, `-max`, `-fast` can each cost differently); give it
+one with `magpie model price`, or in the provider's editor under the model.
+
 A **Kimi Code** membership's models are counted at the Kimi API model each
 one is, not at the $0 models.dev lists them at for the plan: `k3` and
 `k3-256k` at `kimi-k3`, `kimi-for-coding-highspeed` at
@@ -1002,8 +1048,13 @@ numbers are kept, and are what its models take once it is serving again.
 A window is a number agents are shown **and a routing input**: at 95% of the
 window a request held on a routing-group member moves to one that takes more,
 so overstating a window makes that move happen too late. A reply limit is
-advertised in `/models` and is what a group advertises the smallest of; the
-gateway does not itself cap a reply by it.
+advertised in `/models` and is what a group advertises the smallest of. The
+gateway doesn't lower a limit an agent sends by it. A request that names none
+and goes to Anthropic's Messages API, which needs one (Codex's Responses turns,
+a Chat client's), is sent it as `max_tokens`, within the window as agents are
+told it. Only a model whose limit nobody knows goes at 16384. A reply that
+runs into it ends with `stop_reason: max_tokens`, which a Responses client
+reads as `incomplete_details.reason: "max_output_tokens"` (#1792).
 
 Saving a window or a reply limit writes that number into the model lists magpie
 keeps in the agents' own files — Pi's `contextWindow` and `maxTokens`, OpenCode's
@@ -1109,11 +1160,13 @@ relay's `/v1/usage`, its card shows those windows and routing weighs it by
 them as it does a subscription, resting it till the window renews once the
 relay says `api key 7天限额已用完` — or till its windows are next read short
 of full, its limit raised or its usage reset. A key bought as a plan — Kimi Code, GLM Coding Plan
-or Z.ai, MiniMax Coding Plan, OpenCode Go, Command Code — is weighed by its
+or Z.ai, MiniMax Coding Plan, OpenCode Go, Command Code, Ollama Cloud — is weighed by its
 plan's windows the same way. With one key or account, the Routing page still
 shows what it has left. `stays=` is how long a conversation
 stays with the key or account that answered it: `auto` (the default, while
-the vendor's cache of it is worth keeping), `session`, `turn` or `off`.
+the vendor's cache of it is worth keeping), `session`, `turn`, `off` or
+`strict` (never moved to another key or account, even past its usage cap:
+its errors go to the agent).
 `models=` replaces the whole list, in order; a bare model id works when only
 one provider serves it.
 
@@ -1214,7 +1267,9 @@ result for every request: who went first, and why.
    across turns while at least 1,024 tokens of the last request were read
    from the vendor's cache and it answered in the last 5 minutes. This
    never brings back an account that is resting, nor one that has used 98%
-   of a window (100% In order).
+   of a window (100% In order). *Stays: Strict* does, and asks no other:
+   the conversation stays on its account, resting, spent or past its cap,
+   and its errors go to the agent.
 
 So routing decides who goes first only for a conversation nobody has
 answered yet. An account that has used 90% goes behind the others for new
@@ -1524,6 +1579,42 @@ only with a gateway key. A key held to a budget, to some models or to some
 accounts is told its own calls alone: `/v1/magpie/usage` refuses it with a
 403, and `/v1/magpie/usage/requests` keeps only its rows and filter lists.
 
+An app that calls its vendor itself, not through magpie, can report those
+calls so the Usage page counts them: `POST /v1/magpie/usage/requests` with
+`Content-Type: application/json`. The body is one record or an array of up
+to 5000 (32 MiB at most), shaped like a `usage.jsonl` line:
+
+```sh
+curl -s http://127.0.0.1:3425/v1/magpie/usage/requests \
+  -H 'Content-Type: application/json' \
+  -d '[{"t":"2026-10-13T08:00:00Z","agent":"my-app","provider":"anthropic",
+        "model":"claude-sonnet-4-6","in":1200,"out":340,"cache_read":9000,
+        "cache_write":0,"ms":2400,"ttft_ms":610,"status":200,"rid":"req_01"}]'
+```
+
+- **Fields:** `t` (RFC 3339), `agent`, `provider`, `model` and `rid` are
+  required. `in`, `out`, `cache_read`, `cache_write`, `cache_write_1h`,
+  `reasoning`, `ms`, `ttft_ms`, `status`, `cost` (USD), `effort`,
+  `session` and `err` may be left out.
+- **Pricing:** a record without `cost` is priced at magpie's prices for
+  its provider and model.
+- **Past times:** `t` is taken as given, however far back, so a history
+  can be backfilled; it may not be before 2000-01-01T00:00:00Z or more
+  than an hour ahead.
+- **Repeats:** a `rid` already reported is skipped, after a restart too,
+  so a batch can be sent again.
+- **Refusals:** a bad record refuses the whole post with a 400 naming it,
+  as `error.index` and `error.param` (`record 3: in: must not be
+  negative`), and nothing is written.
+- **The reply:** `{"accepted":1,"skipped":0,"records":[{"index":0,"rid":"req_01","status":"accepted"}]}`.
+- **Showing:** reported rows carry `source: "reported"`, count in every
+  total, and can be listed alone with `via=reported` (`reported` in the
+  GET's reply has their totals).
+- **Nothing live:** they never count against a gateway key's limit or a
+  budget, a subscription window, an alert, a rate limit or routing.
+- **Who may post:** the same as the GETs: this machine, or another with a
+  gateway key. A web page needs a key even on this machine.
+
 A row's `session` is the conversation it belongs to. A Claude Code
 subagent's call keeps its parent conversation there and adds `subagent`,
 its agent id (the `agentId` of its lines and its
@@ -1800,7 +1891,8 @@ expose it publicly without gateway-key authentication.
 Such a page is in **gateway mode**: it shows Providers, Gateway, Routing,
 Usage, Plugins and Settings, with no Agents, Sessions or Library tab, and
 Settings leaves out what is written into this machine's agents (provider in
-model names, Codex subagents, long conversations, Codex thread titles) and
+model names, Codex subagents, long conversations, Codex thread titles,
+Codex thread descriptions) and
 the desktop's alerts and tray. `magpie web` is in it by itself when it finds
 no agents on its machine, as in the container, and with
 `magpie web --gateway`. *Settings › General › Gateway mode* picks Automatic,
@@ -1876,6 +1968,7 @@ magpie ls                       # list every agent and its current settings
 magpie claude opus              # set a model (agent names accept prefixes: cc, oc, gem …)
 magpie codex gpt-5.6-sol
 magpie codex effort high        # other fields
+magpie codex effort             # one field, as it is now
 magpie codex xhigh              # bare effort levels are recognised too
 magpie codex deepseek/deepseek-chat   # any catalog model, through the gateway
 magpie claude moonshot/kimi-k2.5

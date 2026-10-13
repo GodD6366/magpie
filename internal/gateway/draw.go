@@ -90,15 +90,69 @@ func resolveDrawing(id string) (provider.Provider, string, bool) {
 			}
 		}
 	}
+	// a subscription's newer image model, named before magpie lists it
+	// (grok-imagine-image-2.0, #1857): its vendor draws it, or says why not
+	for _, p := range provider.All() {
+		if p.On() && !p.DecideOnly() && drawsFamily(p, id) {
+			return p, id, true
+		}
+	}
 	return provider.Resolve(id)
 }
 
-// codexDrawers are the image models a ChatGPT account draws with, at
-// its Codex backend's images API, as Codex CLI does (gpt-image-2 is the one
-// it asks for).
+// drawsFamily is whether a subscription whose image models magpie lists
+// itself (codexDrawers, grokDrawers) draws id, a model of the family those
+// are of: any grok-imagine-image* on a Grok subscription, any gpt-image-*
+// on a ChatGPT account. The vendor's newer ones work before magpie names
+// them, as grok-imagine-video* do for videos; one it doesn't serve is
+// refused by the vendor, in its own words.
+func drawsFamily(p provider.Provider, id string) bool {
+	switch {
+	case drawsGrok(p):
+		return strings.HasPrefix(id, grokDrawerFamily)
+	case drawsCodex(p):
+		return strings.HasPrefix(id, codexDrawerFamily)
+	}
+	return false
+}
+
+// The families of the image models a ChatGPT account and a Grok
+// subscription draw with (drawsFamily).
+const (
+	codexDrawerFamily = "gpt-image-"
+	grokDrawerFamily  = "grok-imagine-image"
+)
+
+// codexDrawers is the image model a ChatGPT account draws with, at its
+// Codex backend's images API, as Codex CLI does (gpt-image-2 is the one it
+// asks for). It is one: the backend picks the model itself, and answers
+// gpt-image-2, gpt-image-2.5 and a made-up name alike with the same image
+// (#1865), so listing 2.5 apart said there was a choice where there is
+// none. A gpt-image-2.5 saved when it was listed still draws there
+// (drawsFamily) and shows as this one (ListedDrawer).
 var codexDrawers = []catalog.Model{
-	{ID: "gpt-image-2", Name: "GPT Image 2", Released: "2026-01-01"},
-	{ID: "gpt-image-2.5", Name: "GPT Image 2.5", Released: "2026-06-01"},
+	{ID: "gpt-image-2", Name: "GPT Image", Released: "2026-01-01"},
+}
+
+// VendorPicksDrawer is whether p's vendor picks the image model itself,
+// whichever is named: a ChatGPT account's images backend (#1865).
+func VendorPicksDrawer(p provider.Provider) bool { return drawsCodex(p) }
+
+// ListedDrawer is the listed image model a picked one (provider/model)
+// stands for: a ChatGPT account's gpt-image-2.5, or any other GPT Image
+// name, is its one GPT Image, as its backend draws the same for any name
+// (#1865). ref itself otherwise, and when its provider isn't found. The
+// pick itself is kept as it was saved, and draws as before.
+func ListedDrawer(ref string) string {
+	pid, id, ok := strings.Cut(ref, "/")
+	if !ok || !strings.HasPrefix(id, codexDrawerFamily) || id == codexDrawer {
+		return ref
+	}
+	p, err := provider.Find(pid)
+	if err != nil || !drawsCodex(*p) {
+		return ref
+	}
+	return pid + "/" + codexDrawer
 }
 
 // codexDrawer is the image model Codex CLI asks a ChatGPT account for, the
@@ -317,6 +371,10 @@ func (s *Server) images(edit bool) http.HandlerFunc {
 		}
 		if keyWho, held := keyHolds(r); held && named && !modelAllowed(keyWho, p, model) {
 			fail(403, keyModelError(keyWho, d.Model))
+			return
+		}
+		if msg, off := modelOff(p, model, d.Model); off { // disabled by the user (#1867)
+			fail(403, msg)
 			return
 		}
 		var unmask func()
@@ -642,11 +700,20 @@ func (s *Server) drawOnAccounts(ctx context.Context, r *http.Request, p provider
 	for i, c := range cs {
 		p = c.p
 		out, code, err = s.draw(ctx, p, model, d)
-		if err == nil || ctx.Err() != nil || i+1 == len(cs) || !accountRefusedDrawing(code) {
+		if err == nil || ctx.Err() != nil || i+1 == len(cs) || !accountRefusedDrawing(code) && !keyLacksModel(code, err) {
 			break
 		}
 	}
 	return p, out, code, time.Time{}, err
+}
+
+// keyLacksModel says a vendor answered 404 that the model isn't one this
+// key or account serves: a relay's "Model "gpt-image-2" is not supported by
+// any configured account in this group" for a key of its text models
+// alone, while the provider's next key serves it (#1657). The next is
+// asked; a bare 404, a wrong address, is the request's and asks none.
+func keyLacksModel(code int, err error) bool {
+	return code == http.StatusNotFound && err != nil && modelRefused(code, []byte(err.Error()))
 }
 
 // accountRefusedDrawing says a failure to draw was the account's — its
@@ -677,16 +744,33 @@ func (s *Server) draw(ctx context.Context, p provider.Provider, model string, d 
 	}
 	via := viaFor(p, model)
 	out, code, err := s.drawOn(ctx, p, model, d, via)
-	if err != nil && (code == 404 || code == 405) && via != viaGemini {
+	if err != nil && via != viaGemini && (code == 404 || code == 405 || pointsAway(via, code, err)) {
 		other := viaChat
 		if via == viaChat {
 			other = viaImages
 		}
-		if o, c, e := s.drawOn(ctx, p, model, d, other); e == nil {
-			return o, c, nil
+		// the vendor named the other API: its answer there is the one to
+		// tell, not the refusal that sent the request on
+		if o, c, e := s.drawOn(ctx, p, model, d, other); e == nil || pointsAway(via, code, err) {
+			return o, c, e
 		}
 	}
 	return out, code, err
+}
+
+// pointsAway is whether a vendor turned a drawing away on one API with
+// words that send it to the other: a 400 on chat completions saying "Use
+// /v1/images/generations" (Agnes, #1837), or one on the images API naming
+// chat completions. The model is then asked there, as when the API it was
+// asked on isn't served at all (404, 405).
+func pointsAway(via drawVia, code int, err error) bool {
+	if code != http.StatusBadRequest && code != http.StatusUnprocessableEntity {
+		return false
+	}
+	if via == viaChat {
+		return catalog.PointsToImagesAPI(err.Error())
+	}
+	return catalog.PointsToChat(err.Error())
 }
 
 func (s *Server) drawOn(ctx context.Context, p provider.Provider, model string, d drawing, via drawVia) (drawn, int, error) {
@@ -720,6 +804,8 @@ func (s *Server) sendWith(ctx context.Context, p provider.Provider, method, url,
 	if contentType != "" {
 		req.Header.Set("Content-Type", contentType)
 	}
+	// magpie's, or the agent's own where the provider passes it on (#1851)
+	stampUA(ctx, p, req.Header)
 	if p.IsRemoteMagpie() {
 		req.Header.Set("User-Agent", "magpie/"+Version)
 		passOnCaller(ctx, req)

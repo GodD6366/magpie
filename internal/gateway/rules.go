@@ -82,7 +82,10 @@ type Classified struct {
 	Sure    float64  `json:"sure,omitempty"`   // how confident it was of the intent, 0 to 1
 	Cached  bool     `json:"cached,omitempty"` // said before, for the same message
 	Ms      int      `json:"ms,omitempty"`     // how long asking it took
-	Error   string   `json:"error,omitempty"`  // why it couldn't say: no intent matches then
+	Error   string   `json:"error,omitempty"`  // why it couldn't say: no intent matches then, unless Fallback
+	// Fallback: "previous" when it couldn't say and the turn keeps the
+	// intent the turn before had (After), rather than none
+	Fallback string `json:"fallback,omitempty"`
 
 	// AfterEffort: the reasoning picked for the turn before, which it was told
 	AfterEffort string `json:"afterEffort,omitempty"`
@@ -116,11 +119,24 @@ func ruleKey(g provider.Group, in http.Header, req *Request) string {
 }
 
 // firstWords tells an agent's subagents from it: they share its session
-// but not what they were asked. Only the words are taken — not how the
-// agent marked them for caching — as they stay the same for the
-// conversation's whole life.
+// but not what they were asked. Only what the user said is taken (userSaid,
+// the first user message that has any) — not how the agent marked it for
+// caching, nor what it put in beside it (instruction files, reminders,
+// Codex's context), which an agent such as ZCode changes as the
+// conversation goes on — so it stays the same for the conversation's
+// whole life. A conversation the user said nothing in yet goes by its
+// first user message's text.
 func firstWords(req *Request) string {
 	h := sha256.New()
+	for _, m := range req.Messages {
+		if m.Role != "user" {
+			continue
+		}
+		if said := userSaid(m); said != "" {
+			h.Write([]byte(said))
+			return hex.EncodeToString(h.Sum(nil)[:12])
+		}
+	}
 	for _, m := range req.Messages {
 		if m.Role != "user" {
 			continue
@@ -271,6 +287,13 @@ func ruleFor(key string, g provider.Group, ms []provider.Member, req *Request, a
 			}
 			if err != nil {
 				c.Error = err.Error()
+				if c.After != "" {
+					// timed out, failed or resting: the intent the turn
+					// before had, still one of this turn's, is a better
+					// guess than none, which sends the turn to the
+					// group's first member whatever it is (#1826)
+					c.Intent, c.Fallback = c.After, "previous"
+				}
 			}
 		}
 		q.Intent = c.Intent

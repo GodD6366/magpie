@@ -23,7 +23,6 @@ import (
 	"maps"
 	"os"
 	"path/filepath"
-	"regexp"
 	"slices"
 	"strings"
 	"time"
@@ -228,11 +227,9 @@ func Collect(keys bool, app string) (Bundle, error) {
 	return b, nil
 }
 
-var secretHeader = regexp.MustCompile(`(?i)auth|key|token|secret|cookie|session|password`)
-
 // Secret reports whether a header or an environment variable by that name
 // looks like it holds a key: what a backup without keys leaves empty.
-func Secret(name string) bool { return secretHeader.MatchString(name) }
+func Secret(name string) bool { return provider.SecretHeader(name) }
 
 func withoutKeys(p provider.Provider) provider.Provider {
 	p.Key, p.KeyName, p.Keys, p.KeyProtocol, p.KeyWeight = "", "", nil, "", 0
@@ -260,8 +257,7 @@ func Seal(b Bundle, pass string) ([]byte, error) {
 		return nil, err
 	}
 	e := envelope{Format: format, Version: 1, KDF: "pbkdf2-sha256", Iterations: iterations,
-		Salt: make([]byte, 16), Nonce: make([]byte, 12)}
-	rand.Read(e.Salt)
+		Salt: saltFor(pass), Nonce: make([]byte, 12)}
 	rand.Read(e.Nonce)
 	gcm, err := aead(pass, e)
 	if err != nil {
@@ -321,7 +317,7 @@ func header(e envelope) []byte {
 }
 
 func aead(pass string, e envelope) (cipher.AEAD, error) {
-	key, err := deriveKey(pass, e)
+	key, err := derived(pass, e)
 	if err != nil {
 		return nil, err
 	}

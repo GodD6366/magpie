@@ -45,13 +45,20 @@ func GroupIDOf(ref string) (string, bool) {
 // Affinities are how long a conversation stays with the key or account that
 // answered it: "" auto, as long as what the vendor cached of it is worth
 // keeping; for the whole session; within a turn only, free to move when
-// the user speaks again; or never.
-var Affinities = []string{"", AffinitySession, AffinityTurn, AffinityOff}
+// the user speaks again; never; or strictly: for the whole session, never
+// moved to another key or account however it answers (#1797).
+var Affinities = []string{"", AffinitySession, AffinityTurn, AffinityOff, AffinityStrict}
 
 const (
 	AffinitySession = "session"
 	AffinityTurn    = "turn"
 	AffinityOff     = "off"
+	// AffinityStrict keeps a conversation on the key or account that
+	// answered it whatever happens: resting, all but used up or past the
+	// usage cap set on it, it is still the one asked, and its error goes
+	// to the agent rather than the conversation to another. A usage cap
+	// still keeps new conversations off it.
+	AffinityStrict = "strict"
 )
 
 // EffortAuto is a group whose classifier picks each turn's reasoning
@@ -297,7 +304,7 @@ func groupsIn(entries []Entry) []Group {
 			}
 			g = withoutRemoved(g, have)
 		}
-		out = append(out, withMatches(entries, g))
+		out = append(out, withMatches(entries, g.own()))
 	}
 	if f.NoAutoGroups {
 		return orderedGroups(out, f.GroupOrder)
@@ -343,6 +350,32 @@ func withoutRemoved(g Group, have map[string]bool) Group {
 	g.Members = kept
 	g.Off = slices.DeleteFunc(slices.Clone(g.Off), gone)
 	g.Fast = slices.DeleteFunc(slices.Clone(g.Fast), gone)
+	return g
+}
+
+// own is the group with lists of its own. f.Groups is the providers.json
+// every look-up shares while a request holds the catalog (heldOf), so a
+// caller changing its group in place — the TUI deleting a rule, SaveGroup
+// cleaning one — would change it for every reader in that while, and keep
+// the change there when the save failed.
+func (g Group) own() Group {
+	g.Members = slices.Clone(g.Members)
+	g.Match = slices.Clone(g.Match)
+	g.Matched = slices.Clone(g.Matched)
+	g.Off = slices.Clone(g.Off)
+	g.Levels = slices.Clone(g.Levels)
+	g.Fast = slices.Clone(g.Fast)
+	g.Rules = slices.Clone(g.Rules)
+	for i, r := range g.Rules {
+		g.Rules[i].Agents = slices.Clone(r.Agents)
+		g.Rules[i].Folders = slices.Clone(r.Folders)
+		g.Rules[i].ExceptFolders = slices.Clone(r.ExceptFolders)
+		if r.Time != nil {
+			w := *r.Time
+			w.Days = slices.Clone(w.Days)
+			g.Rules[i].Time = &w
+		}
+	}
 	return g
 }
 
@@ -651,6 +684,11 @@ func groupOf(all []Group, id string) (Group, bool) {
 // member — and a group that would be in itself is cut there. A manual
 // group has only the member picked (see Manual), however deep.
 func membersIn(entries []Entry, all []Group, g Group) []Member {
+	return membersOff(entries, all, g, disabledNow())
+}
+
+// membersOff is membersIn less the models off reports.
+func membersOff(entries []Entry, all []Group, g Group, off func(pid, model string) bool) []Member {
 	var out []Member
 	seen := map[string]bool{}
 	var walk func(g Group, path []string, via []Group, in []string)
@@ -670,6 +708,9 @@ func membersIn(entries []Entry, all []Group, g Group) []Member {
 			key := WithMemberEffort(p.ID+"/"+m, effort)
 			if !ok || seen[key] {
 				continue
+			}
+			if off(p.ID, m) {
+				continue // the user turned it off (#1867): a group never reaches it
 			}
 			seen[key] = true
 			out = append(out, Member{ID: at[0], Path: at, Via: via, Provider: p, Model: m, Effort: effort, Fast: g.IsFast(id)})
@@ -826,7 +867,7 @@ func groupEntries(entries []Entry) []Entry {
 		}
 		ruledEntry(&e, g.Live(), ms, entries)
 		if g.Context > 0 {
-			e.Context = g.Context
+			e.Context, e.WindowSet = g.Context, true
 		} else if g.Context == ContextSmallest && smallest > 0 {
 			e.Context = smallest
 		}
@@ -870,6 +911,7 @@ func (e Entry) Quiet() bool {
 // SaveGroup adds or replaces a group of the user's. Changing one magpie
 // found makes it the user's.
 func SaveGroup(g Group) error {
+	g = g.own() // cleaned below in place: the caller's lists stay as they were
 	g.ID = strings.ToLower(strings.TrimSpace(g.ID))
 	g.Name = strings.TrimSpace(g.Name)
 	if g.ID == "" {

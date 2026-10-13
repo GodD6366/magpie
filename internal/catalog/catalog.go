@@ -56,9 +56,10 @@ type Model struct {
 	// Output is the most tokens a reply may hold, when known.
 	Output int `json:",omitempty"`
 	// Compact is where the user has Codex compact a conversation on this
-	// model (#876), its own or its provider's (settings.ModelCompacts): the
-	// window it is told when Context is longer. 0 is none set, for the
-	// one for every model (settings.Compact).
+	// model (#876), its own or its provider's (settings.ModelCompacts), or
+	// Context itself when that is a window the user typed (#1809,
+	// provider.CompactFor): the window it is told when Context is longer.
+	// 0 is none set, for the one for every model (settings.Compact).
 	Compact int `json:",omitempty"`
 	// Plain, on a model of another magpie's list, is its name there alone
 	// (display_name), when Name is its label there, with that magpie's
@@ -843,17 +844,56 @@ func NameOf(id string) string {
 // knows it by (NameOf), so one model reads the same under every provider:
 // a GLM Coding Plan's glm-5-turbo, which Zhipu's catalog doesn't list, is
 // GLM-5-Turbo as ZCode's is. Its id, and where requests go, stay as they
-// are.
-func Named(ms []Model) []Model {
+// are. A supplemented name shared by different ids falls back to the id.
+// Already named models in reserved count toward collisions but stay as given.
+func Named(ms []Model, reserved ...Model) []Model {
 	out := slices.Clone(ms)
-	for i, m := range out {
+	fallback := make([]string, len(ms))
+	for i, m := range ms {
 		if m.Name == "" || m.Name == m.ID {
-			if n := NameOf(m.ID); n != "" {
-				out[i].Name = n
-			}
+			fallback[i] = NameOf(m.ID)
 		}
 	}
+	fillNames(out, fallback, reserved...)
 	return out
+}
+
+// fillNames applies catalog names without giving different ids the same
+// name. The ids are reserved too, so falling back to one cannot collide
+// with another model's supplemented name. The caller owns ms.
+func fillNames(ms []Model, fallback []string, reserved ...Model) {
+	owners := make(map[string]string)
+	collisions := make(map[string]bool)
+	claim := func(name, id string) {
+		if name == "" {
+			return
+		}
+		if owner, ok := owners[name]; ok && owner != id {
+			collisions[name] = true
+		}
+		owners[name] = id
+	}
+	for _, m := range reserved {
+		claim(m.ID, m.ID)
+		claim(m.Name, m.ID)
+	}
+	for i, m := range ms {
+		claim(m.ID, m.ID)
+		name := m.Name
+		if fallback[i] != "" {
+			name = fallback[i]
+		}
+		claim(name, m.ID)
+	}
+	for i, name := range fallback {
+		if name == "" {
+			continue
+		}
+		if collisions[name] {
+			name = ms[i].ID
+		}
+		ms[i].Name = name
+	}
 }
 
 // Knows reports whether models.dev lists a model of this id at all, under
@@ -1261,6 +1301,22 @@ func ImagesAPI(id string) bool {
 	return false
 }
 
+// PointsToImagesAPI is whether a vendor's refusal of a chat request names
+// its images API as the one the model is asked on: Agnes answers
+// agnes-image-2.5-flash on chat completions with 400 "Model
+// agnes-image-2.5-flash is an image model. Use /v1/images/generations"
+// (#1837), a model ImagesAPI can't tell by its name from gemini's -flash
+// image ones, which chat. The vendor's own words decide it then.
+func PointsToImagesAPI(text string) bool {
+	return strings.Contains(strings.ToLower(text), "images/generations")
+}
+
+// PointsToChat is PointsToImagesAPI the other way round: a refusal on the
+// images API that names chat completions as where the model draws.
+func PointsToChat(text string) bool {
+	return strings.Contains(strings.ToLower(text), "chat/completions")
+}
+
 // Drawers are the models of one models.dev provider that make images,
 // newest first.
 func Drawers(id string) []Model {
@@ -1358,6 +1414,39 @@ func parseCodex(b []byte) ([]Model, error) {
 func MagpieAdded(etag, slug, description string) bool {
 	return strings.HasSuffix(description, " via magpie") ||
 		strings.Contains(etag, "+magpie-") && strings.Contains(slug, "/")
+}
+
+// EffortRank orders the reasoning levels agents and vendors name, weakest
+// first.
+var EffortRank = []string{"none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"}
+
+// NearestEffort is the level of levels nearest want in EffortRank's order,
+// a tie going up, never "none" unless it is want; want itself when levels
+// are none, hold it, or want is no level EffortRank knows. The gateway
+// fits an effort to a model's levels by it on the way out (fitEffort), and
+// Codex's catalog gives a model the effort set for new sessions by it
+// (codexcat.ModelDefault), so the level a model starts at is the one it
+// would be sent at.
+func NearestEffort(want string, levels []string) string {
+	at := slices.Index(EffortRank, want)
+	if len(levels) == 0 || at < 0 || slices.Contains(levels, want) {
+		return want
+	}
+	best, dist := want, len(EffortRank)
+	for _, l := range levels {
+		i := slices.Index(EffortRank, l)
+		if i < 0 || l == "none" {
+			continue
+		}
+		d := i - at
+		if d < 0 {
+			d = -d
+		}
+		if d < dist || d == dist && i > at {
+			best, dist = l, d
+		}
+	}
+	return best
 }
 
 // Efforts returns the reasoning levels a model supports, if known.
