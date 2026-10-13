@@ -81,7 +81,9 @@ something else shows up as drift.
 
 The OpenClaw model-chain editor uses the shared model picker for both the primary
 model and each ordered fallback, including catalog groups and custom model IDs.
-Selections remain a draft until Save writes the whole sequence.
+The controls sit in the expanded agent page. Selecting, adding, reordering or
+removing a model immediately saves the whole sequence; failed writes retain the
+previous selection and show an inline error.
 
 OpenClaw's adapter ([`openclaw.go`](../../internal/agent/openclaw.go)) writes
 `models.providers.magpie` and the default primary model in
@@ -92,7 +94,7 @@ menu gets magpie's entries beside its own; an explicit `modelPolicy.allow`
 gets `magpie/*`. Sync updates only a provider carrying magpie's key and
 removes obsolete, unedited menu entries. Disconnect restores the prior
 primary (including string shorthand), provider and policy, preserving
-fallback lists and later user edits. The GUI's Configure models editor reads
+fallback lists and later user edits. The GUI's inline model controls read
 and atomically saves the primary and ordered fallbacks through
 `/api/agents/model-chain/openclaw`. It accepts qualified native model IDs as
 well as magpie groups. A restricted model menu and policy admit these picks;

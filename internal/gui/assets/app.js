@@ -1816,12 +1816,7 @@ function connectPanel(a, { fields, fieldBtn }) {
       kv(t("Claude models"), line(t("claude-* models need a Claude subscription in magpie"), add));
     }
   }
-  if (a.modelChain) {
-    const edit = el("button", "ag-quiet accent model-chain-edit", t("Configure models"));
-    edit.type = "button";
-    edit.onclick = () => editModelChain(a);
-    kv(t("Fallback models"), line(el("span", "ag-hint", a.modelChain.fallbacks.join(" → ") || t("None")), edit));
-  }
+  if (a.modelChain) kv(t("Configure models"), modelChainFields(a));
   // which of magpie's models it lists, by whose they are
   if (a.models) {
     const chips = line();
@@ -24928,75 +24923,71 @@ else if (mode === "window" && !gatewayMode && !sideNav()) slide($("#nav"), "nav"
 if (gatewayMode) setGatewayMode(true);
 load();
 
-// The sequence is one config update: editing/reordering a draft never changes
-// the live agent before Save succeeds.
-function editModelChain(a) {
-  const ed = el("div", "editor model-chain-editor");
-  const head = el("div", "ehead");
-  head.append(icon(a.icon), el("b", "", t("Configure models") + " · " + a.name));
-  ed.append(head, el("p", "lib-confirm", t("Try the primary model first, then fallback models in order. You can also enter provider/model.")));
-  let primary = a.modelChain.primary;
-  const rows = el("div", "model-chain-rows");
-  const fallbacks = [...a.modelChain.fallbacks];
+// Each inline action saves the whole sequence; failed writes keep the old picks.
+function modelChainFields(a) {
+  const box = el("div", "model-chain-inline");
   const options = (a.fields.find((f) => f.key === "model")?.options || []).filter((o) => o.value);
-  const modelButton = (value, label, selected) => {
-    const b = el("button", "field model-chain-pick");
-    b.type = "button";
-    b.setAttribute("aria-label", label);
-    const paint = () => {
-      b.replaceChildren();
-      const opt = options.find((o) => o.value === value);
-      if (opt?.icon || opt?.icons?.length) b.append(optionIcon(opt));
-      b.append(el("span", "v", opt?.label || value || "provider/model"));
-      const arrow = el("span", "chev"); arrow.append(svg(CHEV, 11, 1.7)); b.append(arrow);
-      b.title = value; b.dataset.value = value;
-    };
-    b.onclick = (ev) => openPicker(a, { key: "model", label: "model", value, options,
-      onPick: (v) => { value = v; selected(v); paint(); b.focus({ preventScroll: true }); }
-    }, b, ev);
-    paint();
-    return b;
-  };
-  ed.append(el("label", "", t("Primary model")), modelButton(primary, t("Primary model"), (v) => { primary = v; }));
-  const draw = () => {
-    rows.replaceChildren();
-    fallbacks.forEach((value, i) => {
-      const wrap = el("div");
-      const row = el("div", "fbrow");
-      const q = modelButton(value, t("Fallback model {n}", { n: i + 1 }), (v) => { fallbacks[i] = v; });
-      row.append(el("span", "i", String(i + 1)), q);
-      const up = el("button", "text", t("Up"));
-      up.type = "button"; up.disabled = i === 0;
-      up.onclick = () => { [fallbacks[i - 1], fallbacks[i]] = [fallbacks[i], fallbacks[i - 1]]; draw(); };
-      const remove = el("button", "text", t("Remove"));
-      remove.type = "button";
-      remove.onclick = () => { fallbacks.splice(i, 1); draw(); };
-      row.append(up, remove); wrap.append(row); rows.append(wrap);
-    });
-  };
-  const add = el("button", "text model-chain-add", t("Add fallback model"));
-  add.type = "button";
-  add.onclick = () => { fallbacks.push(""); draw(); rows.lastElementChild.querySelector(".model-chain-pick").focus({ preventScroll: true }); };
-  ed.append(el("label", "", t("Fallback models")), rows, add);
-  draw();
-  const error = el("p", "lib-confirm model-chain-error");
+  const error = el("span", "model-chain-error");
   error.setAttribute("role", "alert");
-  const cancel = el("button", "text", t("Cancel"));
-  cancel.onclick = () => closeConfirmAsk();
-  const save = el("button", "text primary", t("Save"));
-  save.onclick = async () => {
-    const sequence = { primary: primary.trim(), fallbacks: fallbacks.map((v) => v.trim()) };
+  let pending = false;
+  const save = async (sequence) => {
+    if (pending) return;
     const all = [sequence.primary, ...sequence.fallbacks];
     if (all.some((v) => !/^[^\s/]+\/\S+$/.test(v)) || new Set(all).size !== all.length) {
       error.textContent = t("Enter a different provider/model for each model."); return;
     }
-    save.disabled = true; error.textContent = "";
+    pending = true; error.textContent = "";
+    const buttons = [...box.querySelectorAll("button")];
+    const disabled = buttons.map((b) => b.disabled);
+    buttons.forEach((b) => { b.disabled = true; });
     try {
       state = await api("agents/model-chain/" + encodeURIComponent(a.id), sequence);
-      closeConfirmAsk(); renderAgents();
-    } catch (e) { error.textContent = e.message; save.disabled = false; }
+      renderAgents();
+    } catch (e) {
+      error.textContent = e.message;
+      buttons.forEach((b, i) => { b.disabled = disabled[i]; });
+    } finally { pending = false; }
   };
-  const bar = el("div", "bar"); bar.append(cancel, save);
-  ed.append(error, bar); confirmAsk = ed; openModal(ed);
-  $("#modal").classList.add("lib");
+  const choose = (b, value, selected, ev) => openPicker(a, {
+    key: "model", label: "model", value, options, onPick: selected,
+  }, b, ev);
+  const modelButton = (value, label, selected) => {
+    const b = el("button", "field ag-pick model-chain-pick");
+    b.type = "button"; b.setAttribute("aria-label", label);
+    const opt = options.find((o) => o.value === value);
+    if (opt?.icon || opt?.icons?.length) b.append(optionIcon(opt));
+    b.append(el("span", "v", opt?.label || value));
+    const arrow = el("span", "chev"); arrow.append(svg(CHEV, 11, 1.7)); b.append(arrow);
+    b.title = value; b.dataset.value = value;
+    b.onclick = (ev) => choose(b, value, selected, ev);
+    return b;
+  };
+  const primary = el("div", "ag-vl model-chain-primary");
+  primary.append(el("span", "ag-tier", t("Primary model")), modelButton(a.modelChain.primary, t("Primary model"),
+    (value) => save({ ...a.modelChain, primary: value })));
+  box.append(primary);
+  a.modelChain.fallbacks.forEach((value, i) => {
+    const row = el("div", "ag-vl model-chain-fallback");
+    const label = t("Fallback model {n}", { n: i + 1 });
+    row.append(el("span", "ag-tier", label), modelButton(value, label, (v) => {
+      const fallbacks = [...a.modelChain.fallbacks]; fallbacks[i] = v;
+      return save({ ...a.modelChain, fallbacks });
+    }));
+    const up = el("button", "ag-quiet model-chain-up", t("Up"));
+    up.type = "button"; up.disabled = i === 0;
+    up.onclick = () => {
+      const fallbacks = [...a.modelChain.fallbacks];
+      [fallbacks[i - 1], fallbacks[i]] = [fallbacks[i], fallbacks[i - 1]];
+      save({ ...a.modelChain, fallbacks });
+    };
+    const remove = el("button", "ag-quiet model-chain-remove", t("Remove"));
+    remove.type = "button";
+    remove.onclick = () => save({ ...a.modelChain, fallbacks: a.modelChain.fallbacks.filter((_, at) => at !== i) });
+    row.append(up, remove); box.append(row);
+  });
+  const add = el("button", "ag-quiet accent model-chain-add", t("Add fallback model"));
+  add.type = "button";
+  add.onclick = (ev) => choose(add, "", (value) => save({ ...a.modelChain, fallbacks: [...a.modelChain.fallbacks, value] }), ev);
+  box.append(add, error);
+  return box;
 }
