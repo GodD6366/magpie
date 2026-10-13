@@ -88,7 +88,15 @@ menu gets magpie's entries beside its own; an explicit `modelPolicy.allow`
 gets `magpie/*`. Sync updates only a provider carrying magpie's key and
 removes obsolete, unedited menu entries. Disconnect restores the prior
 primary (including string shorthand), provider and policy, preserving
-fallback lists and later user edits. It does not override per-agent models
+fallback lists and later user edits. The GUI's Configure models editor reads
+and atomically saves the primary and ordered fallbacks through
+`/api/agents/model-chain/openclaw`. It accepts qualified native model IDs as
+well as magpie groups. A restricted model menu and policy admit these picks;
+Sync retains them. Saving an empty list clears fallbacks. Disconnect restores
+the pre-edit list (or removes a newly added one), unless the user changed it
+outside magpie. Reconnecting restores the saved sequence only if the disconnected
+configuration has not changed. A registered provider keeps the connection active even when
+the primary is native, so magpie can serve a fallback. It does not override per-agent models
 or session picks. JSON/JSONC keeps comments and layout; other JSON5 syntax
 is normalized to JSON without changing numeric types or precision.
 Malformed configs, `$include` configs and OpenClaw's read-only/Nix flags

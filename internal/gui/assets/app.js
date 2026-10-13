@@ -1816,6 +1816,12 @@ function connectPanel(a, { fields, fieldBtn }) {
       kv(t("Claude models"), line(t("claude-* models need a Claude subscription in magpie"), add));
     }
   }
+  if (a.modelChain) {
+    const edit = el("button", "ag-quiet accent model-chain-edit", t("Configure models"));
+    edit.type = "button";
+    edit.onclick = () => editModelChain(a);
+    kv(t("Fallback models"), line(el("span", "ag-hint", a.modelChain.fallbacks.join(" → ") || t("None")), edit));
+  }
   // which of magpie's models it lists, by whose they are
   if (a.models) {
     const chips = line();
@@ -1863,7 +1869,7 @@ function connectPanel(a, { fields, fieldBtn }) {
     // Cursor Private Inference's are magpie's own, its effort asked on
     // every request it sends from then on, not what a new session starts
     // with (#1003)
-    kv(t(a.id === "cursor-local" ? "Settings" : "New sessions"), line(fields));
+    kv(t(a.modelChain ? "Primary model" : a.id === "cursor-local" ? "Settings" : "New sessions"), line(fields));
   }
   if (a.native) for (const [key, detail] of Object.entries(a.native.fields || {})) {
     if (detail.detail) { const f = a.fields.find((x) => x.key === key); kv(t(f?.label || key), line(t(detail.detail))); }
@@ -5096,6 +5102,7 @@ function asideAccount(a, f) {
 // directly (Claude Code's own, which unroutes it). From one of its own
 // models already, the pick doesn't move it off magpie.
 function leavesMagpie(a, field, value, opt) {
+  if (a.modelChain?.fallbacks.length && value) return false;
   if (a?.native || !a?.wired || !connectable(a)) return false;
   // Reasonix restores each role separately; either role can keep its provider.
   if (a.id === "reasonix" && value === "") {
@@ -24908,3 +24915,81 @@ else if (mode === "window" && !gatewayMode && !sideNav()) slide($("#nav"), "nav"
 // in gateway mode the first page is Providers, Agents' tab gone
 if (gatewayMode) setGatewayMode(true);
 load();
+
+// The sequence is one config update: editing/reordering a draft never changes
+// the live agent before Save succeeds.
+function editModelChain(a) {
+  const ed = el("div", "editor model-chain-editor");
+  const head = el("div", "ehead");
+  head.append(icon(a.icon), el("b", "", t("Configure models") + " · " + a.name));
+  ed.append(head, el("p", "lib-confirm", t("Try the primary model first, then fallback models in order. You can also enter provider/model.")));
+  const primary = input(a.modelChain.primary, "provider/model");
+  primary.setAttribute("aria-label", t("Primary model"));
+  ed.append(el("label", "", t("Primary model")), primary);
+  const rows = el("div", "model-chain-rows");
+  const fallbacks = [...a.modelChain.fallbacks];
+  const options = a.fields.find((f) => f.key === "model")?.options || [];
+  const suggest = (q, after, selected) => {
+    const choices = el("div", "mchips model-chain-suggestions");
+    after.after(choices);
+    const draw = () => {
+      choices.replaceChildren();
+      if (document.activeElement !== q) return;
+      const term = q.value.trim().toLowerCase();
+      for (const o of options.filter((o) => o.value && (o.value + " " + (o.label || "")).toLowerCase().includes(term)).slice(0, 8)) {
+        const b = el("button", "mchip", o.value);
+        b.type = "button";
+        b.onmousedown = (e) => e.preventDefault();
+        b.onclick = () => { q.value = o.value; selected(o.value); choices.replaceChildren(); };
+        choices.append(b);
+      }
+    };
+    q.addEventListener("input", () => { selected(q.value); draw(); });
+    q.addEventListener("focus", draw);
+    q.addEventListener("blur", () => choices.replaceChildren());
+  };
+  suggest(primary, primary, () => {});
+  const draw = () => {
+    rows.replaceChildren();
+    fallbacks.forEach((value, i) => {
+      const wrap = el("div");
+      const row = el("div", "fbrow");
+      const q = input(value, "provider/model");
+      q.setAttribute("aria-label", t("Fallback model {n}", { n: i + 1 }));
+      row.append(el("span", "i", String(i + 1)), q);
+      const up = el("button", "text", t("Up"));
+      up.type = "button"; up.disabled = i === 0;
+      up.onclick = () => { [fallbacks[i - 1], fallbacks[i]] = [fallbacks[i], fallbacks[i - 1]]; draw(); };
+      const remove = el("button", "text", t("Remove"));
+      remove.type = "button";
+      remove.onclick = () => { fallbacks.splice(i, 1); draw(); };
+      row.append(up, remove); wrap.append(row); rows.append(wrap);
+      suggest(q, row, (v) => { fallbacks[i] = v; });
+    });
+  };
+  const add = el("button", "text model-chain-add", t("Add fallback model"));
+  add.type = "button";
+  add.onclick = () => { fallbacks.push(""); draw(); rows.lastElementChild.querySelector("input").focus({ preventScroll: true }); };
+  ed.append(el("label", "", t("Fallback models")), rows, add);
+  draw();
+  const error = el("p", "lib-confirm model-chain-error");
+  error.setAttribute("role", "alert");
+  const cancel = el("button", "text", t("Cancel"));
+  cancel.onclick = () => closeConfirmAsk();
+  const save = el("button", "text primary", t("Save"));
+  save.onclick = async () => {
+    const sequence = { primary: primary.value.trim(), fallbacks: fallbacks.map((v) => v.trim()) };
+    const all = [sequence.primary, ...sequence.fallbacks];
+    if (all.some((v) => !/^[^\s/]+\/\S+$/.test(v)) || new Set(all).size !== all.length) {
+      error.textContent = t("Enter a different provider/model for each model."); return;
+    }
+    save.disabled = true; error.textContent = "";
+    try {
+      state = await api("agents/model-chain/" + encodeURIComponent(a.id), sequence);
+      closeConfirmAsk(); renderAgents();
+    } catch (e) { error.textContent = e.message; save.disabled = false; }
+  };
+  const bar = el("div", "bar"); bar.append(cancel, save);
+  ed.append(error, bar); confirmAsk = ed; openModal(ed);
+  $("#modal").classList.add("lib");
+}

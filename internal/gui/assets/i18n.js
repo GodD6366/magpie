@@ -4,6 +4,14 @@
 // works. {name} slots are filled by t(str, vars).
 const I18N = {
   zh: {
+    "Configure models": "配置模型",
+    "Primary model": "主模型",
+    "Fallback models": "兜底模型",
+    "Fallback model {n}": "兜底模型 {n}",
+    "Add fallback model": "添加兜底模型",
+    "Try the primary model first, then fallback models in order. You can also enter provider/model.": "先使用主模型，失败时按顺序尝试兜底模型。也可直接输入 provider/model。",
+    "Enter a different provider/model for each model.": "每个模型请输入不同的 provider/model。",
+
     "Manage": "管理",
     "Manage agents": "批量管理",
     "Hiding only changes this list, not an agent's connection or settings. Unhidden agents may stay under Not set up.": "隐藏只改变列表显示，不影响 Agent 的接入或设置。取消隐藏后，Agent 仍可能留在「未设置」中。",
@@ -4621,6 +4629,14 @@ const I18N = {
     "~/.dsh/settings.yaml sets its own DeepSeek endpoint or key, which dsh puts over magpie's; clear it in dsh's Models page to go through magpie.": "~/.dsh/settings.yaml 设置了自己的 DeepSeek 地址或 Key，dsh 会优先用它而不是 magpie 的；请在 dsh 的 Models 页面清除它，才能走 magpie。",
   },
   "zh-TW": {
+    "Configure models": "設定模型",
+    "Primary model": "主要模型",
+    "Fallback models": "備援模型",
+    "Fallback model {n}": "備援模型 {n}",
+    "Add fallback model": "新增備援模型",
+    "Try the primary model first, then fallback models in order. You can also enter provider/model.": "先使用主要模型，失敗時依序嘗試備援模型。也可直接輸入 provider/model。",
+    "Enter a different provider/model for each model.": "每個模型請輸入不同的 provider/model。",
+
     "Codex thread descriptions": "Codex 對話描述",
     "Description": "描述",
     "Manage": "管理",
@@ -9221,6 +9237,14 @@ const I18N = {
     "~/.dsh/settings.yaml sets its own DeepSeek endpoint or key, which dsh puts over magpie's; clear it in dsh's Models page to go through magpie.": "~/.dsh/settings.yaml 設定了自己的 DeepSeek 位址或 Key，dsh 會優先用它而不是 magpie 的；請在 dsh 的 Models 頁面清除它，才能走 magpie。",
   },
   ja: {
+    "Configure models": "モデルを設定",
+    "Primary model": "プライマリモデル",
+    "Fallback models": "フォールバックモデル",
+    "Fallback model {n}": "フォールバックモデル {n}",
+    "Add fallback model": "フォールバックモデルを追加",
+    "Try the primary model first, then fallback models in order. You can also enter provider/model.": "最初にプライマリモデルを試し、次にフォールバックモデルを順に試します。provider/model を直接入力することもできます。",
+    "Enter a different provider/model for each model.": "モデルごとに異なる provider/model を入力してください。",
+
     "Manage": "管理",
     "Manage agents": "エージェントを一括管理",
     "Hiding only changes this list, not an agent's connection or settings. Unhidden agents may stay under Not set up.": "非表示は一覧の表示のみを変更し、エージェントの接続や設定には影響しません。非表示を解除しても「未設定」に残る場合があります。",
@@ -13823,6 +13847,14 @@ const I18N = {
     "~/.dsh/settings.yaml sets its own DeepSeek endpoint or key, which dsh puts over magpie's; clear it in dsh's Models page to go through magpie.": "~/.dsh/settings.yaml に独自の DeepSeek エンドポイントやキーがあり、dsh は magpie のものよりそちらを優先します。magpie を経由するには dsh の Models ページで消してください。",
   },
   de: {
+    "Configure models": "Modelle konfigurieren",
+    "Primary model": "Primäres Modell",
+    "Fallback models": "Fallback-Modelle",
+    "Fallback model {n}": "Fallback-Modell {n}",
+    "Add fallback model": "Fallback-Modell hinzufügen",
+    "Try the primary model first, then fallback models in order. You can also enter provider/model.": "Zuerst wird das primäre Modell versucht, dann die Fallback-Modelle der Reihe nach. Sie können auch provider/model eingeben.",
+    "Enter a different provider/model for each model.": "Geben Sie für jedes Modell einen anderen Wert im Format provider/model ein.",
+
     "Manage": "Verwalten",
     "Manage agents": "Agents verwalten",
     "Hiding only changes this list, not an agent's connection or settings. Unhidden agents may stay under Not set up.": "Ausblenden ändert nur die Liste, nicht die Verbindung oder Einstellungen eines Agents. Nach dem Einblenden können Agents unter „Nicht eingerichtet“ bleiben.",

@@ -88,11 +88,27 @@ func openclawIn(at place) *Agent {
 		}
 		return openclawRestore(path, key, "")
 	}
+	readChain := func() (ModelChain, error) { return openclawChain(path) }
 	return &Agent{
 		ID: "openclaw", Name: "OpenClaw", Icon: "openclaw-color", Bin: "openclaw", Dir: dir, Path: path,
 		Spelled: prefixed, UA: []string{"openclaw"}, Unwire: unwire,
+		ReadModelChain: readChain,
+		SetModelChain: func(c ModelChain) error {
+			if err := writable(); err != nil {
+				return err
+			}
+			if err := validateOpenClawChain(c); err != nil {
+				return err
+			}
+			if c.Fallbacks == nil {
+				c.Fallbacks = []string{}
+			}
+			return openclawWriteChain(path, key, at, c.Primary, &c)
+		},
+		// A chain can start on an own model and reach magpie only on fallback.
+		Joined: func() bool { return ourKey(get(openclawProvider + ".apiKey")) },
 		Check: func() string {
-			if !prefixed(model()) {
+			if !prefixed(model()) && !ourKey(get(openclawProvider+".apiKey")) {
 				return ""
 			}
 			return wiringOff("OpenClaw", path, func(k string) (string, bool) {
@@ -118,6 +134,15 @@ func openclawIn(at place) *Agent {
 				}
 				if ref, ok := strings.CutPrefix(v, magpieID+"/"); ok && isMagpie(ref) {
 					return openclawWrite(path, key, at, v)
+				}
+				if v != "" {
+					c, err := readChain()
+					if err != nil {
+						return err
+					}
+					if len(c.Fallbacks) > 0 {
+						return openclawWrite(path, key, at, v)
+					}
 				}
 				return openclawRestore(path, key, v)
 			},
@@ -244,6 +269,10 @@ func openclawSaved(key string) (openclawRecord, error) {
 // openclawWrite changes the provider, model and model menu together in one
 // atomic write. A restricted model menu gets magpie's models beside its own.
 func openclawWrite(path, key string, at place, model string) error {
+	return openclawWriteChain(path, key, at, model, nil)
+}
+
+func openclawWriteChain(path, key string, at place, model string, chain *ModelChain) error {
 	openclawMu.Lock()
 	defer openclawMu.Unlock()
 	raw, data, err := openclawRead(path)
@@ -278,11 +307,36 @@ func openclawWrite(path, key string, at place, model string) error {
 			rec.Edits[openclawModel+".primary"] = e
 		}
 	}
+	if chain != nil {
+		remember(openclawModel+".fallbacks", chain.Fallbacks)
+	}
+	// A restricted menu must admit the sequence the user selected as well.
+	selected := []string{model}
+	if chain != nil {
+		selected = append([]string{chain.Primary}, chain.Fallbacks...)
+	} else {
+		if c, err := openclawChain(path); err == nil {
+			selected = append([]string{c.Primary}, c.Fallbacks...)
+		}
+		if model != "" {
+			selected[0] = model
+		}
+	}
 	remember(openclawProvider, openclawProviderAt(at.gw()))
 	if menu := gjson.GetBytes(data, "agents.defaults.models"); menu.IsObject() && len(menu.Map()) > 0 {
 		listed := map[string]bool{}
 		for _, m := range magpieModels("openclaw") {
 			k := "agents.defaults.models." + strings.ReplaceAll(magpieID+"/"+m.ID, ".", `\.`)
+			listed[k] = true
+			if !gjson.GetBytes(data, k).Exists() {
+				remember(k, map[string]any{})
+			}
+		}
+		for _, ref := range selected {
+			if ref == "" {
+				continue
+			}
+			k := "agents.defaults.models." + strings.ReplaceAll(ref, ".", `\.`)
 			listed[k] = true
 			if !gjson.GetBytes(data, k).Exists() {
 				remember(k, map[string]any{})
@@ -302,8 +356,14 @@ func openclawWrite(path, key string, at place, model string) error {
 		if err := json.Unmarshal([]byte(p.Raw), &allow); err != nil {
 			return err
 		}
-		if !slices.Contains(allow, "magpie/*") {
-			remember(policy, append(allow, "magpie/*"))
+		before := slices.Clone(allow)
+		for _, ref := range append([]string{"magpie/*"}, selected...) {
+			if ref != "" && !slices.Contains(allow, ref) {
+				allow = append(allow, ref)
+			}
+		}
+		if !slices.Equal(before, allow) {
+			remember(policy, allow)
 		}
 	}
 	sort.Strings(del)
@@ -358,10 +418,14 @@ func openclawRestore(path, key, model string) error {
 	// Put a string shorthand back only if no fallback or other user field
 	// was added to the object while connected.
 	curModel := gjson.GetBytes(data, openclawModel)
+	modelFields := len(curModel.Map())
+	if slices.Contains(del, openclawModel+".fallbacks") {
+		modelFields--
+	}
 	if e, ok := rec.Edits[openclawModel+".primary"]; ok && (sameJSON(curModel.Get("primary").Raw, e.After) || prefixed(curModel.Get("primary").String())) &&
-		curModel.IsObject() && len(curModel.Map()) == 1 && (len(rec.Model) == 0 || gjson.ParseBytes(rec.Model).Type == gjson.String) {
-		set = slices.DeleteFunc(set, func(kv edit.KV) bool { return kv.Path == openclawModel+".primary" })
-		del = slices.DeleteFunc(del, func(k string) bool { return k == openclawModel+".primary" })
+		curModel.IsObject() && modelFields == 1 && (len(rec.Model) == 0 || gjson.ParseBytes(rec.Model).Type == gjson.String) {
+		set = slices.DeleteFunc(set, func(kv edit.KV) bool { return strings.HasPrefix(kv.Path, openclawModel+".") })
+		del = slices.DeleteFunc(del, func(k string) bool { return strings.HasPrefix(k, openclawModel+".") })
 		if len(rec.Model) > 0 {
 			set = append(set, edit.KV{Path: openclawModel, Value: rec.Model})
 		} else {
@@ -414,6 +478,10 @@ func openclawOwn(path, current string) []Option {
 	if current != "" {
 		refs[current] = true
 	}
+	gjson.GetBytes(data, openclawModel+".fallbacks").ForEach(func(_, v gjson.Result) bool {
+		refs[v.String()] = true
+		return true
+	})
 	var ids []string
 	for ref := range refs {
 		if !prefixed(ref) {
@@ -455,4 +523,45 @@ func openclawModelJSON(m catalog.Model) map[string]any {
 		e["cost"] = map[string]any{"input": m.Price.Input, "output": m.Price.Output, "cacheRead": m.Price.CacheRead, "cacheWrite": m.Price.CacheWrite}
 	}
 	return e
+}
+
+func openclawChain(path string) (ModelChain, error) {
+	_, data, err := openclawRead(path)
+	if err != nil {
+		return ModelChain{}, err
+	}
+	v := gjson.GetBytes(data, openclawModel)
+	c := ModelChain{Fallbacks: []string{}}
+	if v.Type == gjson.String {
+		c.Primary = v.String()
+		return c, nil
+	}
+	if v.Exists() && !v.IsObject() {
+		return c, fmt.Errorf("OpenClaw model must be a string or an object")
+	}
+	c.Primary = v.Get("primary").String()
+	if f := v.Get("fallbacks"); f.Exists() {
+		if !f.IsArray() {
+			return c, fmt.Errorf("OpenClaw fallbacks must be an array of model IDs")
+		}
+		if err := json.Unmarshal([]byte(f.Raw), &c.Fallbacks); err != nil {
+			return c, err
+		}
+	}
+	return c, nil
+}
+
+func validateOpenClawChain(c ModelChain) error {
+	seen := map[string]bool{}
+	for _, id := range append([]string{c.Primary}, c.Fallbacks...) {
+		provider, model, ok := strings.Cut(id, "/")
+		if !ok || provider == "" || model == "" || strings.ContainsAny(id, " \t\r\n") {
+			return fmt.Errorf("OpenClaw model %q must be provider/model", id)
+		}
+		if seen[id] {
+			return fmt.Errorf("OpenClaw model %q is repeated", id)
+		}
+		seen[id] = true
+	}
+	return nil
 }

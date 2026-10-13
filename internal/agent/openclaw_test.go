@@ -475,3 +475,104 @@ func TestOpenClawDisconnectPreview(t *testing.T) {
 		t.Fatalf("preview didn't restore original model: %+v", changes)
 	}
 }
+
+func TestOpenClawModelChain(t *testing.T) {
+	for _, original := range []string{`"mine/original"`, `{"primary":"mine/original","fallbacks":["mine/backup"],"other":true}`} {
+		t.Run(original, func(t *testing.T) {
+			a, read := openclawHome(t, `{"agents":{"defaults":{"model":`+original+`}},"other":42}`)
+			c := ModelChain{Primary: "magpie/group/auto", Fallbacks: []string{"magpie/group/fast", "anthropic/claude-opus-5"}}
+			if err := a.ApplyModelChain(c); err != nil {
+				t.Fatal(err)
+			}
+			got, err := a.ReadModelChain()
+			if err != nil || got.Primary != c.Primary || !slices.Equal(got.Fallbacks, c.Fallbacks) {
+				t.Fatalf("read %v %v", got, err)
+			}
+			c.Primary = "anthropic/claude-opus-5"
+			c.Fallbacks = []string{"magpie/group/fast"}
+			if err := a.ApplyModelChain(c); err != nil {
+				t.Fatal(err)
+			}
+			if !a.Wired() {
+				t.Fatal("fallback-only connection lost")
+			}
+			c.Fallbacks = []string{}
+			if err := a.ApplyModelChain(c); err != nil {
+				t.Fatal(err)
+			}
+			if got, _ := a.ReadModelChain(); len(got.Fallbacks) != 0 {
+				t.Fatal(got)
+			}
+			if err := a.Disconnect(); err != nil {
+				t.Fatal(err)
+			}
+			if !sameJSON(gjson.GetBytes(read(), openclawModel).Raw, json.RawMessage(original)) {
+				t.Fatalf("restore: %s", read())
+			}
+			if gjson.GetBytes(read(), "other").Int() != 42 {
+				t.Fatal("unrelated config changed")
+			}
+		})
+	}
+}
+
+func TestOpenClawModelChainInvalid(t *testing.T) {
+	a, read := openclawHome(t, `{"agents":{"defaults":{"model":"mine/original"}}}`)
+	before := read()
+	for _, c := range []ModelChain{{Primary: ""}, {Primary: "invalid"}, {Primary: "mine/a", Fallbacks: []string{"mine/a"}}, {Primary: "mine/a", Fallbacks: []string{""}}} {
+		if err := a.ApplyModelChain(c); err == nil {
+			t.Fatalf("accepted %+v", c)
+		}
+		if !bytes.Equal(before, read()) {
+			t.Fatal("invalid chain changed config")
+		}
+	}
+}
+
+func TestOpenClawModelChainReconnect(t *testing.T) {
+	a, _ := openclawHome(t, `{"agents":{"defaults":{"model":"mine/original"}}}`)
+	want := ModelChain{Primary: "anthropic/claude-opus-5", Fallbacks: []string{"magpie/group/fast"}}
+	if err := a.ApplyModelChain(want); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.Disconnect(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.ConnectHow(); err != nil {
+		t.Fatal(err)
+	}
+	got, err := a.ReadModelChain()
+	if err != nil || got.Primary != want.Primary || !slices.Equal(got.Fallbacks, want.Fallbacks) {
+		t.Fatalf("reconnect %+v %v", got, err)
+	}
+}
+
+func TestOpenClawModelChainRestricted(t *testing.T) {
+	a, read := openclawHome(t, `{"agents":{"defaults":{"model":"mine/original","models":{"mine/original":{}},"modelPolicy":{"allow":["mine/*"]}}}}`)
+	want := ModelChain{Primary: "magpie/group/auto", Fallbacks: []string{"anthropic/claude-opus-5"}}
+	if err := a.ApplyModelChain(want); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.Sync(); err != nil {
+		t.Fatal(err)
+	}
+	if !gjson.GetBytes(read(), "agents.defaults.models.anthropic/claude-opus-5").Exists() {
+		t.Fatal("fallback absent from restricted menu")
+	}
+	if !strings.Contains(gjson.GetBytes(read(), "agents.defaults.modelPolicy.allow").Raw, "anthropic/claude-opus-5") {
+		t.Fatal("fallback excluded by policy")
+	}
+	out, err := edit.PatchJSON(read(), []edit.KV{{Path: openclawModel + ".fallbacks", Value: []string{"mine/changed"}}}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(a.Path, out, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.Disconnect(); err != nil {
+		t.Fatal(err)
+	}
+	if gjson.GetBytes(read(), openclawModel+".fallbacks.0").String() != "mine/changed" {
+		t.Fatal("external edit lost")
+	}
+}
