@@ -108,8 +108,10 @@ the primary is native, so magpie can serve a fallback. The editor reads the effe
 saving also updates it, preserving other agents and restoring the original override
 on disconnect if it is unchanged. An agent primary without fallbacks disables
 inherited fallbacks, matching OpenClaw. Ambiguous fleets use global defaults;
-session picks are not changed. JSON/JSONC keeps comments and layout; other JSON5 syntax
-is normalized to JSON without changing numeric types or precision.
+session picks are not changed. JSON/JSONC keeps comments and layout. Other JSON5 syntax
+is parsed without changing numeric types or precision, then normalized only for
+the first edit; the original file is copied to `openclaw.json.before-magpie`
+and Disconnect puts it back byte for byte when the values still match.
 Malformed configs, `$include` configs and OpenClaw's read-only/Nix flags
 fail without writing. Config location follows `OPENCLAW_CONFIG_PATH`, then
 `OPENCLAW_STATE_DIR`, then `.openclaw` under `OPENCLAW_HOME` or the user's

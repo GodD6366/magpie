@@ -275,10 +275,19 @@ func TestOpenClawForeignProvider(t *testing.T) {
 }
 
 func TestOpenClawJSON5AndUnsafeConfigs(t *testing.T) {
-	a, read := openclawHome(t, `// JSON5
-{agents: {defaults: {model: 'mine/original',}}, gateway: {port: 18789,}}`)
+	const original = `// my notes: keep port for the bot
+{
+  // primary model
+  agents: {defaults: {model: 'mine/original'}},
+  gateway: {port: 18789},
+}
+`
+	a, read := openclawHome(t, original)
 	if a.Field("model").Get() != "mine/original" {
 		t.Fatal("JSON5 was not read")
+	}
+	if _, err := os.Stat(a.Path + ".before-magpie"); !os.IsNotExist(err) {
+		t.Fatal("reading JSON5 rewrote or copied the file")
 	}
 	if err := a.Connect(); err != nil {
 		t.Fatal(err)
@@ -286,8 +295,23 @@ func TestOpenClawJSON5AndUnsafeConfigs(t *testing.T) {
 	if !json.Valid(read()) || gjson.GetBytes(read(), "gateway.port").Type != gjson.Number || gjson.GetBytes(read(), "gateway.port").Int() != 18789 {
 		t.Fatal("JSON5 normalization changed a numeric setting")
 	}
+	connected := read()
+	if bytes.Contains(connected, []byte("my notes")) || bytes.Contains(connected, []byte("primary model")) ||
+		gjson.GetBytes(connected, "agents.defaults.model.primary").String() != "magpie/relay/m1" {
+		t.Fatalf("connected JSON5 was not normalized: %s", connected)
+	}
+	saved, err := os.ReadFile(a.Path + ".before-magpie")
+	if err != nil || string(saved) != original {
+		t.Fatalf("original JSON5 was not kept: %v\n%s", err, saved)
+	}
 	if err := a.Disconnect(); err != nil || a.Field("model").Get() != "mine/original" {
 		t.Fatalf("JSON5 restoration failed: %v", err)
+	}
+	if string(read()) != original {
+		t.Fatalf("disconnect changed JSON5:\n%s", read())
+	}
+	if _, err := os.Stat(a.Path + ".before-magpie"); !os.IsNotExist(err) {
+		t.Fatal("restored JSON5 kept its backup")
 	}
 	for _, config := range []string{`{"agents":`, `{"$include":"other.json"}`, `{"agents":{"$include":"agents.json"}}`, `{} trailing`} {
 		t.Run(config, func(t *testing.T) {
@@ -333,18 +357,22 @@ func TestOpenClawPathsAndReadOnly(t *testing.T) {
 }
 
 func TestOpenClawJSON5Numbers(t *testing.T) {
-	a, read := openclawHome(t, `{gateway:{port:0x4965},agents:{defaults:{model:'mine/original',timeoutSeconds:+120,contextTokens:123456789012345}}}`)
+	const original = `{gateway:{port:0x4965},agents:{defaults:{model:'mine/original',timeoutSeconds:+120,contextTokens:123456789012345}}}`
+	a, read := openclawHome(t, original)
 	if err := a.Connect(); err != nil {
 		t.Fatal(err)
+	}
+	connected := read()
+	for k, want := range map[string]int64{"gateway.port": 18789, "agents.defaults.timeoutSeconds": 120, "agents.defaults.contextTokens": 123456789012345} {
+		if v := gjson.GetBytes(connected, k); v.Type != gjson.Number || v.Int() != want {
+			t.Fatalf("%s changed type or precision while connected: %s", k, connected)
+		}
 	}
 	if err := a.Disconnect(); err != nil {
 		t.Fatal(err)
 	}
-	data := read()
-	for k, want := range map[string]int64{"gateway.port": 18789, "agents.defaults.timeoutSeconds": 120, "agents.defaults.contextTokens": 123456789012345} {
-		if v := gjson.GetBytes(data, k); v.Type != gjson.Number || v.Int() != want {
-			t.Fatalf("%s changed type or precision: %s", k, data)
-		}
+	if string(read()) != original {
+		t.Fatalf("JSON5 number syntax was not restored:\n%s", read())
 	}
 }
 

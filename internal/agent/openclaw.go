@@ -3,8 +3,10 @@ package agent
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"slices"
@@ -147,9 +149,11 @@ func openclawIn(at place) *Agent {
 	}
 }
 
-// openclawRead validates before editing. JSONC keeps its layout; other JSON5
-// syntax (bare keys, single quotes) is normalized to JSON, also read by OpenClaw.
-// Includes are not flattened: their source files belong to the user.
+// openclawRead validates before editing. JSONC keeps its layout. Other JSON5
+// syntax (bare keys, single quotes) is parsed here but left on disk: the first
+// edit that needs strict JSON copies the original aside and writes JSON, and
+// Disconnect puts that copy back when nothing else has changed. Includes are
+// not flattened: their source files belong to the user.
 func openclawRead(path string) (raw, data []byte, err error) {
 	raw, err = edit.Read(path)
 	if err != nil {
@@ -158,31 +162,104 @@ func openclawRead(path string) (raw, data []byte, err error) {
 	if len(bytes.TrimSpace(raw)) == 0 {
 		raw = []byte("{}\n")
 	}
-	dec := json5.NewDecoder(bytes.NewReader(raw))
-	dec.UseNumber()
-	var doc map[string]any
-	if err = dec.Decode(&doc); err != nil || doc == nil {
-		return nil, nil, fmt.Errorf("OpenClaw: cannot parse %s: %v", path, err)
-	}
-	var extra any
-	if err := dec.Decode(&extra); err != io.EOF {
-		return nil, nil, fmt.Errorf("OpenClaw: invalid trailing data in %s", path)
-	}
-	if openclawIncludes(doc) {
-		return nil, nil, fmt.Errorf("OpenClaw uses $include; configure its models in OpenClaw instead")
-	}
-	if err := openclawNumbers(doc); err != nil {
-		return nil, nil, err
-	}
-	data, err = json.Marshal(doc)
+	doc, err := openclawDoc(path, raw)
 	if err != nil {
 		return nil, nil, err
 	}
-	if !json.Valid(jsonc.ToJSON(append([]byte(nil), raw...))) {
-		raw, err = json.MarshalIndent(doc, "", "  ")
-		raw = append(raw, '\n')
-	}
+	data, err = json.Marshal(doc)
 	return raw, data, err
+}
+
+func openclawDoc(path string, raw []byte) (map[string]any, error) {
+	dec := json5.NewDecoder(bytes.NewReader(raw))
+	dec.UseNumber()
+	var doc map[string]any
+	if err := dec.Decode(&doc); err != nil || doc == nil {
+		return nil, fmt.Errorf("OpenClaw: cannot parse %s: %v", path, err)
+	}
+	var extra any
+	if err := dec.Decode(&extra); err != io.EOF {
+		return nil, fmt.Errorf("OpenClaw: invalid trailing data in %s", path)
+	}
+	if openclawIncludes(doc) {
+		return nil, fmt.Errorf("OpenClaw uses $include; configure its models in OpenClaw instead")
+	}
+	if err := openclawNumbers(doc); err != nil {
+		return nil, err
+	}
+	return doc, nil
+}
+
+// openclawJSONC reports whether raw is JSON or JSONC, whose comments and
+// layout PatchJSON can keep. Other JSON5 is edited as normalized JSON.
+func openclawJSONC(raw []byte) bool {
+	return json.Valid(jsonc.ToJSON(append([]byte(nil), raw...)))
+}
+
+func openclawOriginal(path string) string { return path + ".before-magpie" }
+
+// openclawNormalize copies a non-JSONC file aside once, then returns the JSON
+// the editor can patch. A later disconnect restores that copy only when the
+// JSON still says what magpie left.
+func openclawNormalize(path string, raw []byte) ([]byte, error) {
+	if openclawJSONC(raw) {
+		return raw, nil
+	}
+	doc, err := openclawDoc(path, raw)
+	if err != nil {
+		return nil, err
+	}
+	backup := openclawOriginal(path)
+	if _, err := os.Stat(backup); errors.Is(err, fs.ErrNotExist) {
+		if err := edit.WriteAtomic(backup, raw); err != nil {
+			return nil, err
+		}
+	} else if err != nil {
+		return nil, err
+	}
+	out, err := json.MarshalIndent(doc, "", "  ")
+	if err != nil {
+		return nil, err
+	}
+	return append(out, '\n'), nil
+}
+
+// openclawRestoreOriginal puts a normalized JSON5 file back when disconnect
+// left the same values. A file the user changed while connected stays as
+// disconnect left it, and the copy is kept for the next disconnect.
+func openclawRestoreOriginal(path string, left []byte) error {
+	backup := openclawOriginal(path)
+	was, err := os.ReadFile(backup)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil
+		}
+		return err
+	}
+	cur, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	if !bytes.Equal(cur, left) {
+		return nil
+	}
+	then, err := openclawDoc(path, was)
+	if err != nil {
+		return nil
+	}
+	now, err := openclawDoc(path, cur)
+	if err != nil {
+		return err
+	}
+	x, err1 := json.Marshal(now)
+	y, err2 := json.Marshal(then)
+	if err1 != nil || err2 != nil || !bytes.Equal(x, y) {
+		return err1
+	}
+	if err := edit.WriteAtomic(path, was); err != nil {
+		return err
+	}
+	return os.Remove(backup)
 }
 
 // json5.Number is a string type, unlike json.Number: convert it before
@@ -383,7 +460,11 @@ func openclawWriteChain(path, key string, at place, model string, chain *ModelCh
 		}
 	}
 	sort.Strings(del)
-	out, err := edit.PatchJSON(raw, set, del)
+	base, err := openclawNormalize(path, raw)
+	if err != nil {
+		return err
+	}
+	out, err := edit.PatchJSON(base, set, del)
 	if err != nil {
 		return err
 	}
@@ -469,9 +550,18 @@ func openclawRestore(path, key, model string) error {
 			set = append(set, edit.KV{Path: openclawModel + ".primary", Value: model})
 		}
 	}
+	// A provider magpie created can leave an empty models object behind.
+	// That object was not in the user's file, so it goes with the provider.
+	if slices.Contains(del, openclawProvider) && len(gjson.GetBytes(data, "models").Map()) == 1 {
+		del = append(del, "models")
+	}
 	sort.Slice(set, func(i, j int) bool { return set[i].Path < set[j].Path })
 	sort.Strings(del)
-	out, err := edit.PatchJSON(raw, set, del)
+	base, err := openclawNormalize(path, raw)
+	if err != nil {
+		return err
+	}
+	out, err := edit.PatchJSON(base, set, del)
 	if err != nil {
 		return err
 	}
@@ -479,6 +569,9 @@ func openclawRestore(path, key, model string) error {
 		if err := edit.WriteAtomic(path, out); err != nil {
 			return err
 		}
+	}
+	if err := openclawRestoreOriginal(path, out); err != nil {
+		return err
 	}
 	forget(key)
 	return nil
