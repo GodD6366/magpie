@@ -77,6 +77,36 @@ something else shows up as drift.
 - An agent is detected by its config file, its folder, or its command on magpie's PATH (`Detected`). That PATH is the login shell's plus the folders users' tools go in (`proc.UserPath`: `~/.local/bin`, npm's prefixes, the Node nvm's default alias resolves to (the highest installed when it names none), bun, Homebrew, ...), so a CLI a terminal doesn't find can still be found and listed: an npm install under a Node the terminal no longer uses. `/api/agents/cli` then gives where it is (`path`) and `offPath` when the login shell's PATH (`proc.LoginPath`) lacks its folder, and the Agents row says "Not on your terminal's PATH", its tip naming the file (悠悠哥 on Discord: Codex 0.162.1 listed with no codex on PATH and no `~/.codex`). An unknown login PATH says nothing. A folder another tool writes too doesn't count (`dirShared`): Pi's for omp, `~/.copilot` for the Copilot CLI, which GitHub Copilot's JetBrains and VS Code plugins also write, and Qoder's and Qoder CN's, which Qoder's JetBrains plugin fills. A config file another tool writes first counts only when `pathOwn` says it is the agent's: Qoder's `settings.json` holding `enabledPlugins` alone is the plugin's (`qoderPluginOnly`; #1495, `TestCopilotFolderFromAnIDEPluginIsNotTheCLI`, `TestQoderSettingsFromAnIDEPluginIsNotTheCLI`).
 - Tests never touch the real machine. `TestMain` uses `testenv`, which points HOME, USERPROFILE, the XDG folders and APPDATA into a temporary folder, clears `agentenv.Vars` and puts failing stand-ins for keychain tools and agent CLIs on PATH. Agent-specific side effects (Aside, the Zed keychain, Codex's usage check) are also stubbed in `TestMain`.
 
+### OpenClaw
+
+OpenClaw's adapter ([`openclaw.go`](../../internal/agent/openclaw.go)) writes
+`models.providers.magpie` and the default primary model in
+`agents.defaults.model`. Its model catalog includes context/output limits,
+image input, reasoning and known prices; native Responses and Anthropic
+models use their respective API adapters. A nonempty `agents.defaults.models`
+menu gets magpie's entries beside its own; an explicit `modelPolicy.allow`
+gets `magpie/*`. Sync updates only a provider carrying magpie's key and
+removes obsolete, unedited menu entries. Disconnect restores the prior
+primary (including string shorthand), provider and policy, preserving
+fallback lists and later user edits. It does not override per-agent models
+or session picks. JSON/JSONC keeps comments and layout; other JSON5 syntax
+is normalized to JSON without changing numeric types or precision.
+Malformed configs, `$include` configs and OpenClaw's read-only/Nix flags
+fail without writing. Config location follows `OPENCLAW_CONFIG_PATH`, then
+`OPENCLAW_STATE_DIR`, then `.openclaw` under `OPENCLAW_HOME` or the user's
+home; absolute overrides use `appdir.Getenv` and join `agentenv.Vars` for
+sandboxing. WSL uses the distro's default folder and gateway address, not
+Windows' overrides. When neither its config nor CLI is present, the Agents
+page still offers OpenClaw under **Install other agents**, using its vendor
+installer labeled `shell` for macOS/Linux or PowerShell on Windows, plus
+`npm i -g openclaw` on each platform for users who already manage Node.js
+([`install.go`](../../internal/agent/install.go)). Listing these commands
+neither runs an installer nor creates an OpenClaw config.
+
+```sh
+go test -tags nogui ./internal/agent -run TestOpenClaw
+```
+
 ## Verification
 
 ```sh
