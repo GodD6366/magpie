@@ -96,8 +96,12 @@ Sync retains them. Saving an empty list clears fallbacks. Disconnect restores
 the pre-edit list (or removes a newly added one), unless the user changed it
 outside magpie. Reconnecting restores the saved sequence only if the disconnected
 configuration has not changed. A registered provider keeps the connection active even when
-the primary is native, so magpie can serve a fallback. It does not override per-agent models
-or session picks. JSON/JSONC keeps comments and layout; other JSON5 syntax
+the primary is native, so magpie can serve a fallback. The editor reads the effective model of the configured default or sole agent
+(`agents.entries` or legacy `agents.list`). When that agent has a model override,
+saving also updates it, preserving other agents and restoring the original override
+on disconnect if it is unchanged. An agent primary without fallbacks disables
+inherited fallbacks, matching OpenClaw. Ambiguous fleets use global defaults;
+session picks are not changed. JSON/JSONC keeps comments and layout; other JSON5 syntax
 is normalized to JSON without changing numeric types or precision.
 Malformed configs, `$include` configs and OpenClaw's read-only/Nix flags
 fail without writing. Config location follows `OPENCLAW_CONFIG_PATH`, then

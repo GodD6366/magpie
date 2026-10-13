@@ -67,14 +67,8 @@ func openclawIn(at place) *Agent {
 		return gjson.GetBytes(data, k).String()
 	}
 	model := func() string {
-		v := get(openclawModel + ".primary")
-		if v == "" {
-			v = get(openclawModel)
-			if strings.HasPrefix(v, "{") {
-				return ""
-			}
-		}
-		return v
+		c, _ := openclawChain(path)
+		return c.Primary
 	}
 	writable := func() error {
 		if at.spell == nil && (os.Getenv("OPENCLAW_CONFIG_READONLY") == "1" || os.Getenv("OPENCLAW_NIX_MODE") == "1") {
@@ -310,6 +304,28 @@ func openclawWriteChain(path, key string, at place, model string, chain *ModelCh
 	if chain != nil {
 		remember(openclawModel+".fallbacks", chain.Fallbacks)
 	}
+	// The selected agent's model overrides defaults. Keep that override in sync
+	// without changing models belonging to other agents.
+	if target := openclawAgentModel(data); target != "" && (model != "" || chain != nil) {
+		v := gjson.GetBytes(data, target)
+		if v.Exists() {
+			value := map[string]any{}
+			if v.IsObject() {
+				if err := json.Unmarshal([]byte(v.Raw), &value); err != nil {
+					return err
+				}
+			} else if v.Type == gjson.String {
+				value["primary"] = v.String()
+			}
+			if model != "" {
+				value["primary"] = model
+			}
+			if chain != nil {
+				value["fallbacks"] = chain.Fallbacks
+			}
+			remember(target, value)
+		}
+	}
 	// A restricted menu must admit the sequence the user selected as well.
 	selected := []string{model}
 	if chain != nil {
@@ -433,6 +449,16 @@ func openclawRestore(path, key, model string) error {
 		}
 	}
 	if model != "" {
+		if target := openclawAgentModel(data); target != "" && gjson.GetBytes(data, target).Exists() {
+			set = slices.DeleteFunc(set, func(kv edit.KV) bool { return kv.Path == target })
+			del = slices.DeleteFunc(del, func(k string) bool { return k == target })
+			v := gjson.GetBytes(data, target)
+			if v.Type == gjson.String {
+				set = append(set, edit.KV{Path: target, Value: model})
+			} else {
+				set = append(set, edit.KV{Path: target + ".primary", Value: model})
+			}
+		}
 		set = slices.DeleteFunc(set, func(kv edit.KV) bool {
 			return kv.Path == openclawModel || strings.HasPrefix(kv.Path, openclawModel+".")
 		})
@@ -531,6 +557,74 @@ func openclawChain(path string) (ModelChain, error) {
 		return ModelChain{}, err
 	}
 	v := gjson.GetBytes(data, openclawModel)
+	c, err := openclawParseChain(v)
+	if err != nil {
+		return c, err
+	}
+	if target := openclawAgentModel(data); target != "" {
+		v := gjson.GetBytes(data, target)
+		own, err := openclawParseChain(v)
+		if err != nil {
+			return c, err
+		}
+		if own.Primary != "" {
+			c.Primary = own.Primary
+			c.Fallbacks = own.Fallbacks
+		}
+		if v.Get("fallbacks").Exists() {
+			c.Fallbacks = own.Fallbacks
+		}
+	}
+	return c, nil
+}
+
+// Resolve only a configured default or sole agent. An explicit fleet without
+// an owner continues to edit global defaults rather than guessing an agent.
+func openclawAgentModel(data []byte) string {
+	type entry struct {
+		id, path string
+		marked   bool
+	}
+	var entries []entry
+	roster := gjson.GetBytes(data, "agents.entries")
+	if roster.Exists() {
+		roster.ForEach(func(k, v gjson.Result) bool {
+			if v.IsObject() {
+				entries = append(entries, entry{k.String(), "agents.entries." + strings.ReplaceAll(k.String(), ".", `\.`) + ".model", v.Get("default").Bool()})
+			}
+			return true
+		})
+	} else {
+		for i, v := range gjson.GetBytes(data, "agents.list").Array() {
+			if v.IsObject() {
+				entries = append(entries, entry{v.Get("id").String(), fmt.Sprintf("agents.list.%d.model", i), v.Get("default").Bool()})
+			}
+		}
+	}
+	owner := gjson.GetBytes(data, "agents.defaults.systemAgent.agentId").String()
+	for _, e := range entries {
+		if owner != "" && e.id == owner {
+			return e.path
+		}
+	}
+	if gjson.GetBytes(data, "agents.ownership").String() != "explicit" {
+		var marked []entry
+		for _, e := range entries {
+			if e.marked {
+				marked = append(marked, e)
+			}
+		}
+		if len(marked) == 1 {
+			return marked[0].path
+		}
+	}
+	if len(entries) == 1 {
+		return entries[0].path
+	}
+	return ""
+}
+
+func openclawParseChain(v gjson.Result) (ModelChain, error) {
 	c := ModelChain{Fallbacks: []string{}}
 	if v.Type == gjson.String {
 		c.Primary = v.String()

@@ -576,3 +576,37 @@ func TestOpenClawModelChainRestricted(t *testing.T) {
 		t.Fatal("external edit lost")
 	}
 }
+
+func TestOpenClawAgentModelOverride(t *testing.T) {
+	for _, tc := range []struct{ roster, target string }{
+		{`"entries":{"main":{"model":{"primary":"mine/override"}},"other":{"model":"other/keep"}},"defaults":{"systemAgent":{"agentId":"main"},"model":{"primary":"mine/default","fallbacks":["mine/backup"]}}`, "agents.entries.main.model"},
+		{`"entries":{"main":{"model":"mine/override"}},"defaults":{"model":{"primary":"mine/default","fallbacks":["mine/backup"]}}`, "agents.entries.main.model"},
+		{`"list":[{"id":"other","model":"other/keep"},{"id":"main","default":true,"model":{"primary":"mine/override"}}],"defaults":{"model":{"primary":"mine/default","fallbacks":["mine/backup"]}}`, "agents.list.1.model"},
+	} {
+		t.Run(tc.target+tc.roster, func(t *testing.T) {
+			a, read := openclawHome(t, `{"agents":{`+tc.roster+`}}`)
+			before := gjson.GetBytes(read(), tc.target).Raw
+			c, err := a.ReadModelChain()
+			if err != nil || c.Primary != "mine/override" || len(c.Fallbacks) != 0 {
+				t.Fatalf("effective model: %+v, %v", c, err)
+			}
+			c = ModelChain{Primary: "magpie/group/auto", Fallbacks: []string{}}
+			if err := a.ApplyModelChain(c); err != nil {
+				t.Fatal(err)
+			}
+			if got := gjson.GetBytes(read(), tc.target+".primary").String(); got != c.Primary {
+				t.Fatalf("override still wins: %s", got)
+			}
+			got, err := a.ReadModelChain()
+			if err != nil || got.Primary != c.Primary || len(got.Fallbacks) != 0 {
+				t.Fatalf("effective saved chain: %+v %v", got, err)
+			}
+			if err := a.Disconnect(); err != nil {
+				t.Fatal(err)
+			}
+			if !sameJSON(gjson.GetBytes(read(), tc.target).Raw, json.RawMessage(before)) {
+				t.Fatalf("restore override: %s", read())
+			}
+		})
+	}
+}
