@@ -3849,8 +3849,9 @@ input[type="checkbox"]:disabled { opacity: .45; }
 /* a disabled model's pattern, as typed (#1867): an id or a glob */
 .disabled-model .name { font-family: var(--code); font-size: 12px; overflow-wrap: anywhere; }
 
+.modal .editor.model-chain-editor > .ebody { grid-template-columns: minmax(0, 1fr); grid-auto-rows: max-content; gap: 6px; }
 .model-chain-editor .ebody > input { width: 100%; box-sizing: border-box; }
-.model-chain-editor .ebody > label { display: block; margin-top: 12px; margin-bottom: 6px; }
+.model-chain-editor .ebody > label { display: block; text-align: left; margin-top: 12px; margin-bottom: 6px; }
 .model-chain-rows input { flex: 1; min-width: 0; }
 .model-chain-suggestions { margin: 4px 0; }
 .model-chain-error { color: var(--red); }

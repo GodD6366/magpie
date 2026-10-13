@@ -6,7 +6,7 @@ const { test } = require("node:test");
 const { chromium, webkit } = require("playwright");
 
 const assets = process.env.MAGPIE_MODEL_ASSETS || path.resolve(__dirname, "../assets");
-const options = [{ value: "gpt-5.4", label: "GPT-5.4" }, { value: "relay/m1", label: "m1", ref: "relay/m1", note: "Relay · via magpie" }];
+const options = [{ value: "magpie/group/auto-k3-256k", label: "Auto K3" }, { value: "gpt-5.4", label: "GPT-5.4" }, { value: "relay/m1", label: "m1", ref: "relay/m1", note: "Relay · via magpie" }];
 const fresh = () => ({
   agents: [
     { id: "codex", name: "Codex", icon: "generic", path: "/fixture/codex", fields: [{ key: "model", label: "model", value: "gpt-5.4", options }] },
@@ -16,7 +16,7 @@ const fresh = () => ({
   profiles: [],
 });
 
-function server(lang, posts) {
+function server(lang, posts, web = true) {
   let cur = fresh();
   cur.agents = [cur.agents[1]];
   Object.assign(cur.agents[0], {wired:true, modelChain:{primary:"magpie/group/auto",fallbacks:[]}});
@@ -25,7 +25,7 @@ function server(lang, posts) {
   return async (route) => {
     const req = route.request(), url = new URL(req.url());
     const json = (data) => route.fulfill({ json: data });
-    if (url.pathname === "/boot.js") return route.fulfill({ contentType: "text/javascript", body: `window.bootPrefs = {lang:"${lang}",theme:"light",web:true};` });
+    if (url.pathname === "/boot.js") return route.fulfill({ contentType: "text/javascript", body: `window.bootPrefs = {lang:"${lang}",theme:"light",web:${web}};` });
     if (url.pathname === "/wails/runtime.js") return route.fulfill({ contentType: "text/javascript", body: "export const Window = {};" });
     if (url.pathname === "/api/agents/model-chain/openclaw") {
       const c=req.postDataJSON(); posts.push(c); cur.agents[0].modelChain=c; cur.agents[0].fields[0].value=c.primary; return reply(route);
@@ -53,28 +53,37 @@ function server(lang, posts) {
 }
 
 
-for (const engine of ["chromium", "webkit"]) for (const lang of ["en","zh","zh-TW","ja","de"]) {
- test(`${engine} ${lang}: OpenClaw primary and ordered fallbacks`, async t => {
+for (const engine of ["chromium", "webkit"]) for (const lang of ["en","zh","zh-TW","ja","de"]) for (const web of [true, false]) {
+ test(`${engine} ${lang} ${web ? "web" : "desktop"}: OpenClaw primary and ordered fallbacks`, async t => {
   const browser=await (engine==="webkit"?webkit.launch():chromium.launch({channel:"chromium"}));
   t.after(()=>browser.close());
-  const page=await browser.newPage({viewport:{width:440,height:700},reducedMotion:"reduce"});
+  const page=await browser.newPage({viewport:{width:web ? 440 : 980,height:700},reducedMotion:"reduce"});
   page.setDefaultTimeout(5000);
   const posts=[],errors=[]; page.on("pageerror",e=>errors.push(e.message));
-  await page.route("**/*",server(lang,posts));
+  await page.route("**/*",server(lang,posts,web));
   await page.goto("http://magpie.test/?view=agents");
   await page.locator('.row.agent[data-id="openclaw"] .ag-link').click();
   await page.locator('.model-chain-edit').click();
   assert.deepEqual(errors,[]);
   const ed=page.locator('.model-chain-editor');
   await ed.locator('.ebody > input').fill('magpie/group/auto');
+  const suggestion = ed.locator('.model-chain-suggestions .mchip').first();
+  assert.ok(await suggestion.evaluate(e=>e.getBoundingClientRect().width > 170 && e.scrollWidth <= e.clientWidth), 'primary suggestion is not clipped');
+  await suggestion.click();
+  assert.equal(await ed.locator('.ebody > input').inputValue(), 'magpie/group/auto-k3-256k');
+  await ed.locator('.ebody > input').fill('magpie/group/auto');
+  await ed.locator('.ebody > input').press('Tab');
   const add=ed.locator('.model-chain-add');
-  await add.click(); await ed.locator('.fbrow input').nth(0).fill('magpie/group/fast');
+  await add.click();
+  assert.ok(await ed.locator('.fbrow input').first().evaluate(e=>e.getBoundingClientRect().width > 150), 'fallback input has usable width');
+  assert.ok(await ed.locator('.model-chain-rows').evaluate(e=>e.getBoundingClientRect().width > 300), 'fallback rows span the editor');
+  await ed.locator('.fbrow input').nth(0).fill('magpie/group/fast');
   await add.click(); await ed.locator('.fbrow input').nth(1).fill('anthropic/claude-opus-5');
   await ed.locator('.fbrow').nth(1).locator('button').first().click();
   assert.deepEqual(await ed.locator('.fbrow input').evaluateAll(es=>es.map(e=>e.value)),['anthropic/claude-opus-5','magpie/group/fast']);
   await ed.locator('.fbrow').nth(1).locator('button').first().click();
   assert.equal(posts.length,0,'draft is not live');
-  if (process.env.ARTIFACT_DIR) { await fs.mkdir(process.env.ARTIFACT_DIR,{recursive:true}); await page.screenshot({path:path.join(process.env.ARTIFACT_DIR,`openclaw-${engine}-${lang}.png`)}); }
+  if (process.env.ARTIFACT_DIR) { await fs.mkdir(process.env.ARTIFACT_DIR,{recursive:true}); await page.screenshot({path:path.join(process.env.ARTIFACT_DIR,`openclaw-${engine}-${lang}-${web ? "web" : "desktop"}.png`)}); }
   assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth>innerWidth),false);
   await ed.locator('.bar .primary').click();
   await ed.waitFor({state:'detached'});
