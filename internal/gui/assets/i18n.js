@@ -6,10 +6,10 @@ const I18N = {
   zh: {
     "Configure models": "配置模型",
     "Primary model": "主模型",
-    "Fallback models": "兜底模型",
-    "Fallback model {n}": "兜底模型 {n}",
-    "Add fallback model": "添加兜底模型",
-    "Try the primary model first, then fallback models in order. You can also enter provider/model.": "先使用主模型，失败时按顺序尝试兜底模型。也可直接输入 provider/model。",
+    "Fallback models": "降级模型",
+    "Fallback model {n}": "降级模型 {n}",
+    "Add fallback model": "添加降级模型",
+    "Try the primary model first, then fallback models in order. You can also enter provider/model.": "先使用主模型，失败时按顺序尝试降级模型。也可直接输入 provider/model。",
     "Enter a different provider/model for each model.": "每个模型请输入不同的 provider/model。",
 
     "Manage": "管理",

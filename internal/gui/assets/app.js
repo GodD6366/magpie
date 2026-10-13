@@ -24969,7 +24969,7 @@ function modelChainFields(a) {
   a.modelChain.fallbacks.forEach((value, i) => {
     const row = el("div", "ag-vl model-chain-fallback");
     const label = t("Fallback model {n}", { n: i + 1 });
-    row.append(el("span", "ag-tier", label), modelButton(value, label, (v) => {
+    row.append(el("span", "ag-tier", i === 0 ? t("Fallback models") : ""), modelButton(value, label, (v) => {
       const fallbacks = [...a.modelChain.fallbacks]; fallbacks[i] = v;
       return save({ ...a.modelChain, fallbacks });
     }));

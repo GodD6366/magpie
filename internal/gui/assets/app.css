@@ -3854,5 +3854,5 @@ input[type="checkbox"]:disabled { opacity: .45; }
 .model-chain-inline .ag-tier { width: 130px; }
 .model-chain-inline .model-chain-pick { width: 220px; max-width: 100%; min-width: 0; }
 .model-chain-inline .model-chain-pick .v { flex: 1; text-align: left; }
-.model-chain-inline > .model-chain-add { align-self: flex-start; }
+.model-chain-inline > .model-chain-add { align-self: flex-start; margin-left: 138px; padding-left: 0; }
 .model-chain-error { color: var(--red); }
