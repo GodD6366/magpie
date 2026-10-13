@@ -199,6 +199,9 @@ type agentJSON struct {
 	// Menu: its own model menu is the models picked here, no one model to
 	// start on (agent.ListsModels): ZCode's, Cursor Private Inference's
 	Menu bool `json:"menu,omitempty"`
+	// NoNames: its own list doesn't name magpie's models as Names in agents'
+	// lists says (agent.NoNames), for that setting to say so
+	NoNames bool `json:"noNames,omitempty"`
 	// Source: what an agent not connected runs on now (agent.Source), and
 	// Stale: copies of a connected one still running on the list they
 	// started with (agent.Stale), for the line under its name
@@ -453,6 +456,9 @@ type settingsJSON struct {
 	// and a Qoder or Qoder CN account (its plugin's), and theirs
 	Qoder         bool                        `json:"qoder"`
 	QoderCheckins []provider.WorkBuddyCheckin `json:"qoderCheckins,omitempty"`
+	// every account each vendor's daily check-in reaches, and whether the
+	// user left it out (#1902)
+	CheckinAccounts []provider.CheckinAccount `json:"checkinAccounts,omitempty"`
 	// and the plugins' providers that check in themselves (auth.checkin),
 	// each with its switch and its accounts' last check-ins
 	CheckinPlugins []provider.PluginCheckin `json:"checkinPlugins,omitempty"`
@@ -597,6 +603,7 @@ func settingsState() settingsJSON {
 	s.MiniMax, s.MiniMaxCheckins = provider.HasMiniMax(), provider.MiniMaxCheckins()
 	s.Qoder, s.QoderCheckins = provider.HasQoder(), provider.QoderCheckins()
 	s.CheckinPlugins = provider.PluginCheckins()
+	s.CheckinAccounts = provider.CheckinAccounts()
 	s.VisionAuto, s.VisionModels, s.VisionMissing = gateway.AutoVision(), []modelRef{}, gateway.VisionMissing()
 	for _, e := range provider.Served() {
 		if e.Images && (e.ImageInput == nil || *e.ImageInput) && (e.Group != "" || e.Provider.Ready()) {
@@ -1120,6 +1127,11 @@ func Handler(w Windows, gw *gateway.Server) http.Handler {
 		if _, sent := fields["codeFont"]; !sent || isWeb(w) {
 			in.CodeFont = cur.CodeFont
 		}
+		// and pages from before it do not send how often a refusal is asked
+		// again, which null sets back to every one left
+		if _, sent := fields["refusalRetries"]; !sent {
+			in.RefusalRetries = cur.RefusalRetries
+		}
 		in.AgentOrder, in.AgentsHidden, in.AgentsShown = cur.AgentOrder, cur.AgentsHidden, cur.AgentsShown
 		in.Window, in.WindowMaximised = cur.Window, cur.WindowMaximised // the window's own, as it was last resized
 		// and what other pages keep here: which models an agent is shown, and
@@ -1136,6 +1148,7 @@ func Handler(w Windows, gw *gateway.Server) http.Handler {
 		in.FastPicks = cur.FastPicks             // switched in the agents' pickers (#954)
 		in.AgentEfforts = cur.AgentEfforts       // picked in an agent's row (#1003)
 		in.PluginCheckins = cur.PluginCheckins   // set on its own (plugin-checkin below)
+		in.CheckinOff = cur.CheckinOff           // set on its own (checkin-account below)
 		settings.CarryPerModel(&in, &cur)
 		in.LAN, in.LANKey = cur.LAN, cur.LANKey
 		in.LANKeyID = cur.LANKeyID
@@ -1646,6 +1659,36 @@ func Handler(w Windows, gw *gateway.Server) http.Handler {
 		}
 		writeJSON(rw, settingsState())
 	})
+	// and one account's daily check-in, whichever vendor's (#1902): off
+	// leaves it out while its vendor's is on
+	mux.HandleFunc("POST /api/settings/checkin-account", func(rw http.ResponseWriter, r *http.Request) {
+		var in struct {
+			Key string
+			On  bool
+		}
+		if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+			fail(rw, err)
+			return
+		}
+		if in.Key == "" {
+			fail(rw, errors.New("no account"))
+			return
+		}
+		s := settings.Load()
+		off := slices.DeleteFunc(slices.Clone(s.CheckinOff), func(k string) bool { return k == in.Key })
+		if !in.On {
+			off = append(off, in.Key)
+		}
+		if len(off) == 0 {
+			off = nil
+		}
+		s.CheckinOff = off
+		if err := settings.Save(s); err != nil {
+			fail(rw, err)
+			return
+		}
+		writeJSON(rw, settingsState())
+	})
 	// how large the window and the panel are drawn: Settings' choice and
 	// Ctrl/Cmd +, − and 0 in either, set on its own so a key pressed while
 	// the Settings page saves something else is never undone by it
@@ -2051,6 +2094,7 @@ func state() stateJSON {
 		}
 		aj.Models = agentModelCount(a, aj.Fields)
 		aj.Menu = a.ListsModels
+		aj.NoNames = a.NoNames
 		aj.Drift = a.Drift()
 		aj.Wired = a.Wired()
 		if aj.Wired {

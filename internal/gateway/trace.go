@@ -46,6 +46,7 @@ type Route struct {
 	For           *CallFor     `json:"for,omitempty"`           // the request it was made for, as Call's
 	Model         string       `json:"model"`                   // as the agent asked
 	Effort        string       `json:"effort,omitempty"`        // the reasoning the agent asked for; "" for none
+	Tier          string       `json:"tier,omitempty"`          // the service tier the agent asked for (bodyTier); "" for none
 	Provider      string       `json:"provider"`                // the provider the model resolved to
 	Group         *GroupRef    `json:"group,omitempty"`         // the routing group the agent asked for
 	Rule          *RuleHit     `json:"rule,omitempty"`          // the group's rules for it, when it has any
@@ -287,10 +288,15 @@ type Try struct {
 	// Upstream: the provider an aggregator said answered behind it
 	// (OpenRouter's DeepInfra, Novita …)
 	Upstream string `json:"upstream,omitempty"`
-	Fail     string `json:"fail,omitempty"` // why it failed, as rest tells it
-	Error    string `json:"error,omitempty"`
-	Rest     *Rest  `json:"rest,omitempty"`  // how long it now sits out; none when it was the last to try
-	Again    int64  `json:"again,omitempty"` // ms waited before it was tried again, the last one left
+	// Tier: the service tier it went out at, once a fast pick or an
+	// account without Ultrafast had changed it; TierServed: the one its
+	// reply said it ran at, when it said one (#1784)
+	Tier       string `json:"tier,omitempty"`
+	TierServed string `json:"tierServed,omitempty"`
+	Fail       string `json:"fail,omitempty"` // why it failed, as rest tells it
+	Error      string `json:"error,omitempty"`
+	Rest       *Rest  `json:"rest,omitempty"`  // how long it now sits out; none when it was the last to try
+	Again      int64  `json:"again,omitempty"` // ms waited before it was tried again, the last one left
 	// Replan: every member had failed in a way that passes, so after
 	// Again the Replan of them that may answer by then were asked again,
 	// in turn, within the group's Patience (seconds) for the request
@@ -538,10 +544,18 @@ func swapped(sent, served string) bool { return usage.Swapped(sent, served) }
 
 // routeUsage retains only what pricing needs, without another copy of the
 // request's metadata. Unknown token counts have no price, including failures.
+// What the reply counted of earlier requests (Deferred) is priced as a tier
+// of its own before the request's, which stays last: the prompt is read
+// from the last (promptCounted), and is the request's own.
 func routeUsage(id, model string, u Usage) []RouteUsage {
-	if u.Input+u.Output == 0 {
-		return nil
+	var out []RouteUsage
+	if d := u.Deferred; d != nil && d.Input+d.Output+d.CacheRead+d.CacheWrite > 0 {
+		out = append(out, RouteUsage{Provider: id, Model: model, Input: d.Input, Output: d.Output,
+			CacheRead: d.CacheRead, CacheWrite: d.CacheWrite, Reasoning: d.Reasoning})
 	}
-	return []RouteUsage{{Provider: id, Model: model, Input: u.Input, Output: u.Output,
-		CacheRead: u.CacheRead, CacheWrite: u.CacheWrite, Reasoning: u.Reasoning}}
+	if u.Input+u.Output == 0 {
+		return out
+	}
+	return append(out, RouteUsage{Provider: id, Model: model, Input: u.Input, Output: u.Output,
+		CacheRead: u.CacheRead, CacheWrite: u.CacheWrite, Reasoning: u.Reasoning})
 }

@@ -1221,7 +1221,7 @@ function connectLine(a, kind) {
     // line says why, and the accounts that turn it off are a click away
     else if (a.failover) {
       say(t("Not connected · goes through magpie only to fail over to your other ChatGPT accounts"));
-      words.title = t("magpie set openai_base_url in {agent}'s config.toml, so a request the ChatGPT account {agent} is signed in to has no allowance for goes on to your other ChatGPT accounts on in magpie. {agent} keeps to its own models. To stop it, switch those accounts off under Providers › Codex; connecting {agent} adds magpie's models.", { agent: a.name });
+      words.title = t("magpie set openai_base_url in {agent}'s config.toml, so a request the ChatGPT account {agent} is signed in to has no allowance for goes on to your other ChatGPT accounts on in magpie. {agent} keeps to its own models. To stop it, tick Only switch {agent}'s sign-in under Providers › Codex, or switch those accounts off; connecting {agent} adds magpie's models.", { agent: a.name });
       const go = el("button", "ag-acc", t("ChatGPT accounts"));
       go.type = "button";
       go.title = words.title;
@@ -3819,6 +3819,7 @@ async function load(again) {
     tintTitleBar();
     renderAgents();
     redrawSuffix();
+    redrawNoNames();
     // Update all's outcome stays until the agents are read again
     if (cliAll && cliAll.done >= cliAll.n) cliAll = null;
     paintUpdateAll(true);
@@ -8141,6 +8142,7 @@ function asTyped() {
   // many keys pasted (361 on Discord) are asked about by the first
   const keys = splitKeys(draft.key || "");
   const body = { typed: true, key: keys.length > 1 ? keys[0] : (draft.key || "").trim(), chat: (draft.chat || "").trim(), responses: (draft.responses || "").trim(), anthropic: (draft.anthropic || "").trim(), gemini: (draft.gemini || "").trim(), modelsURL: (draft.modelsURL || "").trim() };
+  Object.assign(body, movedURLs(draft));
   // a System One base is asked at POST …/systemone, not on the three APIs
   if (draft.api === "decide") body.decide = (draft.decide || "").trim();
   // a Vertex AI provider is asked at the project typed, with the
@@ -9202,6 +9204,42 @@ function drawEditor(p, presetID) {
     ed.append(...field(t("Endpoint"), endpoint, pr.endpointHint ? t(pr.endpointHint) : ""));
   }
 
+  // a server on this machine (Ollama, LM Studio, oMLX, MLX-Serve) can
+  // listen on another port, or be another computer's: its address moves each URL, each API
+  // keeping its path, as provider.AtAddress does
+  let address = null, addressMore = null;
+  if (pr?.kind === "local") {
+    // a saved provider's URLs (or a duplicate's) start it; a new one's are
+    // the preset's, sent as none unless moved, so the gateway takes them
+    const own = draft.chat !== undefined;
+    // oMLX's decision API (#1641) is the same server's, and moves with it
+    draft.addressFrom ??= { chat: draft.chat ?? pr.chat ?? "", responses: draft.responses ?? pr.responses ?? "", anthropic: draft.anthropic ?? pr.anthropic ?? "", decide: draft.decide ?? (p?.decide || pr.decide || "") };
+    draft.addressWas ??= own ? originOf(draft.addressFrom) : "";
+    const from = draft.addressFrom, addressWas = draft.addressWas;
+    draft.address ??= addressWas;
+    address = input(draft.address, originOf(pr));
+    address.inputMode = "url";
+    address.classList.add("address");
+    // the Jev endpoint field shows where the decision API moved to, until
+    // one is typed there
+    address.oninput = () => {
+      draft.address = address.value;
+      refreshEndpoints();
+      const du = ed.querySelector("input.decide-url");
+      if (du && draft.decide === draft.addressFrom.decide) du.value = movedURLs(draft)?.decide || draft.decide;
+    };
+    const keys = address.onkeydown;
+    address.onkeydown = (e) => { keys(e); if (e.key === "Enter" && isNew) save(); };
+    // folded: most run where the preset says; open for one that doesn't,
+    // or an address typed before the editor was drawn again
+    addressMore = el("details", "more");
+    addressMore.open = (own && originOf(from) !== originOf(pr)) || draft.address.trim() !== addressWas;
+    addressMore.append(el("summary", "", t("Server address")));
+    const inner = el("div", "inner");
+    inner.append(...field(t("Address"), address, t("Where the server listens; change the port, or give another computer's address")));
+    addressMore.append(inner);
+  }
+
   // null, not false, when there is none: false?.key is undefined, and a
   // provider with no key read .set of it (willz: a local Ollama without a
   // key opened no editor, its row just toggling)
@@ -9284,6 +9322,7 @@ function drawEditor(p, presetID) {
   if (p?.keyList?.filter((k) => k.on).length > 1) ed.append(...renderRouting(p));
   else if (vertex) ed.append(...vertexFields());
   else ed.append(...field(t("API key"), keyWrap, isNew ? t("Kept in ~/.config/magpie/providers.json, readable by you alone. Nothing is read from your shell.") : ""));
+  if (addressMore) ed.append(addressMore);
 
   // A user-defined provider can have its own picture; presets keep theirs.
   if (custom) ed.append(...field(t("Icon"), iconPicker(ed), ""));
@@ -9530,7 +9569,8 @@ function drawEditor(p, presetID) {
   // names the account, …/accounts/<id>/ai/run — in place of the preset's
   if (decides && !custom && (p?.preset || pr?.id) !== "remote-magpie") {
     if (draft.decide === undefined) draft.decide = p?.decide || pr?.decide || "";
-    const du = input(draft.decide, pr?.decide || "https://…", "url");
+    const du = input((address && movedURLs(draft)?.decide) || draft.decide, pr?.decide || "https://…", "url");
+    du.classList.add("decide-url");
     // Bailian's is at the host of the key's workspace (#647): its id is
     // typed on its own, the plan's address filled in with it
     if (!draft.region && pr?.regions?.some((r) => r.decide)) draft.region = (pr.regions.find((r) => r.decide && workspaceOf(r.decide, draft.decide) !== null) || pr.regions[0]).id;
@@ -9566,6 +9606,7 @@ function drawEditor(p, presetID) {
         src.gemini = vertexBase(draft.vertex);
         for (const x of row) x.hidden = !src.gemini;
       }
+      Object.assign(src, address && movedURLs(draft));
       ebox.replaceChildren(renderEndpoints(p, src));
     };
     refreshEndpoints();
@@ -9738,6 +9779,11 @@ function drawEditor(p, presetID) {
     if (isNew && custom && !body.chat && !body.anthropic && !body.responses && !body.decide) { url.focus(); return editorError(t("A base URL is needed"), "warn"); }
     if (endpoint && !body.chat && !body.responses) { endpoint.focus(); return editorError(t(pr.endpointNeeded || "Your resource's endpoint is needed"), "warn"); }
     if (vertex && !body.vertex.project) { vertexProject?.focus({ preventScroll: true }); return editorError(t("Google Vertex AI needs the id of your Google Cloud project"), "warn"); }
+    if (address) {
+      const a = (draft.address || "").trim();
+      if (localAddress(a) === null) { addressMore.open = true; address.focus({ preventScroll: true }); return editorError(t("Address: {v} isn't an address like http://localhost:11434", { v: a }), "warn"); }
+      Object.assign(body, movedURLs(draft));
+    }
     editorError("");
     saving(saveBtn, t(isNew ? "Adding…" : "Saving…"));
     providerAction("save", body, t(isNew ? "{name} added" : "{name} saved", { name: draft.name || draft.id }));
@@ -10850,6 +10896,7 @@ function renderModels(p) {
     };
     sayLabel();
     sfx.append(el("span", "", t("Provider in model names")), suffixSegs(sayLabel), sfxSaid);
+    sfx.append(noNamesLine("span", "said"));
     names.append(sfx);
     // the APIs a model can be asked on alone: those of a key's provider
     // it has a URL for, when it has more than one (01huadalang on Discord:
@@ -12617,6 +12664,20 @@ function renderAccounts(a, p) {
       }, "Account to stay signed in to", "sess-menu");
     };
     box.append(keep, as);
+    list.append(box);
+  }
+  // with more of its accounts on, magpie sends Codex's own requests through
+  // the gateway to fail over between them (#1385); this has it only switch
+  // Codex's own sign-in instead, its requests going straight to OpenAI
+  // (#1907: Codex Desktop and the CLI on their own subscription alone)
+  if (a.agent === "codex" && several && p) {
+    const box = el("div", "switch-only");
+    const [only, cb] = tick(t("Only switch {agent}'s sign-in", { agent: a.agentName }), !!p.switchOnly);
+    only.title = t("magpie signs {agent} in to the next account with room when the one it is on is used up, and back once that has room again, by writing {agent}'s own sign-in; {agent}'s requests go straight to OpenAI, never through magpie. A {agent} app or session already open stays on its account until it is opened again. Connected to magpie, {agent}'s requests go through it as before.", { agent: a.agentName });
+    cb.onchange = () => accountAction("provider/switchonly", { id: p.id, switchOnly: cb.checked }, cb.checked
+      ? t("magpie only switches {agent}'s sign-in; its requests go straight to OpenAI", { agent: a.agentName })
+      : t("{agent}'s requests go through magpie to fail over to your other accounts again", { agent: a.agentName }));
+    box.append(only);
     list.append(box);
   }
   if (a.agent === "codex" && providers?.codexDaemon) list.append(renderCodexDaemon(providers.codexDaemon));
@@ -14424,6 +14485,49 @@ function slug(s) { return s.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^
 // dots kept (gpt-6.1-sol, #968).
 function groupSlug(s) { return s.toLowerCase().replace(/[^a-z0-9.]+/g, "-").replace(/\.{2,}/g, ".").replace(/^[-.]+|[-.]+$/g, ""); }
 function hostOf(u) { try { return new URL(u.includes("://") ? u : "https://" + u).host; } catch { return ""; } }
+
+// localAddress is a local server's address as typed, as provider.AtAddress
+// takes it: its origin, http when no scheme is given, any path dropped; ""
+// for nothing typed, null for what is no address.
+function localAddress(s) {
+  s = (s || "").trim();
+  if (!s) return "";
+  if (/\s/.test(s)) return null;
+  try {
+    const u = new URL(s.includes("://") ? s : "http://" + s);
+    if ((u.protocol !== "http:" && u.protocol !== "https:") || !u.hostname) return null;
+    return u.protocol + "//" + u.host;
+  } catch { return null; }
+}
+// originOf is the origin of the first of a provider's URLs that is set.
+function originOf(x) {
+  for (const u of [x?.chat, x?.responses, x?.anthropic]) {
+    if (!u) continue;
+    try { const v = new URL(u); return v.protocol + "//" + v.host; } catch {}
+  }
+  return "";
+}
+// movedURLs is a local server's URLs at the Address typed in its editor,
+// moved from the ones it opened with, or null while the Address is the one
+// it opened with or no address. Moved only then, and never into draft: URLs
+// a saved one has apart (another app's, the CLI's) stay as they are after
+// an Address is typed and put back.
+function movedURLs(d) {
+  if (!d?.addressFrom) return null;
+  const at = localAddress(d.address);
+  if (!at || at === d.addressWas) return null;
+  const out = atAddress(d.addressFrom, at);
+  // a decision endpoint typed in its own field is the user's: kept as typed
+  // (and one with none has none to move)
+  if (!out.decide || (d.decide !== undefined && d.decide !== d.addressFrom.decide)) delete out.decide;
+  return out;
+}
+// atAddress is urls each moved to origin, its path kept.
+function atAddress(urls, origin) {
+  const out = {};
+  for (const [k, v] of Object.entries(urls)) out[k] = v && origin ? v.replace(/^[a-z][\w+.-]*:\/\/[^/?#]*/i, origin) : v;
+  return out;
+}
 
 // the sheet opens below the list: it unrolls on the rows' spring and the
 // view goes down with it. The button stays at the view's foot however long
@@ -16774,6 +16878,9 @@ function checkinRow(q, first, subs) {
         // why, in the row: a reason only in the tooltip read as no reason (#808)
         text = t(on ? "Check-in failed; magpie tries again later" : "Check-in failed") + (r.msg ? " · " + r.msg : "");
     }
+  } else if (q.checkinOff) {
+    // left out on its own in Settings (#1902)
+    text = [t("Auto check-in is off for this account"), last].filter(Boolean).join(" · ");
   } else {
     kind = on ? "wait" : "";
     text = [t(on ? "Not checked in yet today" : "Auto check-in is off"), last].filter(Boolean).join(" · ");
@@ -16804,7 +16911,7 @@ function checkinRow(q, first, subs) {
   };
   row.append(auto);
   // pressed now: shown while an account isn't in today and could be
-  const due = subs.filter((x) => x.checkins && (x.checkinBy || "") === by && !(x.checkin?.day === today && x.checkin.outcome !== "failed"));
+  const due = subs.filter((x) => x.checkins && !x.checkinOff && (x.checkinBy || "") === by && !(x.checkin?.day === today && x.checkin.outcome !== "failed"));
   if (due.length) {
     const now = el("button", "text ci-now", t("Check in now"));
     now.type = "button";
@@ -21024,6 +21131,11 @@ function renderSettings() {
   $("#qoderCheckinSub").textContent = [t("Claims each signed-in Qoder account's daily credits once a day"),
     ...(s.qoderCheckins || []).map(wbCheckinLine)].filter(Boolean).join(" · ");
   $("#qoderCheckinSub").title = t("As claiming the daily credits in Qoder does");
+  // and under each vendor's switch, its accounts', each on its own (#1902)
+  for (const [list, by] of [["#wbList", ""], ["#traeList", "trae"], ["#minimaxList", "minimax"], ["#qoderList", "qoder"]]) {
+    $(list).querySelectorAll(".ci-acct").forEach((x) => x.remove());
+    $(list).append(...checkinAccountRows(s, by));
+  }
   // and the plugins that check in themselves, a row each, their tab shown
   // while one is signed in
   renderPluginCheckins(s);
@@ -21190,10 +21302,16 @@ function renderSessionTerminal(s, keep) {
   };
 }
 
-// renderSync: the Settings page's sync and backup — WebDAV keeping the
+// renderSync: the Settings page's sync and backup — a remote keeping the
 // setup the same on every computer, and a sealed file to carry by hand.
 // One of the three opens a form below its row at a time.
 let syncOpen = ""; // "dav" | "export" | "import"
+const syncNames = { webdav: "WebDAV", s3: "S3", github: "GitHub" };
+function syncServers(v) {
+  const servers = { ...v.servers };
+  if (v.other) servers[v.other.kind] ||= v.other;
+  return servers;
+}
 let syncView = null;
 async function renderSync(v) {
   const box = $("#syncList");
@@ -21219,7 +21337,7 @@ async function renderSync(v) {
   const toggle = (id) => () => { syncOpen = syncOpen === id ? "" : id; renderSync(); };
   const parts = (ps) => ps.map((p) => t({ providers: "providers", settings: "settings", profiles: "profiles", agents: "agents' models", library: "library", usage: "usage" }[p])).join(t(", "));
 
-  // WebDAV or S3
+  // WebDAV, S3 or GitHub
   // off: what it would keep the same, named from the view's toggles as the
   // CLI names them, so the page can't promise a part the setup leaves out.
   // A view that says nothing of the toggles (a read that failed) reads as
@@ -21231,17 +21349,19 @@ async function renderSync(v) {
   let status = t("Keeps {parts} the same on every computer", {
     parts: t(v.keys === false ? "providers without their API keys" : "providers with their API keys") + t(", ") + parts(goes) });
   const s3 = v.on && v.kind === "s3";
+  const github = v.on && v.kind === "github";
   if (v.on) {
     const hostOf = (u) => { try { return new URL(u).host; } catch { return u; } };
     // a bucket is named by its address, and the server it is on unless AWS
-    const host = s3 ? [v.url, v.endpoint && hostOf(v.endpoint.includes("://") ? v.endpoint : "https://" + v.endpoint)].filter(Boolean).join(" · ") : hostOf(v.url);
-    status = v.error ? t("Couldn't sync: {error}", { error: v.serverFile ? serverFileSaid(v.serverFile) : v.error })
+    const host = github ? [v.url, v.branch].filter(Boolean).join(" · ")
+      : s3 ? [v.url, v.endpoint && hostOf(v.endpoint.includes("://") ? v.endpoint : "https://" + v.endpoint)].filter(Boolean).join(" · ") : hostOf(v.url);
+    status = v.error ? t("Couldn't sync: {error}", { error: v.serverFile ? serverFileSaid(v.serverFile) : t(v.error) })
       : v.last ? t("Synced {when} · {host}", { when: syncWhen(v.last), host }) : t("Not synced yet · {host}", { host });
     // the other kind's server, kept from before sync moved here
-    if (v.other) status += " · " + t("{kind} settings kept", { kind: v.other.kind === "s3" ? "S3" : "WebDAV" });
+    for (const kind of Object.keys(syncServers(v))) status += " · " + t("{kind} settings kept", { kind: syncNames[kind] });
     if (v.auto === 0) status += " · " + t("only when asked");
   }
-  const sub = row(t(s3 ? "S3 sync" : v.on ? "WebDAV sync" : "WebDAV or S3 sync"), status, ...(v.on
+  const sub = row(t(github ? "GitHub sync" : s3 ? "S3 sync" : v.on ? "WebDAV sync" : "WebDAV, S3 or GitHub sync"), status, ...(v.on
     ? [btn(t("Sync now"), async (e) => { e.target.classList.add("busy"); renderSync(await api("davsync/now", {}).catch((x) => ({ ...v, error: x.message }))); }),
        btn(t(syncOpen === "dav" ? "Close" : "Edit"), toggle("dav"))]
     : [btn(t(syncOpen === "dav" ? "Close" : "Set up"), toggle("dav"))]));
@@ -21446,17 +21566,16 @@ function syncBar(ed, err, ...tools) {
   return (msg) => { ed.querySelector(".editor-error").textContent = msg || ""; };
 }
 
-// davForm: the sync's settings, a WebDAV folder's or an S3 bucket's (#296).
-// Both sets of fields are made and the kind picked shows one, so what was
-// typed in the other is still there on going back. The kind not synced to
-// shows the server kept from before sync moved from it (ARNO on Discord:
-// trying S3 wiped the WebDAV setup); saving it moves sync back there.
+// davForm: the kind picked shows one set of fields; drafts survive switching.
+// Inactive servers keep their settings for moving sync back.
 function davForm(v) {
   const ed = el("div", "editor sync-form");
-  const active = v.on ? (v.kind === "s3" ? "s3" : "webdav") : "";
+  const active = v.on ? (v.kind || "webdav") : "";
   let kind = active || "webdav";
   const saved = t("saved · type a new one to replace it");
-  const dav = v.kind === "s3" ? v.other || {} : v, bk = v.kind === "s3" ? v : v.other || {};
+  const servers = syncServers(v);
+  const server = (k) => active === k ? v : servers[k] || {};
+  const dav = server("webdav"), bk = server("s3"), gh = server("github");
   const url = input(dav.url || "", "https://dav.jianguoyun.com/dav/");
   const user = input(dav.user || "", t("user name"));
   const pass = input("", dav.passwordSet ? saved : t("password, or an app password"), "password");
@@ -21469,6 +21588,11 @@ function davForm(v) {
   const keyID = input(bk.user || "", "AKIA…");
   const secret = input("", bk.passwordSet ? saved : t("secret access key"), "password");
   const [pathL, pathStyle] = tick(t("Path-style: the bucket in the path, not the host name"), !!bk.pathStyle);
+  const ghParts = /^github:\/\/([^/]+\/[^/]+)\/?(.*)$/i.exec(gh.url || "");
+  const repo = input(ghParts?.[1] || "", "owner/repo");
+  const branch = input(gh.branch || "", t("default branch"));
+  const ghPrefix = input(ghParts?.[2] || "", t("optional"));
+  const token = input("", gh.passwordSet ? saved : t("GitHub token"), "password");
   const phrase = input("", v.passphraseSet ? saved : t("the same on every computer"), "password");
   const [keysL, keys] = tick(t("Providers' API keys"), v.keys !== false);
   const [agentsL, agents] = tick(t("Agents' models"), v.agents !== false);
@@ -21487,23 +21611,27 @@ function davForm(v) {
     ...field(t("Access key"), keyID),
     ...field(t("Secret"), secret),
     ...field("", pathL, t("MinIO and most NAS servers need it."))];
-  const names = { webdav: "WebDAV", s3: "S3" };
+  const ghFields = [...field(t("Repository"), repo, t("An existing private GitHub repository, in owner/repo form.")),
+    ...field(t("Branch"), branch, t("Empty uses the repository's default branch. Empty repositories are initialized by the first sync; other branches must already exist.")),
+    ...field(t("Folder"), ghPrefix, t("The encrypted backup goes in <folder>/magpie/magpie.magpie-backup. Each update creates a commit.")),
+    ...field(t("GitHub token"), token, t("A fine-grained token for this repository with Contents: read and write. Kept on this computer, separately from the library's GitHub token."))];
   // which one is synced to, and that the other's settings stay
-  const to = field(t("Sync to"), segs([["webdav", "WebDAV"], ["s3", "S3"]].map(([id, n]) => [id, id === active ? t("{kind} · on", { kind: n }) : n]), kind, (k) => { kind = k; show(); }), " ");
+  const to = field(t("Sync to"), segs(Object.entries(syncNames).map(([id, n]) => [id, id === active ? t("{kind} · on", { kind: n }) : n]), kind, (k) => { kind = k; show(); }), " ");
   const where = to[1].querySelector(".hint");
   const save = el("button", "text primary", "");
+  const other = Object.keys(servers).map((k) => syncNames[k]).filter(Boolean).join(" / ");
   const show = () => {
     for (const x of davFields) x.hidden = kind !== "webdav";
     for (const x of s3Fields) x.hidden = kind !== "s3";
-    const other = kind === "s3" ? "webdav" : "s3";
+    for (const x of ghFields) x.hidden = kind !== "github";
     where.textContent = !active ? ""
-      : kind === active ? (v.other ? t("Syncing here now. The {other} settings are kept, not synced to: pick {other} to see them.", { other: names[other] }) : t("Syncing here now."))
-      : t("{active} is synced to now. Saving moves sync here; the {active} settings are kept for moving back.", { active: names[active] });
+      : kind === active ? (other ? t("Syncing here now. The {other} settings are kept, not synced to: pick {other} to see them.", { other }) : t("Syncing here now."))
+      : t("{active} is synced to now. Saving moves sync here; the {active} settings are kept for moving back.", { active: syncNames[active] });
     where.hidden = !active;
-    save.textContent = !active ? t("Turn on") : kind === active ? t("Save") : t("Move sync to {kind}", { kind: names[kind] });
+    save.textContent = !active ? t("Turn on") : kind === active ? t("Save") : t("Move sync to {kind}", { kind: syncNames[kind] });
   };
   ed.append(...to,
-    ...davFields, ...s3Fields,
+    ...davFields, ...s3Fields, ...ghFields,
     ...field(t("Passphrase"), phrase, t("The file is sealed with it on this computer; the server only ever sees it sealed. Keep it: without it the file can't be opened.")),
     ...field(t("Also sync"), what, t("Usage goes as a file a day: times, tokens, models and costs, never what was said. Turn it on on each computer that shares its own.")));
   show();
@@ -21515,9 +21643,15 @@ function davForm(v) {
   save.onclick = async () => {
     const b = bucket.value.trim(), p = prefix.value.trim().replace(/^\/+|\/+$/g, "");
     if (kind === "s3" && !b) return say(t("Name the bucket"));
+    const repository = repo.value.trim().replace(/^https:\/\/github\.com\//i, "").replace(/\/+$/, "").replace(/\.git$/i, "");
+    const ghFolder = ghPrefix.value.trim().replace(/^\/+|\/+$/g, "");
+    if (kind === "github" && !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repository)) return say(t("Name the GitHub repository as owner/repo"));
+    if (kind === "github" && !gh.passwordSet && !token.value.trim()) return say(t("Enter a GitHub token with Contents read and write permission"));
     if (!v.passphraseSet && !phrase.value) return say(t("Pick a passphrase: the file is sealed with it"));
     save.classList.add("busy");
-    const where = kind === "s3"
+    const where = kind === "github"
+      ? { url: "github://" + repository + (ghFolder ? "/" + ghFolder : ""), branch: branch.value.trim(), password: token.value.trim() }
+      : kind === "s3"
       ? { url: "s3://" + b + (p ? "/" + p : ""), user: keyID.value.trim(), password: secret.value, endpoint: endpoint.value.trim(), region: region.value.trim(), pathStyle: pathStyle.checked }
       : { url: url.value.trim(), user: user.value.trim(), password: pass.value };
     try {
@@ -21647,6 +21781,38 @@ function suffixSegs(drawn) {
   seg.drawnAgain = drawn;
   return seg;
 }
+// noNamesSaid: what Provider in model names can't change, said under it:
+// the connected agents whose own lists don't name magpie's models as it
+// says (agent.NoNames: handed ids alone, or the gateway's names alone).
+// love1sbug on X found the setting seemed to do nothing; "" when none is.
+function noNamesSaid() {
+  const names = (state.agents || []).filter((a) => a.wired && a.noNames).map((a) => a.name);
+  return names.length ? t("Changes nothing in {agents}: magpie’s names don’t reach their model lists", { agents: names.join(", ") }) : "";
+}
+// noNamesLine is that line, hidden while it says nothing: a page drawn
+// before the agents are read (Routing, a provider's editor) is said again
+// once they are (redrawNoNames)
+function noNamesLine(tag, cls) {
+  const e = el(tag, cls + " no-names");
+  e.dataset.noNames = "";
+  e.textContent = noNamesSaid();
+  e.hidden = !e.textContent;
+  return e;
+}
+function redrawNoNames() {
+  for (const e of document.querySelectorAll("[data-no-names]")) {
+    e.textContent = noNamesSaid();
+    e.hidden = !e.textContent;
+  }
+  if ($("#plainNamesSegs")) sayNoNamesInSettings();
+}
+// the Settings row's name says enough on its own (1ooogle on X): a line
+// under it only for an agent it changes nothing in
+function sayNoNamesInSettings() {
+  const who = $("#plainNamesSegs").parentElement.querySelector(".who"), said = noNamesSaid();
+  who.querySelector(".no-names")?.remove();
+  if (said) who.append(el("div", "sub no-names", said));
+}
 // redrawSuffix draws each suffix choice in the page again when the
 // settings that came in say another mode than it was drawn with: a page
 // drawn before the state's first read (Routing's groups can come back
@@ -21689,6 +21855,7 @@ function renderTrayUsage(s, keep) {
     (v) => savePrefs({ ...keep, chineseUnits: v })));
   renderAlerts(s, keep);
   $("#plainNamesSegs").replaceChildren(suffixSegs());
+  sayNoNamesInSettings();
   // Codex's own models in multi-agent V1 (their subagents' tasks go as text),
   // so a GPT lead can run a subagent on magpie's other models (#141). Where
   // Codex's own multi_agent_v2 is on in the config magpie routes it wins, and
@@ -22584,7 +22751,23 @@ function renderReplies(s, keep) {
   lval.append(segs([["off", t("Off")], ["on", t("On")]], s.noLoopGuard ? "off" : "on",
     (v) => savePrefs({ ...keep, noLoopGuard: v === "off" })));
   l.append(lwho, lval);
-  box.append(r, l);
+  // how many more accounts or members a request the vendor's safety filter
+  // refused is asked of (#248): every one left unless set. Never hands the
+  // refusal back, which Claude Code answers with its own fallback model (DD
+  // on Discord)
+  const f = el("div", "row pref");
+  f.id = "refusalRetriesRow";
+  const fwho = el("div", "who");
+  fwho.append(el("div", "name", t("Ask again after a refusal")),
+    el("div", "sub wraps", t("When a vendor's safety filter refuses a request before anything is said, how many more accounts or routing group members are asked. Never ask again hands the refusal straight back: Claude Code then switches to its own fallback model, as it does on Anthropic's API")));
+  const fval = el("div", "val");
+  const counts = [["0", t("Never ask again")], ["1", "1"], ["2", "2"], ["3", "3"]];
+  const n = s.refusalRetries == null || s.refusalRetries < 0 ? "" : String(s.refusalRetries);
+  if (n && !counts.some(([id]) => id === n)) counts.push([n, n]); // set by hand in settings.json
+  fval.append(segs([...counts, ["", t("All")]], n,
+    (v) => savePrefs({ ...keep, refusalRetries: v === "" ? null : Number(v) })));
+  f.append(fwho, fval);
+  box.append(r, l, f);
 }
 
 // renderDisabledModels: the models the user turned off for every request
@@ -23404,8 +23587,34 @@ function renderPluginCheckins(s) {
       }
     }));
     row.append(who, segBox);
+    return [row, ...checkinAccountRows(s, "plugin:" + p.id)];
+  }).flat());
+}
+
+// checkinAccountRows are an Off/On row for each account vendor by checks
+// in (#1902, magicLaLa: 根据每个账号设置是否开启自动签到), under its Daily
+// check-in; none for a vendor of one account, whose switch is its own.
+function checkinAccountRows(s, by) {
+  const accts = (s.checkinAccounts || []).filter((a) => (a.by || "") === by);
+  if (accts.length < 2) return [];
+  return accts.map((a) => {
+    const row = el("div", "row pref ci-acct");
+    row.dataset.key = a.key;
+    const who = el("div", "who");
+    who.append(el("div", "name", a.user || a.key), el("div", "sub", t(a.on ? "Checked in once a day while Daily check-in is on" : "Left out of the daily check-in")));
+    const segBox = el("div");
+    segBox.append(segs([["off", t("Off")], ["on", t("On")]], a.on ? "on" : "off", async (v) => {
+      try {
+        prefs = await writingPrefs(api("settings/checkin-account", { key: a.key, on: v === "on" }));
+        state.settings = prefs;
+      } catch (err) {
+        status(t(err.message), "err");
+      }
+      renderSettings();
+    }));
+    row.append(who, segBox);
     return row;
-  }));
+  });
 }
 
 // wbCheckinLine is how an account's last WorkBuddy check-in went: today's
@@ -23443,7 +23652,7 @@ function prefsKeep(s) {
     redact: !!s.redact, redactPersonal: !!s.redactPersonal, redactKinds: s.redactKinds || {}, redactWords: s.redactWords || [], codexWarmup: s.codexWarmup || "",
     claudeWarmup: s.claudeWarmup || "", codexWarmAt: s.codexWarmAt || "", claudeWarmAt: s.claudeWarmAt || "",
     codexWarmAts: warmTimes(s.codexWarmAts, s.codexWarmAt), claudeWarmAts: warmTimes(s.claudeWarmAts, s.claudeWarmAt), workbuddyCheckin: !!s.workbuddyCheckin, traeCheckin: !!s.traeCheckin, minimaxCheckin: !!s.minimaxCheckin, qoderCheckin: !!s.qoderCheckin, noStats: !!s.noStats, noUsageStats: !!s.noUsageStats,
-    memberModel: !!s.memberModel, noLoopGuard: !!s.noLoopGuard,
+    memberModel: !!s.memberModel, noLoopGuard: !!s.noLoopGuard, refusalRetries: s.refusalRetries ?? null,
     noUpdatePill: !!s.noUpdatePill, noAutoUpdate: !!s.noAutoUpdate, updateEvery: s.updateEvery || 360,
     trayUsage: s.trayUsage || "", trayUsageEvery: s.trayUsageEvery || 3, trayNoLogos: !!s.trayNoLogos, trayNoBird: !!s.trayNoBird, vision: s.vision || "", imageGen: s.imageGen || "", searcher: s.searcher || "", searchFirst: s.searchFirst || "", currency: s.currency || "usd",
     chineseUnits: !!s.chineseUnits, usageAlert: s.usageAlert || 0, balanceAlert: s.balanceAlert || 0, resetReminder: s.resetReminder || 0,
@@ -23852,6 +24061,8 @@ async function show(v) {
     }
   }
   view = v;
+  // the page the reader leaves is the one the window opens on next (keptView)
+  if (mode === "window") { try { localStorage.setItem("magpie.lastView", v); } catch { /* not kept */ } }
   const title = ({ agents: "Agents", providers: "Providers", gateway: "Gateway", routing: "Routing", usage: "Usage", sessions: "Sessions", library: "Library", plugins: "Plugins", settings: "Settings" })[v];
   $("#pageTitle").dataset.en = title;
   $("#pageTitle").textContent = t(title);
@@ -24917,7 +25128,21 @@ if (mode === "window" && params.get("view") === "usage") {
   for (const k of ["tab", "provider", "agent", "computer", "card", "purpose", "via"]) u.searchParams.delete(k);
   history.replaceState(null, "", u);
 }
-if (mode === "window" && ["providers", "gateway", "routing", "usage", "sessions", "library", "plugins", "settings"].includes(params.get("view"))) show(params.get("view"));
+// The window opens on the page the reader last left, as a Mac app comes back
+// as it was (molvqingtai, lc on Discord): a page asked for (?view=, a link
+// from the tray or a reload) first, then the one kept; a page gateway mode
+// leaves out, or one there is no longer, gives way to the first page.
+// the pages the window can open on besides the first (Agents)
+const OPEN_VIEWS = ["providers", "gateway", "routing", "usage", "sessions", "library", "plugins", "settings"];
+function keptView() {
+  const asked = params.get("view");
+  if (asked === "agents" || OPEN_VIEWS.includes(asked)) return asked;
+  let v = "";
+  try { v = localStorage.getItem("magpie.lastView") || ""; } catch { /* none kept */ }
+  return OPEN_VIEWS.includes(v) ? v : ""; // one gateway mode leaves out, show() makes Providers
+}
+const firstView = mode === "window" ? keptView() : "";
+if (OPEN_VIEWS.includes(firstView)) show(firstView);
 else if (mode === "window" && !gatewayMode && !sideNav()) slide($("#nav"), "nav");
 // in gateway mode the first page is Providers, Agents' tab gone
 if (gatewayMode) setGatewayMode(true);

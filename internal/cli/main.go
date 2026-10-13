@@ -64,6 +64,7 @@ const usage = `magpie — one place to pick every agent's model
   magpie restore [--no-agents] [--no-library] <file> put a backup in on this machine
   magpie webdav [on <address>|set k=v…|now|off]      the same, kept the same on every computer through a WebDAV folder (magpie webdav help)
   magpie s3 [on s3://<bucket>[/<prefix>]|set k=v…|now|off]   the same through an S3-compatible bucket: AWS, R2, B2, MinIO… (magpie s3 help)
+  magpie github [on github://<owner>/<repo>[/<folder>]|set k=v…|now|off]   the same in an encrypted GitHub repository (magpie github help)
 
   magpie library [sync|instructions|mcp|skill]   the instructions, MCP servers and skills written into every agent (magpie library help)
 
@@ -94,6 +95,7 @@ const usage = `magpie — one place to pick every agent's model
   magpie accounts checkin         WorkBuddy's daily check-in (签到) for each WorkBuddy account, now (Settings can do it daily)
   magpie accounts project <gemini|antigravity> <email> <project>   the Google Cloud project a Google account's requests go to
   magpie accounts alias <agent> <email> [<name>|--clear]   a name of your own for an account, shown on its card, in the menu bar and in magpie quota
+  magpie accounts switch-only codex [on|off]   only switch Codex's own sign-in to an account with room; its requests go straight to OpenAI, never through magpie
   magpie claude-code [install [--yes]|remove]   the Claude Code a Claude subscription runs; install downloads Anthropic's own build, checked against its manifest, for a server or container without one
   magpie plugin [add <package>|rm|update|on|off|login <provider>|logout <provider>]
                                   OpenCode provider plugins and pi packages: subscriptions signed in to, and served, through a plugin
@@ -358,6 +360,8 @@ func run(args []string) error {
 		return pluginCmd(args)
 	case "s3":
 		return s3Cmd(args[1:])
+	case "github":
+		return githubCmd(args[1:])
 	case "mcp":
 		return imagemcp.Run(args[1:])
 	case "claude-code":

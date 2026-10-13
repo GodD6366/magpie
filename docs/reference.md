@@ -14,6 +14,7 @@ the model it is set to. Click a value, pick a model. That is the whole app.
 
 It lives in the menu bar: click the icon and a panel drops down; the same
 screen also opens as a normal window (`magpie`, or *Open magpie* in the tray menu),
+which opens on the page you last left, as a Mac app comes back as it was,
 and there is a terminal version (`magpie tui`) and a plain CLI. The
 terminal version serves the gateway while it is open when no other magpie
 (the app, `magpie web`, `magpie serve`) does, and says so on its status
@@ -305,8 +306,14 @@ card each count is a button for its requests in the list below (the
 Failed and Retried filters, `failed=1` and `retried=1`). A try a vendor
 refused or turned away keeps its own row, for what it billed and why, marked
 handed on, and isn't counted as a request. The CSV's last columns are
-`tries` (on the final row, when the request took more than one) and
-`handed_on`.
+`tries` (on the final row, when the request took more than one),
+`handed_on`, then `tier_asked`, `tier_sent` and `tier_served`: the
+service tier the client asked for (Claude's fast speed reads `fast`), the
+one that try went out at (a fast pick sends `priority`; Ultrafast becomes
+`priority` on an account whose plan doesn't offer it), and the one the
+vendor's reply said it ran at, empty when the reply doesn't say. The JSON
+log keeps them as `tier_asked`, `tier_sent` and `tier_served`, and each
+try in `/v1/magpie/route` has `tier` and `tier_served`.
 
 **Output speed** (tok/s on the Usage and Routing pages, `magpie usage`) is
 output tokens over the time after the first token, summed per request: the
@@ -438,6 +445,15 @@ WorkBuddy (China)'s daily check-in (签到) is pressed from the app's Usage card
 which checks in every account signed in on this computer at once; its
 WorkBuddy lines say how today's went. A shared magpie's accounts are checked
 in on that magpie, from its own app, TUI or CLI.
+
+A vendor with two or more accounts lists each under its Daily check-in in
+**Settings → Usage**, with its own Off/On (#1902). An account turned off is
+left out of the daily check-in and of *Check in now*, the CLI's and the
+TUI's too, while the vendor's other accounts are checked in; its Usage card
+says its auto check-in is off. The choice is kept in `checkinOff` in
+`settings.json`, by the account's entry in the vendor's check-in file
+(`workbuddy|<uid>`), and set with `POST /api/settings/checkin-account
+{key, on}`.
 
 A plugin whose `auth` hook has `checkin` checks its own accounts in the same
 way: once a day while its switch under **Settings → Usage → Plugins** is on,
@@ -1362,6 +1378,18 @@ minutes. Out of credit rests half an hour. Any other failure rests a minute, lon
 again, up to 10 minutes; a subscription that fails with a window used up
 rests until that window renews.
 
+**When the safety filter refuses.** A reply the vendor's safety filter
+refuses before any of it is said rests nobody: it is about what was asked,
+not the account. By default the same request is asked of the model's other
+accounts, then the routing group's other members, until one answers.
+Settings › Models › Replies › *Ask again after a refusal* sets how many more
+are asked: 1, 2 or 3, or *Never ask again*. When nobody else is asked, an
+agent on Anthropic's Messages API (Claude Code) gets the refusal as the
+vendor said it, `stop_reason` `refusal` with its category, which Claude Code
+answers by switching to its own fallback model, as it does on Anthropic's
+API. Codex and Chat clients get a 400 saying the model refused the request,
+which they don't ask again for. Any other 400 is never asked again.
+
 **Through the gateway, or on its own.** Everything above is the gateway's,
 for requests sent through magpie. Claude Code or Codex used on its own
 talks to the vendor with the account it is signed in to, and routing
@@ -1374,6 +1402,18 @@ nothing of yet (see below) is not moved to. Once the account it moved the
 agent off has every window under 90% again, it signs the agent back in to
 it. *Keep … signed in to* turns this off: the agent stays on the first
 account, or on the account you picked, whatever it has left. It changes nothing in the gateway's routing.
+
+With more than one Codex account on, magpie also sets `openai_base_url`
+in Codex's config.toml, so a request the signed-in account has no
+allowance for goes on to the others through the gateway. *Only switch
+Codex's sign-in* under Providers › Codex (or `magpie accounts switch-only
+codex on`) leaves that out: magpie only moves Codex's own sign-in
+(`auth.json`) as above, and Codex's requests go straight to OpenAI, never
+through magpie (#1907). An `openai_base_url` you wrote yourself stays. The
+Codex app and a running `codex app-server` read the sign-in when they
+start, so one already open stays on its account until it is opened again;
+a new `codex` session takes the new one. Connected to magpie, Codex's
+requests go through it as before.
 
 **How often an allowance is read.** Routing uses what was read last and
 never waits for a reading, except the first one after magpie starts (3
@@ -2067,14 +2107,20 @@ stdin.
 
 ### Keeping machines in sync
 
-*Settings → Sync and backup → WebDAV or S3 sync* keeps the same backup on a
-server and brings every machine up to date with it, every 3 minutes while the
-gateway runs. Choose one of these:
+*Settings → Sync and backup → WebDAV, S3 or GitHub sync* keeps the same backup
+on a server and brings every machine up to date with it, every 3 minutes while
+the gateway runs. Choose one of these:
 
 - **WebDAV**: a folder on a WebDAV server such as 坚果云, Nextcloud or a
   Synology.
 - **S3**: a bucket on AWS S3, Cloudflare R2, Backblaze B2, MinIO, Garage, a
   NAS or any other S3-compatible server.
+- **GitHub**: an existing repository, using a fine-grained token
+  with Contents read and write permission. The repository must be private:
+  sync refuses a public one, whose history would give anyone every sealed version.
+  The address can include a folder, such as `github://owner/repo/magpie-sync`.
+  Each update is a commit to that branch, so the repository also provides a
+  history of the encrypted backup.
 
 The file is sealed on your machine with the passphrase, so the server only
 ever stores ciphertext. Each machine writes only over the version it read (a
@@ -2086,6 +2132,8 @@ magpie webdav on https://dav.jianguoyun.com/dav/ user=me@example.com
 magpie s3 on s3://my-bucket/magpie endpoint=https://<account>.r2.cloudflarestorage.com access-key-id=…
 magpie s3 on s3://backups endpoint=http://nas.local:9000 path-style=yes access-key-id=…
 magpie s3                       # where it syncs to and how the last sync went; magpie s3 now, off
+magpie github on github://owner/private-backups/settings branch=main
+magpie github                   # where it syncs to and how the last sync went; magpie github now, off
 ```
 
 For S3:
@@ -2110,6 +2158,24 @@ For S3:
 - Shared usage is reconciled only after a complete S3 listing. A missing or
   repeated continuation token, or a listing still truncated after 100 pages,
   reports a sync error and keeps previously downloaded usage days in place.
+
+For GitHub:
+
+- Create the repository before enabling sync. Leaving Branch empty uses its
+  default branch. For an empty repository, the first encrypted backup creates
+  the initial commit on that default branch. A selected branch other than the
+  default must already exist.
+- Give a fine-grained token access to this repository with Contents read and
+  write permission. It is asked for by the CLI, never accepted in a command
+  line, and is saved separately from the library's GitHub token.
+- Folder is optional. Files go in `<folder>/magpie/`; every changed backup
+  creates a commit. Unchanged setup creates no backup commit.
+- Use the same encryption passphrase on every computer. It must differ from
+  the GitHub token. The token and sync connection settings stay on each computer.
+- The file limit is 64 MiB. Repository history retains encrypted old versions,
+  including usage files if sharing is enabled.
+- Switching between WebDAV, S3 and GitHub keeps the other services' settings
+  and credentials for switching back; one service syncs at a time.
 
 ## OTLP export
 
