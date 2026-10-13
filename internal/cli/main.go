@@ -21,6 +21,7 @@ import (
 	"github.com/yetone/magpie/internal/gateway"
 	"github.com/yetone/magpie/internal/imagemcp"
 	"github.com/yetone/magpie/internal/netproxy"
+	"github.com/yetone/magpie/internal/pluginrt"
 	"github.com/yetone/magpie/internal/proc"
 	"github.com/yetone/magpie/internal/profile"
 	"github.com/yetone/magpie/internal/provider"
@@ -103,6 +104,8 @@ const usage = `magpie — one place to pick every agent's model
   magpie plugin move-back|unmigrate <subscription>   go back to the built-in, with its accounts
 
   magpie serve                    run the gateway alone (the app runs it too)
+  magpie daemon [install|uninstall|start|stop|restart|status]
+                                  magpie serve as a service of yours, from boot or login and started again when it stops (systemd --user on Linux, launchd on the Mac)
   magpie healthcheck              exit 0 when the gateway answers (a container's HEALTHCHECK)
   magpie gateway-key list|add <name>|rotate <id>|remove <id>   manage the keys clients use to call a shared gateway
   magpie gateway-key limit <id> [off|reset|day|week|month|<N>d --tokens N --cost USD --cache-reads]   a key's own limit, and what it used
@@ -221,6 +224,15 @@ func run(args []string) error {
 	update.AwaitPredecessor()
 	makeDirs()
 	settings.Migrate()
+	// a new install starts with the Essentials preset of built-in plugins
+	// (plugins.yml), one that ran before with all of them, told by no file
+	// of a magpie run before: so before anything below writes one
+	if _, err := pluginrt.Settle(!settings.RanBefore()); err != nil {
+		fmt.Fprintf(os.Stderr, "magpie: plugins.yml: %v\n", err)
+	}
+	if _, err := pluginrt.Refresh(); err != nil {
+		fmt.Fprintf(os.Stderr, "magpie: plugins.yml: %v\n", err)
+	}
 	// the providers and settings read once for every agent's fields, which
 	// the moves below look at (a write among them reads them again)
 	release := provider.Hold()
@@ -291,6 +303,8 @@ func run(args []string) error {
 		return runPanel()
 	case "autostart":
 		return autostartCmd(args[1:])
+	case "daemon":
+		return daemonCmd(args[1:])
 	case "-h", "--help", "help":
 		fmt.Print(usage)
 		return nil

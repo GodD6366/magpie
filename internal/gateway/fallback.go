@@ -931,6 +931,14 @@ func restOf(id string) (Rest, bool) {
 // status code doesn't: some answer 400 or 403 with it.
 var quotaWords = regexp.MustCompile(`(?i)quota|insufficient|balance|credit|billing|out of budget|budget (exceeded|exhausted)|exceeded|rate.?limit|usage.?limit|limit.?reached|hit your .*limit|limit.{0,24}resets|too many requests|overloaded|余额|额度|欠费|限流|频率|套餐|用量|上限`)
 
+// quotaSaid is whether an error's words, with no status to go by, say
+// out of quota or slow down: quotaWords, unless they say the conversation
+// is too long for the model, whose "context_length_exceeded" or "exceeds
+// the maximum" holds quotaWords' "exceeded" (#1944).
+func quotaSaid(msg string) bool {
+	return quotaWords.MatchString(msg) && !tooLong(http.StatusBadRequest, msg)
+}
+
 // unservedWords are how a vendor says the model isn't one it serves this
 // key, or this way — words another provider, or key, may not answer with.
 var unservedWords = regexp.MustCompile(`(?i)model.{0,80}(not (supported|accessible|available|found|enabled|allowed)|unsupported|does ?n[o']t exist|unknown|invalid)|(no such|unknown|invalid|unsupported) model|model_not_found|模型.{0,12}(不存在|不支持|无权|未开通)`)
@@ -1562,12 +1570,18 @@ func sseStart(head []byte) (sse, sure bool) {
 	return false, true
 }
 
-// streamEnds are how each protocol's stream says it is over, as they can
-// only appear outside a quoted string: text that says so is escaped.
+// streamEnds are how each protocol's stream says it is over, in every
+// spelling a relay sends: SSE makes the space after "data:" and "event:"
+// optional, and JSON the one after a colon (data:[DONE] from a relay was
+// logged 499 when the agent hung up on it, #1978). A JSON marker can only
+// appear outside a quoted string, as text that says so is escaped; an SSE
+// one starts a line, which text inside the JSON can't.
 var streamEnds = [][]byte{
-	[]byte(`"type":"response.completed"`), []byte(`"type":"response.incomplete"`), // Responses
-	[]byte(`"type":"message_stop"`), []byte("event: message_stop"), // Anthropic
-	[]byte("data: [DONE]"), // Chat Completions
+	[]byte(`"type":"response.completed"`), []byte(`"type": "response.completed"`), // Responses
+	[]byte(`"type":"response.incomplete"`), []byte(`"type": "response.incomplete"`),
+	[]byte(`"type":"message_stop"`), []byte(`"type": "message_stop"`), // Anthropic
+	[]byte("\nevent: message_stop"), []byte("\nevent:message_stop"),
+	[]byte("\ndata: [DONE]"), []byte("\ndata:[DONE]"), // Chat Completions
 }
 
 // see notes a stream's last event going by. An agent may hang up as soon as
@@ -1577,6 +1591,9 @@ func (h *holdWriter) see(b []byte) {
 		return
 	}
 	buf := append(h.tail, b...)
+	if len(h.tail) == 0 {
+		buf = append([]byte{'\n'}, b...) // the stream starts a line
+	}
 	for _, m := range streamEnds {
 		if bytes.Contains(buf, m) {
 			h.ended = true
@@ -2742,11 +2759,17 @@ func refusedReply(b []byte) (string, bool) {
 func streamStatus(msg string) int {
 	l := strings.ToLower(msg)
 	switch {
+	case tooLong(http.StatusBadRequest, msg):
+		// before the quota words: the ChatGPT backend's response.failed
+		// for a Codex conversation past the model's window says
+		// "context_length_exceeded", whose "exceeded" read as a rate
+		// limit, and the same request was sent again and again (#1944)
+		return 400
 	case strings.Contains(l, "overloaded"):
 		return 529
 	case creditWords.MatchString(msg) && !strings.Contains(l, "rate"):
 		return 402
-	case strings.Contains(l, "rate_limit"), strings.Contains(l, "rate limit"), strings.Contains(l, "too many"), quotaWords.MatchString(msg):
+	case strings.Contains(l, "rate_limit"), strings.Contains(l, "rate limit"), strings.Contains(l, "too many"), quotaSaid(msg):
 		return 429
 	case unservedWords.MatchString(msg):
 		return 400

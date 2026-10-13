@@ -492,7 +492,15 @@ func claudeIn(at place) *Agent {
 	// Claude version dashed, which it would read as Claude Opus 4
 	spell := provider.ClaudeSpelled
 	model := jsonGet(path, "model")
-	routed := func() bool { return env("ANTHROPIC_BASE_URL") == at.gw() }
+	// routed: on magpie's gateway, or on a proxy to it where magpie has
+	// answered (#1985), which a pick keeps (gwAt)
+	routed := func() bool { u := env("ANTHROPIC_BASE_URL"); return u == at.gw() || surelyMagpie(u, at.gw()) }
+	gwAt := func() string {
+		if u := env("ANTHROPIC_BASE_URL"); u != at.gw() && surelyMagpie(u, at.gw()) {
+			return u
+		}
+		return at.gw()
+	}
 	// the main model while routed: settings.json's model, which Claude
 	// Code's /model saves, so a model picked there holds for its next
 	// sessions too (the owner: 去掉 ANTHROPIC_MODEL，让 /model 的选择对新会话也生效)
@@ -744,8 +752,17 @@ func claudeIn(at place) *Agent {
 				continue
 			}
 			label, note := cmp.Or(labels[o.Ref], o.Label, o.Value), o.Note
-			if by, ok := strings.CutSuffix(note, " · via magpie"); ok && label != o.Label && strings.HasSuffix(label, " · "+by) {
-				note = "via magpie"
+			// a subscription's note is its account alone, so a label left
+			// without its provider (Off, or a name the user gave) named
+			// neither in /model; the provider goes before the account then,
+			// as an API key's note says it (#1136, cjyrainbow)
+			if by, ok := strings.CutSuffix(note, " · via magpie"); ok {
+				switch {
+				case label != o.Label && strings.HasSuffix(label, " · "+by):
+					note = "via magpie"
+				case o.Group != "" && o.Group != RoutingGroups && by != o.Group && !strings.HasSuffix(label, " · "+o.Group):
+					note = o.Group + " · " + note
+				}
 			}
 			rows = append(rows, map[string]any{"model": spell(mark1M(o.Value)), "label": label, "description": note})
 		}
@@ -1074,8 +1091,9 @@ func claudeIn(at place) *Agent {
 				return err
 			}
 		}
+		gw := gwAt()
 		kvs := []edit.KV{
-			{Path: "env.ANTHROPIC_BASE_URL", Value: at.gw()},
+			{Path: "env.ANTHROPIC_BASE_URL", Value: gw},
 			{Path: "env.ANTHROPIC_AUTH_TOKEN", Value: wiredKey()},
 			{Path: "env.ANTHROPIC_SMALL_FAST_MODEL", Value: spell(tiers["haiku"])},
 			{Path: "model", Value: spell(main)},
@@ -1100,7 +1118,7 @@ func claudeIn(at place) *Agent {
 		} else if err := edit.DelJSON(path, "env.CLAUDE_CODE_SUBAGENT_MODEL"); err != nil {
 			return err
 		}
-		stash(map[string]string{mainKey: main, wroteAt: at.gw()})
+		stash(map[string]string{mainKey: main, wroteAt: gw})
 		// the new model's window replaces the old one's, when magpie knows
 		// it; one the user set is theirs
 		if err := writeWindow(main, tiers); err != nil {
@@ -1576,7 +1594,7 @@ func claudeIn(at place) *Agent {
 			if at.sys != nil {
 				managed = at.sys("/etc/claude-code/managed-settings.json")
 			}
-			if u, _ := edit.GetJSON(managed, "env.ANTHROPIC_BASE_URL"); u != "" && u != at.gw() {
+			if u, _ := edit.GetJSON(managed, "env.ANTHROPIC_BASE_URL"); u != "" && u != at.gw() && !reachesMagpie(u, at.gw()) {
 				return "Claude Code's managed settings (" + at.native(managed) + ") set ANTHROPIC_BASE_URL to " + u + ", which wins over magpie's"
 			}
 			getEnv := func(k string) (string, bool) { return edit.GetJSON(path, "env."+k) }
@@ -2007,7 +2025,7 @@ func claudeStandIn(path, model string) string { return claudeStandInAt(path, mod
 // gateway at gw.
 func claudeStandInAt(path, model, gw string) string {
 	env := func(k string) string { v, _ := edit.GetJSON(path, "env."+k); return provider.ClaudeRead(v) }
-	if env("ANTHROPIC_BASE_URL") != gw {
+	if u := env("ANTHROPIC_BASE_URL"); u != gw && !surelyMagpie(u, gw) {
 		return ""
 	}
 	// the model Claude Code is set to itself, by that id, is its own pick

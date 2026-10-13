@@ -555,6 +555,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /v1/messages", keepsSignIn(s.handle(provider.Anthropic)))
 	mux.HandleFunc("POST /messages", keepsSignIn(s.handle(provider.Anthropic)))
 	mux.HandleFunc("POST /v1/systemone", s.serveSystemOne)
+	// Codex's web.run tool (anton on Discord)
+	mux.HandleFunc("POST /v1"+AlphaSearchPath, s.alphaSearch)
+	mux.HandleFunc("POST "+AlphaSearchPath, s.alphaSearch)
 	mux.HandleFunc("POST /v1/messages/count_tokens", keepsSignIn(s.countTokens))
 	mux.HandleFunc("POST /v1/images/generations", s.images(false))
 	mux.HandleFunc("POST /images/generations", s.images(false))
@@ -609,10 +612,15 @@ func (s *Server) info(w http.ResponseWriter, r *http.Request) {
 // same). It names the accounts and their balances, so it answers this
 // machine, and another only with an enabled gateway key, which lanGuard
 // asks of it while the gateway is shared or MAGPIE_ADDR puts it on the
-// network.
+// network. A key held to a budget, models or accounts is someone else's
+// to use and is told none of it (refuseHeld), as are quotasHistory,
+// quotaCards, quotaCardsRefresh and concurrency.
 func (s *Server) quotas(w http.ResponseWriter, r *http.Request) {
 	if !local(r) && !sharedWith(r) {
 		writeError(w, provider.Chat, http.StatusForbidden, "magpie's quotas are told to another machine only when magpie is shared on the local network (Settings → Share on local network) and the request carries its API key (Authorization: Bearer <key> or x-api-key: <key>)")
+		return
+	}
+	if refuseHeld(w, r, heldRefused) {
 		return
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), 12*time.Second)
@@ -629,6 +637,9 @@ func (s *Server) quotasHistory(w http.ResponseWriter, r *http.Request) {
 		writeError(w, provider.Chat, http.StatusForbidden, "magpie's quotas are told to another machine only when magpie is shared on the local network (Settings → Share on local network) and the request carries its API key (Authorization: Bearer <key> or x-api-key: <key>)")
 		return
 	}
+	if refuseHeld(w, r, heldRefused) {
+		return
+	}
 	q := r.URL.Query()
 	writeJSON(w, 200, map[string]any{"object": "list", "data": provider.QuotaHistories(provider.QuotaHistorySince(q.Get("days"), time.Now()), q.Get("provider"), q.Get("user"))})
 }
@@ -639,6 +650,9 @@ func (s *Server) quotasHistory(w http.ResponseWriter, r *http.Request) {
 func (s *Server) quotaCards(w http.ResponseWriter, r *http.Request) {
 	if !local(r) && !sharedWith(r) {
 		writeError(w, provider.Chat, http.StatusForbidden, "magpie's quotas are told to another machine only when magpie is shared on the local network (Settings → Share on local network) and the request carries its API key (Authorization: Bearer <key> or x-api-key: <key>)")
+		return
+	}
+	if refuseHeld(w, r, heldRefused) {
 		return
 	}
 	writeJSON(w, 200, map[string]any{"object": "list", "data": provider.CachedCards(time.Now())})
@@ -661,6 +675,9 @@ const remoteRefreshGap = 30 * time.Second
 func (s *Server) quotaCardsRefresh(w http.ResponseWriter, r *http.Request) {
 	if !local(r) && !sharedWith(r) {
 		writeError(w, provider.Chat, http.StatusForbidden, "magpie's quotas are told to another machine only when magpie is shared on the local network (Settings → Share on local network) and the request carries its API key (Authorization: Bearer <key> or x-api-key: <key>)")
+		return
+	}
+	if refuseHeld(w, r, heldRefused) {
 		return
 	}
 	id, user := r.URL.Query().Get("provider"), r.URL.Query().Get("user")
@@ -869,8 +886,25 @@ func (s *Server) models(w http.ResponseWriter, r *http.Request) {
 		// shows its Fast switch on a model whose tiers hold priority
 		// (#1914). A model with none says nothing
 		tiers := codexTiers(shown)
-		for i, e := range shown {
+		// each model by its bare id as well, after the provider/model ids,
+		// when the user asked for it (settings.BareModelIDs): a client
+		// moved from another proxy asks for gpt-5.6-sol (love1sbug on X).
+		// Never for another magpie, whose provider would list each twice.
+		// Each row is the entry the bare id reaches, its label that one's.
+		rows, ids := slices.Clip(shown), map[int]string{}
+		if !magpie && provider.BareModelIDs() {
+			labels = slices.Clip(labels)
+			for _, b := range provider.BareEntries(shown) {
+				ids[len(rows)] = b.ID
+				rows = append(rows, shown[b.Of])
+				labels = append(labels, labels[b.Of])
+			}
+		}
+		for i, e := range rows {
 			m := modelObject(e)
+			if id, ok := ids[i]; ok {
+				m["id"] = id
+			}
 			if magpie {
 				if how := webSearchOf(e, searches); how != "" {
 					m["web_search"] = how
@@ -936,8 +970,16 @@ func (s *Server) models(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) model(w http.ResponseWriter, r *http.Request) {
 	id := unprefixed(r.PathValue("id"))
-	for _, e := range keyAllowed(r, provider.Catalog()) {
+	shown := keyAllowed(r, provider.Catalog())
+	for _, e := range shown {
 		if e.ID == id {
+			writeJSON(w, 200, modelObject(e))
+			return
+		}
+	}
+	// by its bare id, as the list gives it with that setting on
+	if provider.BareModelIDs() {
+		if e, ok := provider.BareEntry(shown, id); ok {
 			writeJSON(w, 200, modelObject(e))
 			return
 		}
@@ -1187,6 +1229,10 @@ func (s *Server) handle(from provider.Protocol) http.HandlerFunc {
 			}
 			if to := codexDescriptionsTo(r.Header, body, true); to != "" {
 				s.codexDescription(w, r, body, to)
+				return
+			}
+			if to := codexPredictionsTo(r.Header, body, true); to != "" {
+				s.codexPrediction(w, r, body, to)
 				return
 			}
 			// Codex compacts remotely, a compaction_trigger here, on a
@@ -1808,16 +1854,11 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 		}
 		cands, pl, leadAccount = leadFirst(leadScope, parent, cands, pl)
 	}
-	if hit != nil && hit.Use != "" && !(hit.Held && aff.Kept) {
+	if hit != nil && hit.Use != "" {
 		// the rule's member first, over whoever answered last, as a turn
-		// begins; within it, whoever answered last stays — the rule's
-		// member, or who took over when it failed
-		was := cands[0]
-		var ok bool
-		cands, pl, ok = applyRule(hit, ms, cands, pl)
-		if ok && aff.Kept && cands[0].rest != was.rest {
-			aff.Kept, aff.Why = false, "rule"
-		}
+		// begins; within it, whoever answered last stays while it is of
+		// the rule's member, the member's others behind it (#1946)
+		cands, pl = ruleOver(hit, ms, cands, pl, aff)
 	}
 	// the rules of the groups in the group, down the one that goes first
 	var nested []NestedRule
@@ -1911,7 +1952,7 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 		capture.tools = tools
 	}
 	tierAsked := bodyTier(from, body) // the service tier the client asked for (#1784)
-	tr := s.trace.begin(Route{turn: turn, dirOf: dirOf(from, plain), tools: tools, imageTurn: drawingTurnID(metadata.Turn), imageCaller: codexTurnKey(r, call.Agent), TitleLink: link, Pinned: pin, Time: start, Agent: call.Agent, Session: sessionOf(r.Header), Conv: convOf(r.Header, body), ParentSession: titleParentSession(r.Header, metadata, call.Kind), Kind: call.Kind, For: call.For, Model: call.Model, Effort: requestEffort(from, body), Tier: tierAsked, Provider: p.ID, Group: group, Rule: hit, Nested: nested, SealedTask: sealedTask, LeadAccount: leadAccount, Subagent: subagent, Affinity: shown, Order: pl.order, Left: pl.left})
+	tr := s.trace.beginFor(r, Route{turn: turn, dirOf: dirOf(from, plain), tools: tools, imageTurn: drawingTurnID(metadata.Turn), imageCaller: codexTurnKey(r, call.Agent), TitleLink: link, Pinned: pin, Time: start, Agent: call.Agent, Session: sessionOf(r.Header), Conv: convOf(r.Header, body), ParentSession: titleParentSession(r.Header, metadata, call.Kind), Kind: call.Kind, For: call.For, Model: call.Model, Effort: requestEffort(from, body), Tier: tierAsked, Provider: p.ID, Group: group, Rule: hit, Nested: nested, SealedTask: sealedTask, LeadAccount: leadAccount, Subagent: subagent, Affinity: shown, Order: pl.order, Left: pl.left})
 	if telemetry != nil {
 		telemetry.routeID = tr.ID
 	}
@@ -1960,6 +2001,11 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 	rounds := 0            // the rounds they were asked again in
 	var waitFrom time.Time // when every member had first failed so
 	refusals := 0          // the tries the safety filter refused so
+	// ended is when the last try's reply ended: the request's ms end there,
+	// not after what magpie writes down of it once it has (#1939: sticks
+	// and the provider's last answer, saved to disk, took seconds on a busy
+	// disk, and the reply's speed counted them as its own)
+	var ended time.Time
 	for i := 0; i < len(cands); i++ {
 		c := cands[i]
 		if j := s.laneMate(cands, i, isGroup, gaveWay); j > i {
@@ -2014,6 +2060,7 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 		}
 		providerAccount = accountOf(c.p)
 		began := time.Now()
+		ended = time.Time{}
 		if firstBegan.IsZero() {
 			firstBegan = began
 		}
@@ -2321,7 +2368,8 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 			wentAt = at.effort
 		}
 		wentTier = at.tier
-		try := Try{ID: c.rest, Model: c.model, Effort: wentAt, Picked: picked, Fixed: fixed, Fast: fast, Start: began, Done: true, Status: call.Status, Millis: time.Since(began).Milliseconds(), Error: call.Error, Queued: queued,
+		ended = time.Now()
+		try := Try{ID: c.rest, Model: c.model, Effort: wentAt, Picked: picked, Fixed: fixed, Fast: fast, Start: began, Done: true, Status: call.Status, Millis: ended.Sub(began).Milliseconds(), Error: call.Error, Queued: queued,
 			Served: call.Usage.Served, Upstream: call.Usage.Upstream, Tier: wentTier, TierServed: call.Usage.Tier, Auto: autoPicked()}
 		if resetFirst != nil {
 			// the reset spent for it before it was asked
@@ -2459,7 +2507,7 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 					ProviderKeyID: providerKeyID, ProviderKeyName: providerKeyName, ProviderAccount: providerAccount,
 					Requested: call.Model, Served: call.Usage.Served, Upstream: call.Usage.Upstream,
 					Input: call.Usage.billed().Input, Output: call.Usage.billed().Output, CacheRead: call.Usage.billed().CacheRead,
-					CacheWrite: call.Usage.billed().CacheWrite, CacheWrite1h: call.Usage.billed().CacheWrite1h, Reasoning: call.Usage.billed().Reasoning, Effort: wentAt, Millis: time.Since(began).Milliseconds(), Status: call.Status,
+					CacheWrite: call.Usage.billed().CacheWrite, CacheWrite1h: call.Usage.billed().CacheWrite1h, Reasoning: call.Usage.billed().Reasoning, Effort: wentAt, Millis: try.Millis, Status: call.Status,
 					TierAsked: tierAsked, TierSent: wentTier, TierServed: call.Usage.Tier,
 					TTFT: try.TTFT, FirstText: try.FirstText, FirstReasoning: try.FirstReasoning, ReasoningHidden: try.ReasoningHidden, Flow: try.Flow, Session: sessionOf(r.Header), NativeSession: nativeSessionOf(r.Header), Kind: call.Kind,
 					RequestID: call.Usage.RequestID, Endpoint: endpointOf(r, from, call.To, c.p, c.model), Archive: call.archiveName(), HandedOn: true}
@@ -2503,7 +2551,7 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 					ProviderKeyID: providerKeyID, ProviderKeyName: providerKeyName, ProviderAccount: providerAccount,
 					Requested: call.Model, Served: call.Usage.Served,
 					Input: call.Usage.billed().Input, Output: call.Usage.billed().Output, CacheRead: call.Usage.billed().CacheRead,
-					CacheWrite: call.Usage.billed().CacheWrite, CacheWrite1h: call.Usage.billed().CacheWrite1h, Reasoning: call.Usage.billed().Reasoning, Effort: wentAt, Millis: time.Since(began).Milliseconds(), Status: call.Status,
+					CacheWrite: call.Usage.billed().CacheWrite, CacheWrite1h: call.Usage.billed().CacheWrite1h, Reasoning: call.Usage.billed().Reasoning, Effort: wentAt, Millis: try.Millis, Status: call.Status,
 					TierAsked: tierAsked, TierSent: wentTier, TierServed: call.Usage.Tier,
 					TTFT: try.TTFT, FirstText: try.FirstText, FirstReasoning: try.FirstReasoning, ReasoningHidden: try.ReasoningHidden, Flow: try.Flow, Session: sessionOf(r.Header), NativeSession: nativeSessionOf(r.Header), Kind: call.Kind,
 					RequestID: call.Usage.RequestID, Endpoint: endpointOf(r, from, call.To, c.p, c.model), Archive: call.archiveName(), HandedOn: true}
@@ -2901,6 +2949,9 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 		call.Fallback = strings.Join(skipped, "; ")
 	}
 	call.Millis = time.Since(start).Milliseconds()
+	if !ended.IsZero() {
+		call.Millis = ended.Sub(start).Milliseconds()
+	}
 	call.Usage.ResponseID = clientResponseID
 	finishCapture()
 	// a reply the vendor gave that is no use to its caller all the same —
@@ -3654,6 +3705,11 @@ func (s *Server) passthrough(w http.ResponseWriter, r *http.Request, p provider.
 	if s.foldsRoots(p, model, proto) {
 		body, _ = objectRootsBody(proto, body)
 	}
+	// a tool's strict, to an upstream that turned it away before
+	// (strict_refused.go, #1980)
+	if !s.fits(p.ID, toolStrictRefused, proto) {
+		body, _ = withoutToolStrict(proto, body)
+	}
 	// a Grok subscription is given Codex's namespaced functions flat
 	// (grokBody), and Zed's plugin likewise (ZedBody); a call to one goes
 	// back under its namespace (#404)
@@ -3700,6 +3756,18 @@ func (s *Server) passthrough(w http.ResponseWriter, r *http.Request, p provider.
 			// (#1271): asked once more with them folded to an object
 			if nb, changed := objectRootsBody(proto, body); changed {
 				refused = append(refused, rootUnionRefused(model))
+				body = nb
+				if res, err = s.forward(r.Context(), p, proto, path, p.Prepare(body), r.Header); err != nil {
+					return writeError(w, proto, 502, p.Name+": "+err.Error()), err.Error(), true
+				}
+				continue
+			}
+		}
+		if len(fs) == 0 && len(ms) == 0 && toolStrictRefusal.Match(b) {
+			// a tool's strict refused, OpenCode's "strict": false (#1980):
+			// asked once more without it, and not sent it again
+			if nb, changed := withoutToolStrict(proto, body); changed {
+				refused = append(refused, toolStrictRefused)
 				body = nb
 				if res, err = s.forward(r.Context(), p, proto, path, p.Prepare(body), r.Header); err != nil {
 					return writeError(w, proto, 502, p.Name+": "+err.Error()), err.Error(), true
