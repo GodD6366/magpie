@@ -79,6 +79,10 @@ something else shows up as drift.
 
 ### OpenClaw
 
+The OpenClaw model-chain editor uses the shared model picker for both the primary
+model and each ordered fallback, including catalog groups and custom model IDs.
+Selections remain a draft until Save writes the whole sequence.
+
 OpenClaw's adapter ([`openclaw.go`](../../internal/agent/openclaw.go)) writes
 `models.providers.magpie` and the default primary model in
 `agents.defaults.model`. Its model catalog includes context/output limits,

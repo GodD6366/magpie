@@ -4446,6 +4446,8 @@ function openPicker(agent, field, anchor, ev, only) {
   pop.classList.toggle("effort-picker", effortPicker);
   // a choice explained in a sentence (Codex's sign-in) shows all of it
   pop.classList.toggle("explained", field.label === "sign-in");
+  // Keep a dialog's picker inside its active surface; background siblings are inert.
+  if ($("#modal").contains(anchor)) { $("#modal").append(pop); pop.inert = false; }
   pop.hidden = false;
   $("#effortControl").hidden = !effortPicker;
   pop.querySelector(".search").hidden = effortPicker;
@@ -5235,6 +5237,11 @@ function popGhost(pop) {
 }
 
 function closePicker() {
+  const pop = $("#pop");
+  if (pop.parentElement === $("#modal")) {
+    document.body.append(pop);
+    pop.inert = modalBackgroundElements.includes(pop);
+  }
   if (!pick) return;
   hideRailTip();
   pick.groupAnimation?.cancel();
@@ -16888,6 +16895,7 @@ function closeConfirmAsk() {
   // still holds an older full arrangement. Done is disabled for the same reason.
   if (agentsVisibilitySaving && confirmAsk.classList.contains("ag-manager")) return;
   // one asked from an editor goes back to it rather than close it too
+  if (pick && confirmAsk.contains(pick.anchor)) closePicker();
   const back = confirmAsk.back;
   confirmAsk = null;
   if (back) { $("#modal").classList.remove("lib"); back(); return; }
@@ -16899,7 +16907,11 @@ $("#modal").addEventListener("click", (e) => {
   if (confirmAsk && modalBackdrop(e)) { e.stopImmediatePropagation(); closeConfirmAsk(); }
 }, true);
 document.addEventListener("keydown", (e) => {
-  if (!confirmationPending && confirmAsk && e.key === "Escape") { e.preventDefault(); e.stopImmediatePropagation(); closeConfirmAsk(); }
+  if (!confirmationPending && confirmAsk && e.key === "Escape") {
+    e.preventDefault(); e.stopImmediatePropagation();
+    if (pick && confirmAsk.contains(pick.anchor)) { const anchor = pick.anchor; closePicker(); anchor.focus(); }
+    else closeConfirmAsk();
+  }
 }, true);
 function resetOutcome(out) {
   switch (out.code) {
@@ -24923,39 +24935,35 @@ function editModelChain(a) {
   const head = el("div", "ehead");
   head.append(icon(a.icon), el("b", "", t("Configure models") + " · " + a.name));
   ed.append(head, el("p", "lib-confirm", t("Try the primary model first, then fallback models in order. You can also enter provider/model.")));
-  const primary = input(a.modelChain.primary, "provider/model");
-  primary.setAttribute("aria-label", t("Primary model"));
-  ed.append(el("label", "", t("Primary model")), primary);
+  let primary = a.modelChain.primary;
   const rows = el("div", "model-chain-rows");
   const fallbacks = [...a.modelChain.fallbacks];
-  const options = a.fields.find((f) => f.key === "model")?.options || [];
-  const suggest = (q, after, selected) => {
-    const choices = el("div", "mchips model-chain-suggestions");
-    after.after(choices);
-    const draw = () => {
-      choices.replaceChildren();
-      if (document.activeElement !== q) return;
-      const term = q.value.trim().toLowerCase();
-      for (const o of options.filter((o) => o.value && (o.value + " " + (o.label || "")).toLowerCase().includes(term)).slice(0, 8)) {
-        const b = el("button", "mchip", o.value);
-        b.type = "button";
-        b.onmousedown = (e) => e.preventDefault();
-        b.onclick = () => { q.value = o.value; selected(o.value); choices.replaceChildren(); };
-        choices.append(b);
-      }
+  const options = (a.fields.find((f) => f.key === "model")?.options || []).filter((o) => o.value);
+  const modelButton = (value, label, selected) => {
+    const b = el("button", "field model-chain-pick");
+    b.type = "button";
+    b.setAttribute("aria-label", label);
+    const paint = () => {
+      b.replaceChildren();
+      const opt = options.find((o) => o.value === value);
+      if (opt?.icon || opt?.icons?.length) b.append(optionIcon(opt));
+      b.append(el("span", "v", opt?.label || value || "provider/model"));
+      const arrow = el("span", "chev"); arrow.append(svg(CHEV, 11, 1.7)); b.append(arrow);
+      b.title = value; b.dataset.value = value;
     };
-    q.addEventListener("input", () => { selected(q.value); draw(); });
-    q.addEventListener("focus", draw);
-    q.addEventListener("blur", () => choices.replaceChildren());
+    b.onclick = (ev) => openPicker(a, { key: "model", label: "model", value, options,
+      onPick: (v) => { value = v; selected(v); paint(); b.focus({ preventScroll: true }); }
+    }, b, ev);
+    paint();
+    return b;
   };
-  suggest(primary, primary, () => {});
+  ed.append(el("label", "", t("Primary model")), modelButton(primary, t("Primary model"), (v) => { primary = v; }));
   const draw = () => {
     rows.replaceChildren();
     fallbacks.forEach((value, i) => {
       const wrap = el("div");
       const row = el("div", "fbrow");
-      const q = input(value, "provider/model");
-      q.setAttribute("aria-label", t("Fallback model {n}", { n: i + 1 }));
+      const q = modelButton(value, t("Fallback model {n}", { n: i + 1 }), (v) => { fallbacks[i] = v; });
       row.append(el("span", "i", String(i + 1)), q);
       const up = el("button", "text", t("Up"));
       up.type = "button"; up.disabled = i === 0;
@@ -24964,12 +24972,11 @@ function editModelChain(a) {
       remove.type = "button";
       remove.onclick = () => { fallbacks.splice(i, 1); draw(); };
       row.append(up, remove); wrap.append(row); rows.append(wrap);
-      suggest(q, row, (v) => { fallbacks[i] = v; });
     });
   };
   const add = el("button", "text model-chain-add", t("Add fallback model"));
   add.type = "button";
-  add.onclick = () => { fallbacks.push(""); draw(); rows.lastElementChild.querySelector("input").focus({ preventScroll: true }); };
+  add.onclick = () => { fallbacks.push(""); draw(); rows.lastElementChild.querySelector(".model-chain-pick").focus({ preventScroll: true }); };
   ed.append(el("label", "", t("Fallback models")), rows, add);
   draw();
   const error = el("p", "lib-confirm model-chain-error");
@@ -24978,7 +24985,7 @@ function editModelChain(a) {
   cancel.onclick = () => closeConfirmAsk();
   const save = el("button", "text primary", t("Save"));
   save.onclick = async () => {
-    const sequence = { primary: primary.value.trim(), fallbacks: fallbacks.map((v) => v.trim()) };
+    const sequence = { primary: primary.trim(), fallbacks: fallbacks.map((v) => v.trim()) };
     const all = [sequence.primary, ...sequence.fallbacks];
     if (all.some((v) => !/^[^\s/]+\/\S+$/.test(v)) || new Set(all).size !== all.length) {
       error.textContent = t("Enter a different provider/model for each model."); return;

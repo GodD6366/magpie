@@ -6,7 +6,7 @@ const { test } = require("node:test");
 const { chromium, webkit } = require("playwright");
 
 const assets = process.env.MAGPIE_MODEL_ASSETS || path.resolve(__dirname, "../assets");
-const options = [{ value: "magpie/group/auto-k3-256k", label: "Auto K3" }, { value: "gpt-5.4", label: "GPT-5.4" }, { value: "relay/m1", label: "m1", ref: "relay/m1", note: "Relay · via magpie" }];
+const options = [{ value: "magpie/group/auto-k3-256k", label: "Auto K3", group: "Routing groups", icon: "openclaw-color" }, { value: "gpt-5.4", label: "GPT-5.4" }, { value: "relay/m1", label: "m1", ref: "relay/m1", note: "Relay · via magpie" }];
 const fresh = () => ({
   agents: [
     { id: "codex", name: "Codex", icon: "generic", path: "/fixture/codex", fields: [{ key: "model", label: "model", value: "gpt-5.4", options }] },
@@ -66,22 +66,35 @@ for (const engine of ["chromium", "webkit"]) for (const lang of ["en","zh","zh-T
   await page.locator('.model-chain-edit').click();
   assert.deepEqual(errors,[]);
   const ed=page.locator('.model-chain-editor');
-  await ed.locator('.ebody > input').fill('magpie/group/auto');
-  const suggestion = ed.locator('.model-chain-suggestions .mchip').first();
-  assert.ok(await suggestion.evaluate(e=>e.getBoundingClientRect().width > 170 && e.scrollWidth <= e.clientWidth), 'primary suggestion is not clipped');
-  await suggestion.click();
-  assert.equal(await ed.locator('.ebody > input').inputValue(), 'magpie/group/auto-k3-256k');
-  await ed.locator('.ebody > input').fill('magpie/group/auto');
-  await ed.locator('.ebody > input').press('Tab');
+  const choose = async (button, value) => {
+    await button.click();
+    assert.ok(await page.locator('#pop').evaluate(e=>e.classList.contains('model-picker')));
+    await page.locator('#q').fill(value);
+    if (await page.locator('#list li.custom').count()) await page.locator('#list li.custom').click();
+    else await page.locator('#q').press('Enter');
+    assert.equal(await button.getAttribute('data-value'), value);
+  };
+  const primary = ed.locator('.ebody > .model-chain-pick');
+  await primary.click();
+  assert.equal(await page.locator('#pop').evaluate(e=>e.inert), false);
+  await page.locator('#q').fill('Auto K3');
+  await page.locator('#q').press('Enter');
+  assert.equal(await primary.getAttribute('data-value'), 'magpie/group/auto-k3-256k');
+  await primary.click();
+  if (process.env.ARTIFACT_DIR) { await fs.mkdir(process.env.ARTIFACT_DIR,{recursive:true}); await page.screenshot({path:path.join(process.env.ARTIFACT_DIR,`picker-${engine}-${lang}-${web ? "web" : "desktop"}.png`)}); }
+  await page.locator('#q').press('Escape');
+  assert.ok(await ed.isVisible(), 'Escape closes the picker before the editor');
+  assert.ok(await page.locator('#pop').isHidden());
+  await choose(primary, 'magpie/group/auto');
   const add=ed.locator('.model-chain-add');
   await add.click();
-  assert.ok(await ed.locator('.fbrow input').first().evaluate(e=>e.getBoundingClientRect().width > 150), 'fallback input has usable width');
+  assert.ok(await ed.locator('.fbrow .model-chain-pick').first().evaluate(e=>e.getBoundingClientRect().width > 150), 'fallback input has usable width');
   assert.ok(await ed.locator('.model-chain-rows').evaluate(e=>e.getBoundingClientRect().width > 300), 'fallback rows span the editor');
-  await ed.locator('.fbrow input').nth(0).fill('magpie/group/fast');
-  await add.click(); await ed.locator('.fbrow input').nth(1).fill('anthropic/claude-opus-5');
-  await ed.locator('.fbrow').nth(1).locator('button').first().click();
-  assert.deepEqual(await ed.locator('.fbrow input').evaluateAll(es=>es.map(e=>e.value)),['anthropic/claude-opus-5','magpie/group/fast']);
-  await ed.locator('.fbrow').nth(1).locator('button').first().click();
+  await choose(ed.locator('.fbrow .model-chain-pick').nth(0), 'magpie/group/fast');
+  await add.click(); await choose(ed.locator('.fbrow .model-chain-pick').nth(1), 'anthropic/claude-opus-5');
+  await ed.locator('.fbrow').nth(1).locator('button.text').first().click();
+  assert.deepEqual(await ed.locator('.fbrow .model-chain-pick').evaluateAll(es=>es.map(e=>e.dataset.value)),['anthropic/claude-opus-5','magpie/group/fast']);
+  await ed.locator('.fbrow').nth(1).locator('button.text').first().click();
   assert.equal(posts.length,0,'draft is not live');
   if (process.env.ARTIFACT_DIR) { await fs.mkdir(process.env.ARTIFACT_DIR,{recursive:true}); await page.screenshot({path:path.join(process.env.ARTIFACT_DIR,`openclaw-${engine}-${lang}-${web ? "web" : "desktop"}.png`)}); }
   assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth>innerWidth),false);
@@ -89,8 +102,8 @@ for (const engine of ["chromium", "webkit"]) for (const lang of ["en","zh","zh-T
   await ed.waitFor({state:'detached'});
   assert.deepEqual(posts,[{primary:'magpie/group/auto',fallbacks:['magpie/group/fast','anthropic/claude-opus-5']}]);
   await page.locator('.model-chain-edit').click();
-  assert.equal(await ed.locator('.fbrow input').nth(1).inputValue(),'anthropic/claude-opus-5');
-  await ed.locator('.ebody > input').fill('bad'); await ed.locator('.bar .primary').click();
+  assert.equal(await ed.locator('.fbrow .model-chain-pick').nth(1).getAttribute('data-value'),'anthropic/claude-opus-5');
+  await choose(ed.locator('.ebody > .model-chain-pick'), 'bad'); await ed.locator('.bar .primary').click();
   assert.ok(await ed.locator('[role=alert]').textContent()); assert.equal(posts.length,1);
   await ed.locator('.bar button').first().click();
   await page.locator('.model-chain-edit').click();
