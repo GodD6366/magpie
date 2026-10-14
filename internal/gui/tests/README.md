@@ -280,6 +280,13 @@ method's questions (a pick, then a text the plugin checks), then takes the
 code the browser page shows; an API-key way opens the account. English and
 Chinese, Chromium and WebKit, with the API faked.
 
+`plugin-options.test.cjs` checks the switches a plugin declares for its
+provider (#2038), in its editor: the plugin's words shown as text, wrapped
+inside the editor; a confirm asked before one is turned on, and Cancel
+leaving it off; Save posting each changed one by the plugin's provider id
+before the provider, and none switched back. Chromium and WebKit, 1100 and
+420 wide, every language.
+
 `plugin-move-overflow.test.cjs` checks a Plugins card that offers a
 built-in's accounts: the button is one word beside the name, as Install is
 ("Move", its title saying whose accounts and how many), on one line, and it
@@ -2326,6 +2333,15 @@ collisions, changed configuration fingerprints, excluding unticked collision and
 disabled Alma entries while preserving the add-key case, and keeping credentials
 server-side.
 
+## OpenClaw model sequence
+
+`openclaw-models.test.cjs` covers editing the primary model and ordered fallback
+models, reordering and clearing, readback after saving, cancel and invalid input.
+It runs the real UI against isolated API fixtures in both Chromium and WebKit,
+in English, Simplified and Traditional Chinese, Japanese and German at 440px.
+`ARTIFACT_DIR` optionally saves screenshots. Run with
+`node --test internal/gui/tests/openclaw-models.test.cjs`.
+
 ## Filters typed through an IME
 
 `filter-ime.test.cjs` covers #1055: a digit typed into the Routing page's
@@ -2392,11 +2408,17 @@ and 50 once Plugins › Built-in sets it. Chromium and WebKit, every language,
 node --test internal/gui/tests/plugin-kernel.test.cjs internal/gui/tests/builtins.test.cjs
 ```
 
-## OpenClaw model sequence
+`quota-curve.test.cjs` also checks per-account historical cycle selection in
+all five languages and both engines at 440px: natural expiry, an early
+manual reset and an unscheduled refill with an unchanged deadline. The
+historical legend and pace use the selected readings; other accounts stay
+on their own cycle, missing short-window history is not invented, and
+selecting a cycle does not scroll. `MAGPIE_QUOTA_ASSETS` selects an older
+assets directory to verify the regression fails before the picker existed.
 
-`openclaw-models.test.cjs` covers editing the primary model and ordered fallback
-models, reordering and clearing, readback after saving, cancel and invalid input.
-It runs the real UI against isolated API fixtures in both Chromium and WebKit,
-in English, Simplified and Traditional Chinese, Japanese and German at 440px.
-`ARTIFACT_DIR` optionally saves screenshots. Run with
-`node --test internal/gui/tests/openclaw-models.test.cjs`.
+Historical quota selections also update the 5-hour and weekly meters from
+the last readings inside the selected interval. The cycle menu describes
+observed duration rather than the nominal window name. Regression checks
+cover missing windows, historical end and sampling dates, Used/Left,
+restoring live values on 2 days/current cycle, and hiding live account
+controls while inspecting history.

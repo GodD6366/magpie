@@ -846,6 +846,8 @@ body.window .field.solo { grid-column: auto; }
 .quota-curve { margin-top: 10px; }
 .quota-curve .qc-head { display: flex; justify-content: space-between; align-items: baseline; gap: 6px; font-size: 10.5px; color: var(--muted); }
 .quota-curve .qc-range { font-size: 10px; color: var(--faint); }
+.quota-curve button.qc-range { display: inline-flex; align-items: center; gap: 3px; flex-shrink: 0; padding: 0; }
+.quota-curve button.qc-range:disabled { opacity: 1; cursor: default; }
 .quota-curve .qc-plot { display: block; width: 100%; height: 52px; margin-top: 5px; overflow: hidden; }
 /* a click makes a curve larger, another back (TJHHHH on Discord) */
 .quota-curve .qc-plot { cursor: zoom-in; transition: height .15s ease; }
@@ -2666,6 +2668,11 @@ body.window .ag-sk-icon { width: 22px; height: 22px; border-radius: 6px; }
    over the same row as the provider's, in a quiet card, no stripes */
 .editor .acct-proxies { display: grid; gap: 8px; margin-top: 4px; padding: 8px 10px; border: 1px solid var(--line); border-radius: 10px; background: var(--card); }
 .editor .acct-proxy { display: grid; gap: 4px; min-width: 0; }
+/* a plugin's own switches (#2038): its words, then Off/On */
+.editor .plugin-options { gap: 10px; }
+.editor .plugin-option { display: flex; align-items: flex-start; gap: 12px; min-width: 0; }
+.editor .plugin-option-text { flex: 1 1 auto; min-width: 0; overflow-wrap: anywhere; }
+.editor .plugin-option .segs { flex: none; }
 .editor .acct-proxy .who { font-size: 12px; font-weight: 500; color: var(--fg-2); min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .editor .acct-proxies > .hint { margin-top: 0; }
 /* what a balance token's URL wants instead, and a balance checked in the form */
@@ -3038,6 +3045,8 @@ input.words.compact-num { flex: none; width: 76px; font-variant-numeric: tabular
 .row.pref.rule-row { flex-wrap: wrap; row-gap: 8px; }
 .row.pref.rule-row .who { flex: 1 1 100%; }
 .row.pref.rule-row .sub { white-space: normal; }
+/* the address a refused allow list would shut out, added in one click */
+.row.pref.rule-row .who .allow-fix { display: block; max-width: 100%; margin: 4px 0 0 -7px; overflow: hidden; text-overflow: ellipsis; color: var(--accent); }
 .row.pref.cors-origin .name { white-space: normal; overflow-wrap: anywhere; }
 /* a kind of personal data, under Mask personal data */
 .row.pref.redact-kind .who { padding-left: 14px; min-width: 0; }
@@ -3054,6 +3063,16 @@ input.words.search-key, input.words.search-url { flex: 1 1 120px; width: auto; m
 /* a search API's key, shown: selectable, and broken anywhere rather than widening the row */
 .search-api .sub.revealed { font-family: var(--code-font, var(--code)); overflow-wrap: anywhere; user-select: text; -webkit-user-select: text; }
 :where(html[data-fonts]) .search-api .sub.revealed { font-style: var(--code-style, inherit); font-weight: var(--code-weight, inherit); font-stretch: var(--code-stretch, 100%); }
+/* a search API's keys and what each has used of its limit */
+/* how its searches pick a key, and Check again: wrapped, right-aligned, on a
+   narrow window in a long language rather than past its edge */
+.row.pref.search-keys .val { flex-wrap: wrap; justify-content: flex-end; gap: 4px; }
+.search-quota { display: flex; flex-direction: column; gap: 3px; margin-top: 6px; font-size: 12px; min-width: 0; }
+.search-quota .quota-key { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 10px; min-width: 0; }
+.search-quota code { font-family: var(--code-font, var(--code)); color: var(--muted); }
+.search-quota .faint { color: var(--muted); overflow-wrap: anywhere; }
+.search-quota .err { color: var(--red); overflow-wrap: anywhere; }
+.search-quota .warn { color: var(--amber); }
 .prefs .val.rule-add .segs { margin-left: 0; }
 /* a rule open to edit (nf1qaz2w on Discord): laid out as the add row; a
    narrow window puts the match, Save and Cancel on a line of their own under

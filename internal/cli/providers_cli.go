@@ -62,9 +62,15 @@ const providerUsage = `usage:
                                           past either a request is turned away with a 429 (0: no bound)
   magpie provider rpm <id> [n|off]        how many requests each account or key sends the vendor in any minute;
                                           one more waits for room, up to 2 minutes, then is turned away with a 429
-  magpie provider quota-rest <id> [30m|6h|7d|default]
+  magpie provider quota-rest <id> [30m|6h|7d|until 08:00|until 00:00+08:00|default]
                                           how long a key sits out once the vendor says it is out of its allowance
-                                          without saying when it is back (default: 15 minutes; at most 8 days)
+                                          without saying when it is back (default: 15 minutes; at most 8 days),
+                                          or until the time of day a daily allowance comes back, on this
+                                          computer's clock or at the vendor's offset from UTC
+  magpie provider rest-cap <id> [30m|6h|1d|default]
+                                          the most a key or account sits out while it keeps failing or being
+                                          rate limited, its rest doubling each time from a minute (default:
+                                          10 minutes for a failure, 30 for a rate limit; at most 8 days)
   magpie provider listed <id> yes|no      no: its models serve only through routing groups, not in the list
   magpie provider off|on <id>             switch it off (kept, but no agent or request uses it), or on again
   magpie provider test <id> [--as codex|claude-code] [model…]
@@ -105,7 +111,10 @@ const providerUsage = `usage:
                                    (a new-api relay's whole account: its access token and user id, from its personal settings)
                                    (balance.path: where the amount is in the reply, or a sum of those with + - * / and
                                     brackets; $ or ¥ in front adds the sign, % after it shows a percent of 1;
-                                    several go apart by ; each with a label: '5h: a.used / a.cap %; $credits.left')
+                                    several go apart by ; each with a label: '5h: a.used / a.cap %; $credits.left';
+                                    a list's items are a.*.used, or a[status=active].used for those that match,
+                                    in sum() max() min() count(): 'sum(a.*.used) / sum(a.*.cap) %'; one the reply
+                                    hasn't shows — and the others still show)
        magpie provider set my-relay context=272k context.gpt-6=1m
                                    (context: how long a request agents are told the models take, over what the
                                     vendor or models.dev says; context.<model> for one of them; empty clears)
@@ -555,6 +564,8 @@ func providerCmd(args []string) error {
 		return rpmCmd(rest)
 	case "quota-rest":
 		return quotaRestCmd(rest)
+	case "rest-cap":
+		return restCapCmd(rest)
 	case "listed":
 		// no: the provider's models leave the list agents see and serve
 		// only through the routing groups they are in
@@ -1575,8 +1586,51 @@ func rpmCmd(rest []string) error {
 // vendor says one is out of its allowance without saying when it is back
 // (#1772: Ollama Cloud's weekly limit, asked again every 15 minutes).
 func quotaRestCmd(rest []string) error {
+	usage := fmt.Errorf("magpie provider quota-rest <id> [30m|6h|7d|until 08:00|until 00:00+08:00|default]")
+	if len(rest) == 3 && (rest[1] == "until" || rest[1] == "at") {
+		rest = []string{rest[0], rest[2]}
+	}
 	if len(rest) < 1 || len(rest) > 2 {
-		return fmt.Errorf("magpie provider quota-rest <id> [30m|6h|7d|default]")
+		return usage
+	}
+	p, err := provider.Find(rest[0])
+	if err != nil {
+		return err
+	}
+	if len(rest) > 1 {
+		// a time of day (#2008): until the daily allowance comes back
+		if strings.Contains(rest[1], ":") {
+			err = provider.SetQuotaResetAt(p.ID, rest[1])
+		} else {
+			var minutes int
+			if minutes, err = restMinutes(rest[1]); err == nil {
+				if err = provider.SetQuotaRest(p.ID, minutes); err == nil && minutes == 0 {
+					err = provider.SetQuotaResetAt(p.ID, "")
+				}
+			}
+		}
+		if err != nil {
+			return err
+		}
+		if p, err = provider.Find(p.ID); err != nil {
+			return err
+		}
+	}
+	if t, ok := provider.NextResetAt(p.QuotaResetAt, time.Now()); ok {
+		fmt.Printf("%s · a key out of its allowance, with no word of when it is back, sits out until %s (next %s)\n", p.Name, p.QuotaResetAt, t.Local().Format("Jan 2 15:04"))
+	} else if d := p.QuotaRestFor(); d > 0 {
+		fmt.Printf("%s · a key out of its allowance, with no word of when it is back, sits out %s\n", p.Name, restWords(d))
+	} else {
+		fmt.Printf("%s · a key out of its allowance, with no word of when it is back, sits out 15 minutes (magpie's own)\n", p.Name)
+	}
+	return nil
+}
+
+// restCapCmd sets or shows the most a provider's keys and accounts sit out
+// while they keep failing or being rate limited (#2008).
+func restCapCmd(rest []string) error {
+	if len(rest) < 1 || len(rest) > 2 {
+		return fmt.Errorf("magpie provider rest-cap <id> [30m|6h|1d|default]")
 	}
 	p, err := provider.Find(rest[0])
 	if err != nil {
@@ -1587,17 +1641,17 @@ func quotaRestCmd(rest []string) error {
 		if err != nil {
 			return err
 		}
-		if err := provider.SetQuotaRest(p.ID, minutes); err != nil {
+		if err := provider.SetRestCap(p.ID, minutes); err != nil {
 			return err
 		}
 		if p, err = provider.Find(p.ID); err != nil {
 			return err
 		}
 	}
-	if d := p.QuotaRestFor(); d > 0 {
-		fmt.Printf("%s · a key out of its allowance, with no word of when it is back, sits out %s\n", p.Name, restWords(d))
+	if p.RestCap > 0 {
+		fmt.Printf("%s · a key or account that keeps failing sits out at most %s\n", p.Name, restWords(time.Duration(p.RestCap)*time.Minute))
 	} else {
-		fmt.Printf("%s · a key out of its allowance, with no word of when it is back, sits out 15 minutes (magpie's own)\n", p.Name)
+		fmt.Printf("%s · a key or account that keeps failing sits out at most 10 minutes, 30 when rate limited (magpie's own)\n", p.Name)
 	}
 	return nil
 }

@@ -3,9 +3,13 @@
 // own folder and writes each agent's files from it; what the user has in
 // those files besides stays theirs, and every file is kept aside before
 // magpie writes it. Everything shown here comes from /api/library.
-(() => {
-  const page = $("#view-library");
-  if (!page) return;
+//
+// A page the Library plugin adds to the window (kernel.js): mount wires it
+// up, open and relang read the library again, redraw draws it again as it
+// is, and close, dirty and discard are what app.js asks of it before the
+// reader leaves it.
+magpie.plugin("library", (ctx) => {
+  let page = null;
 
   let lib = null;        // the page, as /api/library gives it
   let taken = 0;         // how many times lib was set, for a read to tell a newer answer came first
@@ -466,11 +470,6 @@
       status(e.message, "err");
     }
   }
-  window.loadLibrary = load;
-  // drawn again as it is: the agents hidden are known only from the state,
-  // which can come after the page was drawn (it counted them, and Turn all
-  // on gave them the servers)
-  window.redrawLibrary = () => { if (lib) render(); };
   // the library as the page shows it: what a change did is said once, not shown
   const seen = (v) => JSON.stringify({ ...v, result: undefined });
 
@@ -1732,6 +1731,18 @@
         line.append(button(ready?.saves?.() ? t("Save and sign in") : cur.dead ? t("Sign in again") : t("Sign in"), "action", start));
       }
       box.append(line);
+      // the browser didn't start (#2043): the page to open by hand, rather
+      // than waiting on one that never opened until the sign-in times out
+      if (sg?.state === "waiting" && sg.openError && sg.url) {
+        box.append(el("div", "lib-signin-err", t("magpie couldn't open your browser: {error}. Open the sign-in link below in a browser yourself.", { error: sg.openError })));
+        const link = el("div", "lib-signin-link");
+        const u = el("code", "", sg.url);
+        u.title = sg.url;
+        const cp = copyBtn(sg.url, t("Sign-in link"));
+        cp.title = t("Copy link");
+        link.append(u, cp);
+        box.append(link);
+      }
       if (sg?.state === "failed") box.append(el("div", "lib-signin-err", sg.error));
     };
     async function start() {
@@ -1914,7 +1925,9 @@
     i.spellcheck = false;
     i.autocomplete = "off";
     i.oninput = () => onInput(i.value);
-    i.onkeydown = (e) => { e.stopPropagation(); if (e.key === "Escape") closeLibModal(); else if (e.key === "Enter" && modal?.save) { e.preventDefault(); modal.save(); } };
+    // an Enter or Escape that ends an input method's composition (a
+    // Chinese description, #2011) is the IME's, not a save or a close
+    i.onkeydown = (e) => { e.stopPropagation(); if (e.isComposing || e.keyCode === 229) return; if (e.key === "Escape") closeLibModal(); else if (e.key === "Enter" && modal?.save) { e.preventDefault(); modal.save(); } };
     return i;
   }
 
@@ -2233,7 +2246,10 @@
   function hookRow(h, all) {
     const row = el("div", "row lib-row click lib-hook");
     const who = el("div", "who");
-    who.append(el("div", "name mono", h.name), el("div", "sub lib-hookev", hookLine(h)));
+    who.append(el("div", "name mono", h.name));
+    // what it is for, in the user's own words (#2011)
+    if (h.description) who.append(el("div", "lib-hookdesc", h.description));
+    who.append(el("div", "sub lib-hookev", hookLine(h)));
     const cmd = el("div", "sub mono lib-hookcmd", h.command);
     cmd.title = h.command;
     who.append(cmd);
@@ -2247,8 +2263,8 @@
 
   function editHook(h) {
     const all = hookAgents();
-    const d = h ? { name: h.name, event: h.event, matcher: h.matcher || "", command: h.command, timeout: h.timeout || 0, agents: [...(h.agents || [])] }
-      : { name: "", event: "turn-end", matcher: "", command: "", timeout: 0, agents: [] };
+    const d = h ? { name: h.name, description: h.description || "", event: h.event, matcher: h.matcher || "", command: h.command, timeout: h.timeout || 0, agents: [...(h.agents || [])] }
+      : { name: "", description: "", event: "turn-end", matcher: "", command: "", timeout: 0, agents: [] };
     if (!h) d.agents = all.filter((a) => !hookBlocked(d)(a)).map((a) => a.id);
     const ed = el("div", "editor lib-editor lib-hookedit");
     const head = el("div", "ehead");
@@ -2257,6 +2273,10 @@
     const err = el("div", "editor-error");
     const name = field2(d.name, t("e.g. notify"), (v) => { d.name = v.trim(); });
     ed.append(...field(t("Name"), name, t("Letters, digits, - and _")));
+    const desc = field2(d.description, t("e.g. Tell me when a turn ends"), (v) => { d.description = v; });
+    desc.maxLength = 200;
+    desc.classList.add("lib-hookdescin");
+    ed.append(...field(t("Description"), desc, t("Optional: what it's for, in any language. Only the library keeps it")));
 
     // the event and the tools it is narrowed to: menus, never a <select>
     const evBtn = el("button", "sess-pick lib-menu lib-hookevent");
@@ -2329,7 +2349,7 @@
     const save = async () => {
       err.textContent = "";
       try {
-        const hook = { name: d.name, event: d.event, matcher: d.matcher, command: d.command, timeout: d.timeout, agents: d.agents.filter((id) => !hookBlocked(d)(agentOf(id) || { id })) };
+        const hook = { name: d.name, description: d.description.trim(), event: d.event, matcher: d.matcher, command: d.command, timeout: d.timeout, agents: d.agents.filter((id) => !hookBlocked(d)(agentOf(id) || { id })) };
         take(await api("library/hooks/save", { old: h ? h.name : "", hook }));
         report(lib.result, h ? t("{name} saved", { name: d.name }) : "");
         closeLibModal(true);
@@ -3298,13 +3318,15 @@
   // and while the page scrolls, its lists say so (library.css, .scrolling)
   let still = 0;
   const settled = () => { still = 0; for (const w of lists) w.el.classList.remove("scrolling"); };
-  page.addEventListener("scroll", () => {
-    queueLists();
-    if (!still) for (const w of lists) w.el.classList.add("scrolling");
-    clearTimeout(still);
-    still = setTimeout(settled, 150);
-  }, { passive: true });
-  window.addEventListener("resize", queueLists);
+  function wireLists() {
+    page.addEventListener("scroll", () => {
+      queueLists();
+      if (!still) for (const w of lists) w.el.classList.add("scrolling");
+      clearTimeout(still);
+      still = setTimeout(settled, 150);
+    }, { passive: true });
+    window.addEventListener("resize", queueLists);
+  }
 
   // The filling: one list's next few rows per idle moment, the lists in turn.
   const FILL = 20;
@@ -4156,7 +4178,9 @@
   function probeResult(p) {
     const box = el("div", "lib-probe");
     const c = p.found.candidates;
-    if (!c.length) { box.append(el("div", "lib-none", t("No skills there — a skill is a folder with a SKILL.md in it."))); return box; }
+    // skills too big to install on their own, left out of the list (#2062)
+    const left = (p.found.left || []).map((x) => el("div", "lib-none lib-left", t("{name} is too big to install: {size}, over the {limit} a skill may be", { name: x.path.split("/").pop() || p.found.source, size: Math.round(x.size / 1048576) + " MB", limit: "200 MB" })));
+    if (!c.length) { box.append(...(left.length ? left : [el("div", "lib-none", t("No skills there — a skill is a folder with a SKILL.md in it."))])); return box; }
     const head = el("div", "lib-probehead");
     const src = p.found.kind === "github" ? "github.com/" + p.found.source.replace(/^https?:\/\/github\.com\//, "") : tilde(p.found.source);
     head.append(el("span", "note", c.length === 1 ? t("1 skill in {src}", { src }) : t("{n} skills in {src}", { n: c.length, src })));
@@ -4166,7 +4190,7 @@
       const allOn = fresh.every((x) => p.pick.has(x.path));
       head.append(button(allOn ? t("Select none") : t("Select all"), "", () => { for (const x of fresh) allOn ? p.pick.delete(x.path) : p.pick.add(x.path); render(); }));
     }
-    box.append(head);
+    box.append(head, ...left);
     if (c.length > 8) {
       const f = el("input", "lib-filter");
       f.type = "text";
@@ -4914,31 +4938,45 @@
     closeModal().then(() => { if (!modal) $("#modal").classList.remove("lib"); });
     return true;
   }
-  window.closeLibraryModal = () => { if (modal) closeLibModal(true); else closeModal(); };
-  window.libraryDirty = () => !!lib && dirty();
-  window.discardLibrary = () => discard(true);
-  // The dialog is the providers page's; while the library has it, its
-  // backdrop and Escape close it here.
-  $("#modal").addEventListener("click", (e) => {
-    if (modal && modalBackdrop(e)) { e.stopImmediatePropagation(); closeLibModal(); }
-  }, true);
-  document.addEventListener("keydown", (e) => {
-    if (!confirmationPending && modal && e.key === "Escape") { e.preventDefault(); e.stopImmediatePropagation(); closeLibModal(); }
-  }, true);
-  // leaving the page with the shared text not saved asks first
-  window.addEventListener("beforeunload", (e) => { if (lib && dirty()) e.preventDefault(); });
   // Back to the window, the library is read again — it may have changed
   // in another window or through the CLI meanwhile. Not over an open dialog,
   // unsaved text, or a lookup under way.
-  page.addEventListener("scroll", () => page.querySelector(".lib-head")?.classList.toggle("stuck", page.scrollTop > 0), { passive: true });
   // What changed there changes what the market calls added, too: take asks it again.
   async function quietLoad() {
     if (page.hidden || modal || dirty() || probing) return;
     await load(true);
   }
   const shelf = () => JSON.stringify([lib?.servers?.map((x) => x.name), lib?.skills?.map((x) => x.name)]);
-  document.addEventListener("visibilitychange", () => { if (!document.hidden) quietLoad(); });
-  window.addEventListener("focus", quietLoad);
-  // opened on ?view=library: app.js showed the page before this was here
-  if (!page.hidden) load();
-})();
+
+  ctx.slots.add("page", {
+    key: "library",
+    title: "Library",
+    mount(main) {
+      page = main;
+      wireLists();
+      // The dialog is the providers page's; while the library has it, its
+      // backdrop and Escape close it here.
+      $("#modal").addEventListener("click", (e) => {
+        if (modal && modalBackdrop(e)) { e.stopImmediatePropagation(); closeLibModal(); }
+      }, true);
+      document.addEventListener("keydown", (e) => {
+        if (!confirmationPending && modal && e.key === "Escape") { e.preventDefault(); e.stopImmediatePropagation(); closeLibModal(); }
+      }, true);
+      // leaving the page with the shared text not saved asks first
+      window.addEventListener("beforeunload", (e) => { if (lib && dirty()) e.preventDefault(); });
+      page.addEventListener("scroll", () => page.querySelector(".lib-head")?.classList.toggle("stuck", page.scrollTop > 0), { passive: true });
+      document.addEventListener("visibilitychange", () => { if (!document.hidden) quietLoad(); });
+      window.addEventListener("focus", quietLoad);
+    },
+    open: () => load(),
+    relang: () => load(),
+    // drawn again as it is: the agents hidden are known only from the state,
+    // which can come after the page was drawn (it counted them, and Turn all
+    // on gave them the servers)
+    redraw: () => { if (lib) render(); },
+    // the reader leaving the page: its dialog closed, and what isn't saved
+    close: () => { if (modal) closeLibModal(true); else closeModal(); },
+    dirty: () => !!lib && dirty(),
+    discard: () => discard(true),
+  });
+});

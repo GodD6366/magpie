@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"regexp"
 	"strings"
 	"time"
 
@@ -29,7 +30,20 @@ type pluginSubJSON struct {
 	Methods  []plugin.Method `json:"methods"`
 	SignedIn bool            `json:"signedIn"`
 	Models   int             `json:"models"`
+	// Options are the switches the plugin declares (auth.options, #2038),
+	// each with where it stands now
+	Options []pluginOptionJSON `json:"options,omitempty"`
 }
+
+// pluginOptionJSON is a plugin's option with the user's value, else its
+// default.
+type pluginOptionJSON struct {
+	plugin.Option
+	On bool `json:"on"`
+}
+
+// pluginOptionKey is the key an option may have, as the host checks it.
+var pluginOptionKey = regexp.MustCompile(`^[a-z0-9_-]{1,40}$`)
 
 // pluginIcon is the vendor's icon: the one the plugin gives its provider,
 // else the one the plugin market gives the plugin or its provider, else
@@ -57,10 +71,15 @@ func pluginIcon(pp plugin.Provider) string {
 
 func pluginSubs() []pluginSubJSON {
 	out := []pluginSubJSON{}
+	chosen := settings.Load().PluginOptions
 	for _, pp := range plugin.Cached() {
+		var opts []pluginOptionJSON
+		for _, o := range pp.Options {
+			opts = append(opts, pluginOptionJSON{o, plugin.OptionOn(chosen, pp.ID, o)})
+		}
 		out = append(out, pluginSubJSON{
 			ID: provider.PluginID(pp.ID), PID: pp.ID, Name: pp.Name, Icon: pluginIcon(pp), Spec: pp.Spec,
-			Methods: pp.Methods, SignedIn: pp.SignedIn, Models: len(pp.Models),
+			Methods: pp.Methods, SignedIn: pp.SignedIn, Models: len(pp.Models), Options: opts,
 		})
 	}
 	return out
@@ -348,6 +367,15 @@ func pluginMarketState(ctx context.Context, w Windows) pluginMarketJSON {
 	return m
 }
 
+// addPlugin, removePlugin, updatePlugins and upgradePlugin are what
+// /api/plugins/{op} runs, for tests to stand in for.
+var (
+	addPlugin     = plugin.Add
+	removePlugin  = provider.RemovePlugin
+	updatePlugins = plugin.Update
+	upgradePlugin = plugin.Upgrade
+)
+
 func pluginRoutes(mux *http.ServeMux, w Windows) {
 	// the updates waiting for the reader, which put a dot on Plugins
 	mux.HandleFunc("GET /api/plugins/updates", func(rw http.ResponseWriter, r *http.Request) {
@@ -472,19 +500,22 @@ func pluginRoutes(mux *http.ServeMux, w Windows) {
 			fail(rw, err)
 			return
 		}
-		// a first plugin downloads Bun, and npm installs it
-		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Minute)
+		// a first plugin downloads Bun, and npm installs it. It goes on
+		// though the page's connection goes: a proxy or tunnel in front of
+		// magpie web gives up first (Cloudflare after 100 seconds, #2032),
+		// and bun stopped halfway leaves plugins/ half-written
+		ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), 5*time.Minute)
 		defer cancel()
 		var err error
 		switch r.PathValue("op") {
 		case "add":
-			_, err = plugin.Add(ctx, in.Spec)
+			_, err = addPlugin(ctx, in.Spec)
 		case "remove":
-			err = provider.RemovePlugin(ctx, in.Spec)
+			err = removePlugin(ctx, in.Spec)
 		case "update":
-			err = plugin.Update(ctx)
+			err = updatePlugins(ctx)
 		case "upgrade":
-			err = plugin.Upgrade(ctx, plugin.Name(in.Spec))
+			err = upgradePlugin(ctx, plugin.Name(in.Spec))
 		case "off":
 			err = provider.SetPluginOff(ctx, in.Spec, in.Off)
 		case "options":
@@ -579,10 +610,11 @@ func pluginRoutes(mux *http.ServeMux, w Windows) {
 			fail(rw, err)
 			return
 		}
-		if st.URL != "" && w != nil {
-			w.OpenURL(st.URL)
+		var failed string
+		if w != nil {
+			failed = openError(w, st.URL)
 		}
-		writeJSON(rw, st)
+		writeJSON(rw, signInOpened{st, failed})
 	})
 }
 

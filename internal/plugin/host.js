@@ -277,6 +277,9 @@ let userConfig = {}
 // prefer is the plugin the user picked for a provider id more than one
 // plugin signs in to: id → its spec (plugins.json's prefer)
 let prefer = {}
+// chosen are the user's own values of the plugins' options (auth.options),
+// provider id → key → true/false (settings.json's pluginOptions, #2038)
+let chosen = {}
 const hooks = [] // {spec, hooks}
 const loaded = [] // {spec, id, error}
 const loaders = new Map() // account → options the auth loader returned
@@ -1135,6 +1138,10 @@ async function loadPlugins(list) {
     experimental_workspace: { register() {} },
     serverUrl: new URL("http://127.0.0.1:4096"),
     $: Bun.$,
+    // magpie's own (OpenCode has none): the plugin's options as the user
+    // set them in magpie, read when wanted, so a change reaches the
+    // plugin without a restart (#2038)
+    magpie: { option: optionValue, options: optionValues },
   }
   // pi's packages and extensions are loaded as pi loads them (pi.js)
   let pi
@@ -1294,6 +1301,10 @@ async function info(id, key, strict) {
     // magpie's own field: the plugin serves a decision API (System One)
     // for this provider, asked at its base /systemone through its fetch
     decide: cfg?.decide === true,
+    // magpie's own field: the provider's upstream answers a web search
+    // tool offered on its Anthropic or Responses API by itself, so a
+    // client's web_search goes to it as sent (#2027)
+    searches: cfg?.searches === true,
     models: {},
   }
   if (md) for (const m of Object.values(md.models ?? {})) out.models[m.id] = fromModelsDev(md, m)
@@ -1373,6 +1384,51 @@ async function info(id, key, strict) {
 // characters, "" for anything else.
 const shown = (v, n) => (typeof v === "string" ? v.trim().slice(0, n) : "")
 
+// optionsOf are the switches a plugin declares for its provider, magpie's
+// own field (#2038, Vocllum): auth.options, each {key, label, description?,
+// default?, confirm?}. magpie shows each as an Off/On switch in the
+// provider's editor and keeps what the user sets; the plugin reads it with
+// input.magpie.option(provider, key). A switch is only kept and handed
+// over, nothing is run when it changes. Keys are [a-z0-9_-], 1–40 long,
+// the first of a key kept; at most MAX_OPTIONS; one without a key or a
+// label is left out.
+const MAX_OPTIONS = 16
+const OPTION_KEY = /^[a-z0-9_-]{1,40}$/
+function optionsOf(auth) {
+  const out = []
+  if (!Array.isArray(auth?.options)) return out
+  for (const o of auth.options) {
+    if (out.length >= MAX_OPTIONS) break
+    if (!o || typeof o !== "object" || typeof o.key !== "string" || !OPTION_KEY.test(o.key)) continue
+    if (out.some((x) => x.key === o.key)) continue
+    const label = shown(o.label, 60)
+    if (!label) continue
+    out.push({
+      key: o.key,
+      label,
+      description: shown(o.description, 300),
+      default: o.default === true,
+      confirm: shown(o.confirm, 300),
+    })
+  }
+  return out
+}
+
+// optionValues are provider's options as they stand: the user's value,
+// else the plugin's default, for each key its plugin declares.
+function optionValues(provider) {
+  const own = chosen?.[provider] ?? {}
+  const out = {}
+  for (const o of optionsOf(auths().get(provider)?.auth)) out[o.key] = typeof own[o.key] === "boolean" ? own[o.key] : o.default
+  return out
+}
+
+// optionValue is one of provider's options as it stands; false for a key
+// its plugin doesn't declare.
+function optionValue(provider, key) {
+  return optionValues(provider)[key] === true
+}
+
 // methods are the auth hook's ways to sign in. An "api" one may say what
 // its key looks like (placeholder, magpie's own: OpenCode's dialog says
 // "API key"); its label titles the key's field, as OpenCode's does.
@@ -1449,7 +1505,9 @@ async function providers({ proxies } = {}) {
       icon: iconOf(a),
       usage: typeof a.auth.usage === "function",
       checkin: typeof a.auth.checkin === "function",
+      options: optionsOf(a.auth),
       decide: p.decide === true,
+      searches: p.searches === true,
       maxConcurrency: concurrencyOf(a),
       signedIn: keys.length > 0,
       authType: first?.type ?? "",
@@ -1978,6 +2036,7 @@ const handlers = {
     directory = p.directory ?? directory
     userConfig = p.config ?? {}
     prefer = p.prefer ?? {}
+    chosen = p.options ?? {}
     await loadPlugins(p.plugins ?? [])
     return { plugins: loaded.map(withProviders) }
   },
@@ -1990,6 +2049,12 @@ const handlers = {
   load,
   usage,
   checkin,
+  // setOptions takes the user's option values over, as init did: the
+  // plugin reads them when it next asks (#2038)
+  setProviderOptions(p) {
+    chosen = p?.options ?? {}
+    return null
+  },
   // check tries one account as a request would: its loader, then its
   // models as the plugin lists them for it, then its usage, which asks the
   // vendor of the account itself. refused is the models hook saying the

@@ -39,7 +39,9 @@ import (
 	"github.com/yetone/magpie/internal/gateway"
 	"github.com/yetone/magpie/internal/lastgood"
 	"github.com/yetone/magpie/internal/library"
+	"github.com/yetone/magpie/internal/mcpauth"
 	"github.com/yetone/magpie/internal/netproxy"
+	"github.com/yetone/magpie/internal/plugin"
 	"github.com/yetone/magpie/internal/profile"
 	"github.com/yetone/magpie/internal/provider"
 	"github.com/yetone/magpie/internal/redact"
@@ -145,8 +147,9 @@ type Windows interface {
 	// ShowMain brings the window up, on the named tab when view is set.
 	ShowMain(view string)
 	Quit()
-	// OpenURL hands a link to the system browser.
-	OpenURL(url string)
+	// OpenURL hands a link to the system browser. The error is the browser's
+	// not starting, which a sign-in shows with its link (#2043).
+	OpenURL(url string) error
 	// OpenFolder shows a folder in the system file manager.
 	OpenFolder(path string) error
 	// ChooseFolder asks for a folder in the system's picker: "" when the
@@ -488,6 +491,12 @@ type searchAPIJSON struct {
 	Key    string `json:"key,omitempty"` // masked
 	URL    string `json:"url,omitempty"`
 	Ready  bool   `json:"ready"`
+	// Keys is how many keys it has, Pick how a search picks among them
+	// (provider.SearchPick*), and Quota whether what each has left can be
+	// read (gateway.SearchQuotas)
+	Keys  int    `json:"keys,omitempty"`
+	Pick  string `json:"pick,omitempty"`
+	Quota bool   `json:"quota,omitempty"`
 }
 
 // searchChoiceJSON is a provider that can search for a model that can't,
@@ -524,7 +533,7 @@ func searchState(s *settingsJSON) {
 	}
 	s.SearchAPIs, s.SearchVendors = []searchAPIJSON{}, []searchVendorJSON{}
 	for _, a := range provider.StoredSearchAPIs() {
-		j := searchAPIJSON{Vendor: a.Vendor, Name: a.Name(), URL: a.URL, Ready: a.Ready()}
+		j := searchAPIJSON{Vendor: a.Vendor, Name: a.Name(), URL: a.URL, Ready: a.Ready(), Keys: len(a.Keys()), Pick: a.Pick, Quota: gateway.CanReadSearchQuota(a)}
 		if a.Key != "" {
 			j.Key = a.MaskedKey()
 		}
@@ -1171,6 +1180,7 @@ func Handler(w Windows, gw *gateway.Server) http.Handler {
 		in.FastPicks = cur.FastPicks             // switched in the agents' pickers (#954)
 		in.AgentEfforts = cur.AgentEfforts       // picked in an agent's row (#1003)
 		in.PluginCheckins = cur.PluginCheckins   // set on its own (plugin-checkin below)
+		in.PluginOptions = cur.PluginOptions     // set on its own (plugin-option below)
 		in.CheckinOff = cur.CheckinOff           // set on its own (checkin-account below)
 		settings.CarryPerModel(&in, &cur)
 		in.LAN, in.LANKey = cur.LAN, cur.LANKey
@@ -1723,6 +1733,43 @@ func Handler(w Windows, gw *gateway.Server) http.Handler {
 		}
 		writeJSON(rw, settingsState())
 	})
+	// and a switch a plugin declares for its provider (auth.options, #2038),
+	// by the plugin's own provider id, handed to the running host at once
+	mux.HandleFunc("POST /api/settings/plugin-option", func(rw http.ResponseWriter, r *http.Request) {
+		var in struct {
+			Provider string
+			Key      string
+			On       bool
+		}
+		if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+			fail(rw, err)
+			return
+		}
+		if in.Provider == "" || !pluginOptionKey.MatchString(in.Key) {
+			fail(rw, errors.New("no provider or no such option"))
+			return
+		}
+		s := settings.Load()
+		s.PluginOptions = maps.Clone(s.PluginOptions)
+		if s.PluginOptions == nil {
+			s.PluginOptions = map[string]map[string]bool{}
+		}
+		own := maps.Clone(s.PluginOptions[in.Provider])
+		if own == nil {
+			own = map[string]bool{}
+		}
+		own[in.Key] = in.On
+		s.PluginOptions[in.Provider] = own
+		if err := settings.Save(s); err != nil {
+			fail(rw, err)
+			return
+		}
+		// best effort: a host that misses it reads them when it next starts
+		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+		_ = plugin.SetProviderOptions(ctx)
+		cancel()
+		writeJSON(rw, settingsState())
+	})
 	// and one account's daily check-in, whichever vendor's (#1902): off
 	// leaves it out while its vendor's is on
 	mux.HandleFunc("POST /api/settings/checkin-account", func(rw http.ResponseWriter, r *http.Request) {
@@ -2033,8 +2080,8 @@ func Handler(w Windows, gw *gateway.Server) http.Handler {
 	// a web search API added, given a new key or address, or taken away
 	mux.HandleFunc("POST /api/settings/search-api", func(rw http.ResponseWriter, r *http.Request) {
 		var in struct {
-			Vendor, Key, URL string
-			Remove           bool
+			Vendor, Key, URL, Pick string
+			Remove                 bool
 		}
 		if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
 			fail(rw, err)
@@ -2044,7 +2091,7 @@ func Handler(w Windows, gw *gateway.Server) http.Handler {
 		if in.Remove {
 			err = provider.RemoveSearchAPI(in.Vendor)
 		} else {
-			err = provider.SetSearchAPI(provider.SearchAPI{Vendor: in.Vendor, Key: in.Key, URL: in.URL})
+			err = provider.SetSearchAPI(provider.SearchAPI{Vendor: in.Vendor, Key: in.Key, URL: in.URL, Pick: in.Pick})
 		}
 		if err != nil {
 			fail(rw, err)
@@ -2063,6 +2110,29 @@ func Handler(w Windows, gw *gateway.Server) http.Handler {
 		for _, a := range provider.StoredSearchAPIs() {
 			if a.Vendor == in.Vendor {
 				writeJSON(rw, map[string]string{"key": a.Key})
+				return
+			}
+		}
+		fail(rw, fmt.Errorf("no search API %q", in.Vendor))
+	})
+	// what each of a search API's keys has used of its limit (SlouchyQuill
+	// on Discord), the keys masked; fresh reads again what was read lately
+	mux.HandleFunc("POST /api/settings/search-quota", func(rw http.ResponseWriter, r *http.Request) {
+		var in struct {
+			Vendor string
+			Fresh  bool
+		}
+		if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+			fail(rw, err)
+			return
+		}
+		for _, a := range provider.StoredSearchAPIs() {
+			if a.Vendor == in.Vendor {
+				qs := gateway.SearchQuotas(r.Context(), a, in.Fresh)
+				if qs == nil {
+					qs = []gateway.SearchKeyQuota{}
+				}
+				writeJSON(rw, map[string]any{"keys": qs})
 				return
 			}
 		}
@@ -2207,6 +2277,32 @@ func state() stateJSON {
 	return s
 }
 
+// signInOpened is a sign-in as it starts, with why its page didn't open in
+// the browser: the window then shows the link to open by hand, instead of
+// waiting on a page that never opened until the sign-in times out (#2043).
+type signInOpened struct {
+	provider.SignInState
+	OpenError string `json:"openError,omitempty"`
+}
+
+// mcpSignInOpened is signInOpened for a sign-in to an MCP server.
+type mcpSignInOpened struct {
+	mcpauth.State
+	OpenError string `json:"openError,omitempty"`
+}
+
+// openError opens url in the browser, and says why it didn't open: "" when
+// it did, or when there is no url.
+func openError(w Windows, url string) string {
+	if url == "" {
+		return ""
+	}
+	if err := w.OpenURL(url); err != nil {
+		return err.Error()
+	}
+	return ""
+}
+
 func writeJSON(rw http.ResponseWriter, v any) {
 	rw.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(rw).Encode(v)
@@ -2225,6 +2321,12 @@ func fail(rw http.ResponseWriter, err error) {
 	if errors.As(err, &noModels) {
 		out["code"] = "no_models"
 		out["agent"] = noModels.Agent
+	}
+	// magpie has models, and none is left in the agent's lists (#1989)
+	var allHidden *agent.AllHiddenError
+	if errors.As(err, &allHidden) {
+		out["code"] = "all_hidden"
+		out["agent"] = allHidden.Agent
 	}
 	var signedIn *provider.SignedInError
 	if errors.As(err, &signedIn) {

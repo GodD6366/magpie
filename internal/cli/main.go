@@ -103,9 +103,14 @@ const usage = `magpie — one place to pick every agent's model
   magpie plugin move|migrate <subscription>   run a built-in subscription's accounts on its community plugin
   magpie plugin move-back|unmigrate <subscription>   go back to the built-in, with its accounts
 
-  magpie serve                    run the gateway alone (the app runs it too)
+  magpie serve [--web[=host:port]]
+                                  run the gateway alone (the app runs it too); --web serves magpie web's page too, from the same process (127.0.0.1:3430 unless told)
   magpie daemon [install|uninstall|start|stop|restart|status]
                                   magpie serve as a service of yours, from boot or login and started again when it stops (systemd --user on Linux, launchd on the Mac)
+  magpie daemon install [--web] [--lan] [--addr host:port] [--no-web]
+                                  --web: the service serves magpie web's page too, with a key kept across restarts; installed again, it keeps what it served
+  magpie daemon web [on|off] [--lan] [--addr host:port]
+                                  the service's page: its link, or turn it on or off
   magpie healthcheck              exit 0 when the gateway answers (a container's HEALTHCHECK)
   magpie gateway-key list|add <name>|rotate <id>|remove <id>   manage the keys clients use to call a shared gateway
   magpie gateway-key limit <id> [off|reset|day|week|month|<N>d --tokens N --cost USD --cache-reads]   a key's own limit, and what it used
@@ -121,6 +126,7 @@ const usage = `magpie — one place to pick every agent's model
                                   block until that subscription (any of its accounts) or account has allowance again
   magpie quota history [<provider|account>] [--days N] [--json]
                                   each window's readings over time, kept 45 days
+  magpie statusline [<provider|account>]   one line for Claude Code's status line: the session's model and each account's windows
   magpie sync                     refresh the model catalog and vendor model lists
   magpie agents                   list every supported agent
   magpie update [check] [--proxy <url>] [--mirror <prefix>]
@@ -349,7 +355,7 @@ func run(args []string) error {
 	case "group":
 		return groupCmd(args)
 	case "serve":
-		return serve()
+		return serveCmd(args[1:])
 	case "gateway-key":
 		return gatewayKeys(args)
 	case "accounts", "account":
@@ -360,6 +366,8 @@ func run(args []string) error {
 		return sessionsCmd(args)
 	case "quota", "quotas":
 		return quotaCmd(args)
+	case "statusline":
+		return statuslineCmd(args)
 	case "update":
 		return updateCmd(args)
 	case "library", "lib":
@@ -457,7 +465,11 @@ func set(a *agent.Agent, key, value string) error {
 		return err
 	}
 	before := f.Get()
-	if err := a.Apply(f.Key, value); err != nil {
+	wired := a.Wired()
+	// a magpie model picked on an agent not connected yet connects it
+	// first, as the Agents page's picker does (#1900): the agent is wired
+	// in, and Disconnect puts back what it had before
+	if err := a.Pick(f.Key, value); err != nil {
 		return err
 	}
 	// what the config reads now, not what was asked: an agent may name the
@@ -472,6 +484,13 @@ func set(a *agent.Agent, key, value string) error {
 		shown += " " + muted.Render("(unchanged)")
 	}
 	fmt.Println(green.Render("✓"), bold.Render(a.Name), muted.Render(f.Label), shown)
+	// a value that is the agent's own, not one of magpie's, takes magpie
+	// out: said, as Disconnect is, with the way back (#2000: magpie claude
+	// sonnet put Claude Code back on its DeepSeek endpoint, which refused
+	// Sonnet, and only "✓ Claude Code model sonnet" was printed)
+	if wired && now != "" && !a.Wired() {
+		fmt.Println(muted.Render(fmt.Sprintf("  disconnected from magpie: %s is %s's own, sent to the endpoint it had before magpie; magpie %s <model> with one of magpie's models connects it again", now, a.Name, a.ID)))
+	}
 	if a.Notice != nil {
 		if n := a.Notice(); n != "" {
 			fmt.Println(muted.Render("  ↻ " + n))

@@ -125,7 +125,7 @@ Click a value and a searchable list opens: every model of every provider you add
 
 Pick a preset, paste a key. Model lists come from the vendor, with names and reasoning levels filled in from [models.dev](https://models.dev), so a model released this morning is in your picker on the next refresh.
 
-> **Presets include** Anthropic · OpenAI · Google Gemini · Google Vertex AI · DeepSeek · Kimi · Zhipu GLM · MiniMax · StepFun · Qwen · Baidu Qianfan · Tencent Cloud · Huawei Cloud MaaS · Volcengine Ark · Mistral · Groq · xAI · OpenRouter · Together · Fireworks · SiliconFlow · NVIDIA NIM · ModelScope · Ollama · LM Studio … and any OpenAI- or Anthropic-compatible URL.
+> **Presets include** Anthropic · OpenAI · Google Gemini · Google Vertex AI · DeepSeek · Kimi · Zhipu GLM · MiniMax · StepFun · Qwen · Baidu Qianfan · Tencent Cloud · Huawei Cloud MaaS · Volcengine Ark · Mistral · Groq · Nous Portal · xAI · OpenRouter · Together · Fireworks · SiliconFlow · NVIDIA NIM · ModelScope · Ollama · LM Studio … and any OpenAI- or Anthropic-compatible URL.
 
 **Import** brings in the providers from CC Switch, Claude Code, Codex and Alma. **[Add to magpie](https://usemagpie.ai/docs/import)** links let a provider's website hand its config to magpie in one click. Each key and each account can go through a proxy of its own.
 
@@ -249,6 +249,7 @@ Find them under Plugins › Discover › Gateway middleware. See [Gateway middle
 ### Also
 
 - **Library**: write instructions, MCP servers and skills once; magpie writes them into each agent's files in its format, and removes only what it wrote.
+- **Web search for any model**: a model that can't search gets magpie's search: a provider that can, or search APIs (Tavily, Brave, Exa, Firecrawl, You.com, SearXNG). An API can hold several keys: searches take turns over them (or use them in order with `pick=order`), a key refused lately is asked last, and Tavily keys show what each has used of its limit, in Settings and in `magpie search`.
 - **Images and video**: an image tool for any agent over MCP, with the model you choose, and videos with a Grok subscription.
 - **Agents kept current**: the Agents page shows each CLI's version, updates it the way it was installed, and gives the commands for the ones you don't have.
 - **WSL**: on Windows, agents inside WSL distros are wired too, and their sessions counted.

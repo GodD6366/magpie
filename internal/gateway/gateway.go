@@ -280,6 +280,18 @@ func ServedBy() Served {
 	return Served{Running: true, Window: info.Window, Version: info.Version}
 }
 
+// Taken reports whether anything accepts connections at the gateway's
+// address, whether or not it answers ServedBy's question in time: a
+// magpie busy starting, or slow on a small server, still holds the port.
+func Taken() bool {
+	c, err := net.DialTimeout("tcp", strings.TrimPrefix(URL(), "http://"), 500*time.Millisecond)
+	if err != nil {
+		return false
+	}
+	c.Close()
+	return true
+}
+
 // Call is one request the gateway handled, for the status views.
 type Call struct {
 	// ID numbers the call in the Recent-calls ring, from 1, for the page
@@ -567,6 +579,11 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /embeddings", s.retrieve("/embeddings", "embeddings"))
 	mux.HandleFunc("POST /v1/rerank", s.retrieve("/rerank", "rerank"))
 	mux.HandleFunc("POST /rerank", s.retrieve("/rerank", "rerank"))
+	// speech to text, for a client's voice input (#2053)
+	mux.HandleFunc("POST /v1/audio/transcriptions", s.transcribe("/audio/transcriptions", "transcriptions"))
+	mux.HandleFunc("POST /audio/transcriptions", s.transcribe("/audio/transcriptions", "transcriptions"))
+	mux.HandleFunc("POST /v1/audio/translations", s.transcribe("/audio/translations", "translations"))
+	mux.HandleFunc("POST /audio/translations", s.transcribe("/audio/translations", "translations"))
 	mux.HandleFunc("POST /v1/videos", s.videosCreate)
 	mux.HandleFunc("POST /videos", s.videosCreate)
 	mux.HandleFunc("GET /v1/videos/{id}", s.videosGet)
@@ -582,7 +599,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /v1beta/models", s.geminiModels)
 	mux.HandleFunc("POST /v1beta/models/{call...}", s.gemini)
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		writeError(w, provider.Chat, http.StatusNotFound, "magpie serves /v1/chat/completions, /v1/responses, /v1/messages, /v1/systemone, /v1/images/generations, /v1/images/edits, /v1/videos, /v1/embeddings, /v1/rerank and /v1beta/models/*")
+		writeError(w, provider.Chat, http.StatusNotFound, "magpie serves /v1/chat/completions, /v1/responses, /v1/messages, /v1/systemone, /v1/images/generations, /v1/images/edits, /v1/videos, /v1/embeddings, /v1/rerank, /v1/audio/transcriptions, /v1/audio/translations and /v1beta/models/*")
 	})
 	return s.counted(corsGuard(callerGuard(withCaller(keyLimited(mux)))))
 }
@@ -604,7 +621,7 @@ func responsesOverHTTP(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) info(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]any{"name": "magpie", "version": Version, "models": len(provider.Catalog()), "window": Window,
-		"apis": []string{"/v1/chat/completions", "/v1/responses", "/v1/messages", "/v1/systemone", "/v1beta/models/{model}:generateContent", "/v1/images/generations", "/v1/images/edits", "/v1/videos", "/v1/embeddings", "/v1/rerank", "/v1/magpie/quotas", "/v1/magpie/quotas/history", "/v1/magpie/usage", "/v1/magpie/usage/requests", "/v1/magpie/route", SearchMCPPath, VisionMCPPath}})
+		"apis": []string{"/v1/chat/completions", "/v1/responses", "/v1/messages", "/v1/systemone", "/v1beta/models/{model}:generateContent", "/v1/images/generations", "/v1/images/edits", "/v1/videos", "/v1/embeddings", "/v1/rerank", "/v1/audio/transcriptions", "/v1/audio/translations", "/v1/magpie/quotas", "/v1/magpie/quotas/history", "/v1/magpie/usage", "/v1/magpie/usage/requests", "/v1/magpie/route", SearchMCPPath, VisionMCPPath}})
 }
 
 // quotas is what is left of every subscription, plan and key magpie has,
@@ -621,6 +638,12 @@ func (s *Server) quotas(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if refuseHeld(w, r, heldRefused) {
+		return
+	}
+	// ?kept=1: what was last read, no vendor asked (magpie statusline,
+	// run on every message, #1997)
+	if r.URL.Query().Get("kept") == "1" {
+		writeJSON(w, 200, map[string]any{"object": "list", "data": provider.KeptQuotaReport(time.Now())})
 		return
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), 12*time.Second)
@@ -2166,7 +2189,14 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 		// user saying this model does think, over a catalog that may be
 		// wrong about it (the Trae plugin's own model, #950)
 		quiet := isGroup && c.effort == "" && quietTo(c.p.ID, c.model)
-		if quiet {
+		if provider.Reasonless(c.p.ID, c.model) {
+			// a model the user said takes no reasoning ask is sent none,
+			// in a group or not, at a fixed effort or not: not even
+			// reasoning turned off (yuexian7 on Discord: its vendor
+			// answers reasoning_effort with 422)
+			quiet = true
+			attemptBody, picked = withoutAnyReasoning(from, attemptBody), false
+		} else if quiet {
 			attemptBody, picked = withoutReasoningAsk(from, attemptBody), false
 		}
 		// the reasoning the model is asked for, whoever chose it
@@ -3277,7 +3307,7 @@ func (s *Server) forward(ctx context.Context, p provider.Provider, to provider.P
 	// "updates", a turn's output_config in messages: anthropic_shapes.go),
 	// each learned once
 	for range 3 {
-		if err != nil || to != provider.Anthropic || res.StatusCode != http.StatusBadRequest {
+		if err != nil || to != provider.Anthropic || res.StatusCode != http.StatusBadRequest && res.StatusCode != http.StatusUnprocessableEntity {
 			return res, err
 		}
 		b, _ := io.ReadAll(io.LimitReader(res.Body, 1<<20))
@@ -3315,6 +3345,12 @@ func (s *Server) forwardOnce(ctx context.Context, p provider.Provider, to provid
 		// shapes a provider refused are taken out, as it asks a display
 		body = adaptiveThinking(body)
 		body = s.withoutRefusedShapes(p, body)
+		if isKimi(p, to) {
+			// Claude Code's deferred-tool blocks, for which Kimi's
+			// Anthropic endpoint turns the whole request away with a 400
+			// that names nothing to learn from (#2042)
+			body = withoutDeferredTools(body)
+		}
 		body = thinkingOffAsTaken(body, path)
 		body = samplingAsTaken(body, path)
 		asked := askedBetas(in)
@@ -3646,7 +3682,7 @@ func (s *Server) passthrough(w http.ResponseWriter, r *http.Request, p provider.
 			// turns the whole request away for (#1611)
 			body = withThinkingOnToolTurns(body)
 		}
-		if !anthropicModel.MatchString(model) {
+		if !anthropicModel.MatchString(model) && !provider.Reasonless(p.ID, model) {
 			body = thinkingOffUnlessAsked(body)
 			// Claude Code's auto mode classifier, on a vendor's model that
 			// may think whatever it is told (#250); a Claude model's request
@@ -4212,6 +4248,12 @@ func (s *Server) forwardTranslated(ctx context.Context, p provider.Provider, to 
 		// the model can stop thinking: asked for none (#899)
 		r := *req
 		r.Effort, req = "none", &r
+	}
+	if provider.Reasonless(p.ID, model) {
+		// the user said it takes no reasoning ask: built with none, not
+		// even reasoning turned off (yuexian7 on Discord)
+		r := *req
+		r.Effort, r.ThinkOff, r.Thinking, req = "", false, false, &r
 	}
 	if req.Effort != "" {
 		if e := fitFor(p, model, req.Effort); e != req.Effort {

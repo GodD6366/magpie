@@ -520,6 +520,11 @@ func newDue(ps []Provider) (due, skipped []newFetch) {
 	for _, p := range ps {
 		// a list of decision models fetched before magpie kept their
 		// windows and input, or not fetched yet (ARNO on Discord)
+		// one switched off isn't asked (leftAlone): a signed-in
+		// agent's list asks its CLI or the vendor
+		if p.Off {
+			continue
+		}
 		decide := p.decideListDue()
 		if !decide && (p.Account == nil || !p.Ready()) {
 			continue
@@ -1439,6 +1444,9 @@ func (p Provider) RejectsTemperature(model string) bool {
 // Efforts are the reasoning levels the model takes, when known: its own,
 // or those the user gave it when it has none known.
 func (p Provider) Efforts(model string) []string {
+	if Reasonless(p.ID, model) {
+		return nil
+	}
 	if all := p.Known(model); len(all) > 0 {
 		return all
 	}
@@ -1449,6 +1457,9 @@ func (p Provider) Efforts(model string) []string {
 // it thinks, or models.dev says most of those serving it do (Entry's
 // Reasoning).
 func (p Provider) Thinks(model string) bool {
+	if Reasonless(p.ID, model) {
+		return false
+	}
 	if len(p.Efforts(model)) > 0 {
 		return true
 	}
@@ -1509,6 +1520,9 @@ func (p Provider) knownElsewhere(model string) []string {
 // lists it with a thinking switch alone, or nothing (Xiaomi's
 // mimo-v2.6-flash), and the user gave it none.
 func (p Provider) Levelless(model string) bool {
+	if Reasonless(p.ID, model) {
+		return true
+	}
 	if len(p.Efforts(model)) > 0 {
 		return false
 	}
@@ -1593,8 +1607,12 @@ func (p Provider) ListPrice(model string) (catalog.Price, bool) {
 			names = append(names, id)
 		}
 	}
+	cats := p.Catalogs()
+	if c := p.EndpointCatalog(); c != "" {
+		cats = []string{c}
+	}
 	for _, m := range names {
-		if pr, ok := catalog.PricedBy(priceCatalogs(p.Catalogs()), m); ok {
+		if pr, ok := catalog.PricedBy(priceCatalogs(cats), m); ok {
 			return pr, true
 		}
 		if pr, ok := catalog.PricedBy(makerPriceCatalogs(), m); ok {
@@ -1602,6 +1620,40 @@ func (p Provider) ListPrice(model string) (catalog.Price, bool) {
 		}
 	}
 	return catalog.Price{}, false
+}
+
+// EndpointCatalog is the models.dev catalog a provider the user added by
+// its endpoint alone is priced from: the one models.dev says serves its
+// models at that address, when exactly one does (#2052, mengyianx: a
+// provider at AMD's own https://developer.amd.com.cn/radeon/api/v1 had no
+// price for Qwen3.8-27B, which models.dev's amd lists at $0 there, while
+// its maker sells no such model). Only a key's provider with no catalog
+// named counts: a catalog the user or a preset gave stands, and a
+// subscription's account is priced as its own code says. A plan's catalog
+// is never one: it lists what its membership charges per token, $0, not
+// what the model costs (membershipCatalogs).
+func (p Provider) EndpointCatalog() string {
+	if p.Account != nil || len(p.Catalogs()) > 0 {
+		return ""
+	}
+	var found []string
+	// the Anthropic base is kept as its root (normalize), where models.dev
+	// writes an Anthropic API's with its /v1
+	urls := []string{p.Chat, p.Responses, p.Anthropic, p.Gemini}
+	if p.Anthropic != "" {
+		urls = append(urls, p.Anthropic+"/v1")
+	}
+	for _, u := range urls {
+		for _, id := range catalog.AtEndpoint(u) {
+			if !slices.Contains(found, id) {
+				found = append(found, id)
+			}
+		}
+	}
+	if len(found) != 1 || strings.Contains(found[0], "-plan") || slices.Contains(membershipCatalogs, found[0]) {
+		return ""
+	}
+	return found[0]
 }
 
 // cursorFast is a Cursor id of a Grok model in its fast mode, at an effort
@@ -1945,6 +1997,10 @@ type Entry struct {
 	// thinking switch alone has it and no Efforts (a group's: a member
 	// thinks).
 	Reasoning bool `json:"reasoning,omitempty"`
+	// Reasonless is set on a model the user said takes no reasoning ask
+	// (SetModelReasonless): it is sent none, and as a group's member it
+	// leaves the group the levels the others have
+	Reasonless bool `json:"-"`
 	// AgentsV2 is set on a model offering Codex's Ultra that no ChatGPT
 	// account answers for (a group's: none of its members): Codex is told
 	// multi-agent V2 for it, so Ultra hands work to its agents, whose
@@ -2086,6 +2142,11 @@ func entryFor(p Provider, m catalog.Model, s settings.Settings) Entry {
 	if p.Account == nil || p.Account.Agent != "codex" {
 		e.Efforts = withUltra(m.ID, e.Efforts)
 		e.AgentsV2 = slices.Contains(e.Efforts, "ultra")
+	}
+	// one the user said takes no reasoning ask offers none and is sent
+	// none (SetModelReasonless), whatever its list says
+	if s.ModelReasonless[e.ID] {
+		e.Efforts, e.Reasoning, e.AgentsV2, e.Reasonless = nil, false, false, true
 	}
 	return e
 }
