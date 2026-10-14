@@ -326,6 +326,49 @@ func TestOpenClawJSON5AndUnsafeConfigs(t *testing.T) {
 	}
 }
 
+func TestOpenClawJSON5ReconnectAfterUserEdit(t *testing.T) {
+	const original = "// first connection\n{agents:{defaults:{model:'mine/original'}},gateway:{port:18789}}\n"
+	for _, port := range []string{"18790", "18789"} {
+		t.Run(port, func(t *testing.T) {
+			a, read := openclawHome(t, original)
+			if err := a.Connect(); err != nil {
+				t.Fatal(err)
+			}
+			changed := bytes.Replace(read(), []byte("18789"), []byte("18790"), 1)
+			if err := os.WriteFile(a.Path, changed, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := a.Disconnect(); err != nil {
+				t.Fatal(err)
+			}
+			if gjson.GetBytes(read(), "gateway.port").Int() != 18790 {
+				t.Fatal("disconnect lost the user's port edit")
+			}
+			if _, err := os.Stat(openclawOriginal(a.Path)); !os.IsNotExist(err) {
+				t.Error("disconnect kept an obsolete JSON5 backup")
+			}
+			// A fresh JSON5 may have different values, or the same values as the
+			// first backup but new comments. Both must survive the next cycle.
+			next := "// new notes for the second connection\n{agents:{defaults:{model:'mine/original'}},gateway:{port:" + port + "}}\n"
+			if err := os.WriteFile(a.Path, []byte(next), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := a.Connect(); err != nil {
+				t.Fatal(err)
+			}
+			if err := a.Disconnect(); err != nil {
+				t.Fatal(err)
+			}
+			if string(read()) != next {
+				t.Fatalf("reconnect lost the new JSON5 bytes:\n%s", read())
+			}
+			if _, err := os.Stat(openclawOriginal(a.Path)); !os.IsNotExist(err) {
+				t.Fatal("second disconnect kept its backup")
+			}
+		})
+	}
+}
+
 func TestOpenClawPathsAndReadOnly(t *testing.T) {
 	a, _ := openclawHome(t, "")
 	home := filepath.Dir(a.Dir)

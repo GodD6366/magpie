@@ -225,8 +225,8 @@ func openclawNormalize(path string, raw []byte) ([]byte, error) {
 }
 
 // openclawRestoreOriginal puts a normalized JSON5 file back when disconnect
-// left the same values. A file the user changed while connected stays as
-// disconnect left it, and the copy is kept for the next disconnect.
+// left the same values. Otherwise it keeps the user's changes and discards
+// the old copy, so the next connection backs up the current JSON5.
 func openclawRestoreOriginal(path string, left []byte) error {
 	backup := openclawOriginal(path)
 	was, err := os.ReadFile(backup)
@@ -241,11 +241,11 @@ func openclawRestoreOriginal(path string, left []byte) error {
 		return err
 	}
 	if !bytes.Equal(cur, left) {
-		return nil
+		return os.Remove(backup)
 	}
 	then, err := openclawDoc(path, was)
 	if err != nil {
-		return nil
+		return os.Remove(backup)
 	}
 	now, err := openclawDoc(path, cur)
 	if err != nil {
@@ -253,8 +253,14 @@ func openclawRestoreOriginal(path string, left []byte) error {
 	}
 	x, err1 := json.Marshal(now)
 	y, err2 := json.Marshal(then)
-	if err1 != nil || err2 != nil || !bytes.Equal(x, y) {
+	if err1 != nil {
 		return err1
+	}
+	if err2 != nil {
+		return err2
+	}
+	if !bytes.Equal(x, y) {
+		return os.Remove(backup)
 	}
 	if err := edit.WriteAtomic(path, was); err != nil {
 		return err

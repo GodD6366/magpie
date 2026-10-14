@@ -53,11 +53,11 @@ function server(lang, posts, web = true) {
 }
 
 
-for (const engine of ["chromium", "webkit"]) for (const lang of ["en","zh","zh-TW","ja","de"]) for (const web of [true, false]) {
- test(`${engine} ${lang} ${web ? "web" : "desktop"}: OpenClaw primary and ordered fallbacks`, async t => {
+for (const engine of ["chromium", "webkit"]) for (const lang of ["en","zh","zh-TW","ja","de"]) for (const web of [true, false]) for (const width of [420, 1100]) {
+ test(`${engine} ${lang} ${web ? "web" : "desktop"} ${width}px: OpenClaw primary and ordered fallbacks`, async t => {
   const browser=await (engine==="webkit"?webkit.launch():chromium.launch({channel:"chromium"}));
   t.after(()=>browser.close());
-  const page=await browser.newPage({viewport:{width:web ? 440 : 980,height:700},reducedMotion:"reduce"});
+  const page=await browser.newPage({viewport:{width,height:700},reducedMotion:"reduce"});
   page.setDefaultTimeout(5000);
   const posts=[],errors=[]; page.on("pageerror",e=>errors.push(e.message));
   await page.route("**/*",server(lang,posts,web));
@@ -97,7 +97,7 @@ for (const engine of ["chromium", "webkit"]) for (const lang of ["en","zh","zh-T
   await page.unroute('**/api/agents/model-chain/openclaw');
   if (process.env.ARTIFACT_DIR) {
     await fs.mkdir(process.env.ARTIFACT_DIR,{recursive:true});
-    await page.screenshot({path:path.join(process.env.ARTIFACT_DIR,`inline-${engine}-${lang}-${web ? "web" : "desktop"}.png`),animations:'disabled'});
+    await page.screenshot({path:path.join(process.env.ARTIFACT_DIR,`inline-${engine}-${lang}-${web ? "web" : "desktop"}-${width}.png`),animations:'disabled'});
   }
   assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth>innerWidth), false);
   await box.locator('.model-chain-remove').first().click();

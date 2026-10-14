@@ -2366,7 +2366,8 @@ server-side.
 `openclaw-models.test.cjs` covers editing the primary model and ordered fallback
 models, reordering and clearing, readback after saving, cancel and invalid input.
 It runs the real UI against isolated API fixtures in both Chromium and WebKit,
-in English, Simplified and Traditional Chinese, Japanese and German at 440px.
+in English, Simplified and Traditional Chinese, Japanese and German at 420px
+and 1100px, in both web and desktop mode (40 cases).
 `ARTIFACT_DIR` optionally saves screenshots. Run with
 `node --test internal/gui/tests/openclaw-models.test.cjs`.
 

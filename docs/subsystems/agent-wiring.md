@@ -127,6 +127,8 @@ session picks are not changed. JSON/JSONC keeps comments and layout. Other JSON5
 is parsed without changing numeric types or precision, then normalized only for
 the first edit; the original file is copied to `openclaw.json.before-magpie`
 and Disconnect puts it back byte for byte when the values still match.
+When values have changed, Disconnect keeps those changes and removes the
+obsolete copy, so the next connection backs up the current JSON5 text.
 Malformed configs, `$include` configs and OpenClaw's read-only/Nix flags
 fail without writing. Config location follows `OPENCLAW_CONFIG_PATH`, then
 `OPENCLAW_STATE_DIR`, then `.openclaw` under `OPENCLAW_HOME` or the user's
