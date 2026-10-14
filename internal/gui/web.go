@@ -83,6 +83,11 @@ func StartWeb(addr, version string) (*Web, error) {
 	if err != nil {
 		return nil, err
 	}
+	// with --tls-cert, the page is HTTPS to other computers, as the
+	// gateway is: it carries the settings and keys
+	if ln, err = gateway.ServeTLS(ln); err != nil {
+		return nil, err
+	}
 	w := &Web{Addr: ln.Addr().String(), key: key, quit: make(chan struct{})}
 	host, port, _ := net.SplitHostPort(w.Addr)
 	if ip := net.ParseIP(host); ip == nil || ip.IsUnspecified() {
@@ -90,12 +95,26 @@ func StartWeb(addr, version string) (*Web, error) {
 	}
 	var once sync.Once
 	quit := func() { once.Do(func() { close(w.quit) }) }
-	w.Link = "http://" + net.JoinHostPort(host, port) + "/?k=" + url.QueryEscape(key)
+	// on loopback the page takes plain HTTP with TLS on too, which a
+	// browser here opens without a certificate for 127.0.0.1
+	scheme := "http"
+	if ip := net.ParseIP(host); ip != nil && !ip.IsLoopback() {
+		scheme = gateway.Scheme()
+	}
+	w.Link = scheme + "://" + net.JoinHostPort(host, port) + "/?k=" + url.QueryEscape(key)
 	w.srv = &http.Server{
 		Handler:           gateway.AllowGuard(webHandler(port, key, keep, Handler(webHost{quit}, startBackend()))),
 		ReadHeaderTimeout: 30 * time.Second,
 	}
 	go w.srv.Serve(ln)
+	// Settings' AutoRestart: magpie web runs on as the new version (#2096)
+	updates.autoRestart = func() bool {
+		if restartInto(true, false, "", true) {
+			quit()
+			return true
+		}
+		return false
+	}
 	updates.start()
 	news.start()
 	return w, nil
@@ -271,7 +290,7 @@ func NetworkLinks(port, key string) []string {
 	}
 	var out []string
 	for _, a := range LANAddrs() {
-		out = append(out, "http://"+net.JoinHostPort(a, port)+key)
+		out = append(out, gateway.Scheme()+"://"+net.JoinHostPort(a, port)+key)
 	}
 	return out
 }

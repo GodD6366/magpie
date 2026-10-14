@@ -10,6 +10,7 @@
 // reader leaves it.
 magpie.plugin("library", (ctx) => {
   let page = null;
+  let loading = null;    // the read open started, which server waits for
 
   let lib = null;        // the page, as /api/library gives it
   let taken = 0;         // how many times lib was set, for a read to tell a newer answer came first
@@ -2273,9 +2274,18 @@ magpie.plugin("library", (ctx) => {
     const err = el("div", "editor-error");
     const name = field2(d.name, t("e.g. notify"), (v) => { d.name = v.trim(); });
     ed.append(...field(t("Name"), name, t("Letters, digits, - and _")));
-    const desc = field2(d.description, t("e.g. Tell me when a turn ends"), (v) => { d.description = v; });
+    // a box that wraps, so a long description is read whole while it is
+    // written (#2085). It is kept as one paragraph (library.SaveHook joins
+    // its lines), so Enter still saves, as in every other field here
+    const desc = el("textarea", "lib-text small lib-hookdescin");
+    desc.value = d.description;
+    desc.placeholder = t("e.g. Tell me when a turn ends");
+    desc.spellcheck = false;
+    desc.rows = 3;
     desc.maxLength = 200;
-    desc.classList.add("lib-hookdescin");
+    desc.oninput = () => { d.description = desc.value; };
+    desc.onkeydown = (e) => { e.stopPropagation(); if (e.isComposing || e.keyCode === 229) return; if (e.key === "Escape") closeLibModal(); else if (e.key === "Enter" && modal?.save) { e.preventDefault(); modal.save(); } };
+    autosize(desc, 64);
     ed.append(...field(t("Description"), desc, t("Optional: what it's for, in any language. Only the library keeps it")));
 
     // the event and the tools it is narrowed to: menus, never a <select>
@@ -4968,8 +4978,22 @@ magpie.plugin("library", (ctx) => {
       document.addEventListener("visibilitychange", () => { if (!document.hidden) quietLoad(); });
       window.addEventListener("focus", quietLoad);
     },
-    open: () => load(),
+    open: () => (loading = load()),
     relang: () => load(),
+    // one of the market's servers up close, from another page (Settings ›
+    // Images' Magpie Image, #2091): its sheet over the MCP servers tab, to
+    // pick the agents that get it; one already in the library is on that
+    // tab's list, which opens with nothing over it
+    server: async (name) => {
+      if (tab !== "mcp") openTab("mcp");
+      await loading;
+      if (!market.mcp.items || market.mcp.q.trim()) {
+        market.mcp.q = "";
+        await fetchMarket("mcp");
+      }
+      const x = market.mcp.items?.find((m) => m.name === name || m.id === name);
+      if (x && !x.have && !page.hidden) serverSheet(x);
+    },
     // drawn again as it is: the agents hidden are known only from the state,
     // which can come after the page was drawn (it counted them, and Turn all
     // on gave them the servers)

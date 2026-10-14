@@ -964,6 +964,23 @@ func modelRefused(status int, body []byte) bool {
 	return unservedWords.Match(body) && !quotaWords.Match(body) && !refusedWords.Match(body)
 }
 
+// codeAssistModelMissing says a Google account's Code Assist — the
+// Antigravity or Gemini CLI built-in's — answered 404 NOT_FOUND
+// ("Requested entity was not found."). Its endpoint is the same for every
+// model, so what isn't there is the model: one fetchAvailableModels lists
+// that the account's plan doesn't serve (Packing1 on Discord: Argon on
+// Google AI Pro). Only that model rests, on that account; its others are
+// asked as before.
+func codeAssistModelMissing(p provider.Provider, status int, body []byte) bool {
+	if status != http.StatusNotFound || p.Account == nil || p.IsPlugin() {
+		return false
+	}
+	if p.Account.Agent != "antigravity" && p.Account.Agent != "gemini" {
+		return false
+	}
+	return bytes.Contains(body, []byte("NOT_FOUND")) || bytes.Contains(bytes.ToLower(body), []byte("not found"))
+}
+
 // retiredWords are how a vendor says the model is retired, though its
 // list may still name it: OpenCode Zen's 410 {"type":"error","error":
 // {"type":"ModelDeprecated","message":"Model exo-free has been
@@ -1158,9 +1175,11 @@ func tooLongUnsaid(p provider.Provider, model string, tokens, status int, body [
 }
 
 // windowOf is the tokens a provider's model takes, where known: the
-// user's (Provider.ContextOf), else its catalog entry's.
+// user's for the model, else its catalog entry's (Provider.WindowOf, where
+// the one set for all the provider's models is no larger than the model's
+// own, #2112), else the one set for all of them.
 func windowOf(p provider.Provider, model string) int {
-	if n := p.ContextOf(model); n > 0 {
+	if n := p.Contexts[model]; n > 0 {
 		return n
 	}
 	for _, e := range provider.Served() {
@@ -1168,7 +1187,7 @@ func windowOf(p provider.Provider, model string) int {
 			return e.Context
 		}
 	}
-	return 0
+	return p.ContextOf(model)
 }
 
 const (

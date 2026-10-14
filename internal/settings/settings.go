@@ -37,8 +37,12 @@ import (
 // Settings is what the user chose. "" and "system" both mean "follow the OS".
 type Settings struct {
 	Theme string `json:"theme,omitempty"` // system | light | dark
-	Lang  string `json:"lang,omitempty"`  // system | en | zh
-	Tray  string `json:"tray,omitempty"`  // what clicking the tray icon opens: panel | window
+	// Colorblind switches chart series (--c1…--c7) to an Okabe–Ito palette
+	// and gives each quota curve window, and its legend key, a dash of its
+	// own (#2073).
+	Colorblind bool   `json:"colorblind,omitempty"`
+	Lang       string `json:"lang,omitempty"` // system | en | zh
+	Tray       string `json:"tray,omitempty"` // what clicking the tray icon opens: panel | window
 	// SessionTerminal is the Mac app that opens a resumed session, by bundle
 	// id. "" and "system" follow the .command file association.
 	SessionTerminal string `json:"sessionTerminal,omitempty"`
@@ -158,6 +162,13 @@ type Settings struct {
 	// unused half an hour before it does, or at once when the account is
 	// held up past then (provider.SpendExpiringCodexResets).
 	CodexAutoReset []string `json:"codexAutoReset,omitempty"`
+	// CodexAutoResetOnly narrows an account in CodexAutoReset to one of
+	// those two times (#2078, alanwalk: Codex's own resets come often, so
+	// a week used up is worth waiting out, while a card about to run out
+	// isn't): "week" for its week used up only, "expiring" for the one
+	// about to run out only. An account not in it uses one at both, as
+	// every account did before the two were split.
+	CodexAutoResetOnly map[string]string `json:"codexAutoResetOnly,omitempty"`
 	// CodexNoCredits are the ChatGPT accounts (lower-case) that don't
 	// spend their credits: once a usage window is used up, routing holds
 	// the account as used up and goes on to the user's other accounts,
@@ -235,6 +246,12 @@ type Settings struct {
 	// one of UpdateEveries, 0 for every six hours.
 	NoAutoUpdate bool `json:"noAutoUpdate,omitempty"`
 	UpdateEvery  int  `json:"updateEvery,omitempty"`
+	// AutoRestart has the app restart into an update it downloaded by
+	// itself, once the gateway it serves has nothing in flight, rather than
+	// waiting for a click or for quitting (#2096). Off by default: a
+	// restart ends the window and whatever an agent sends next waits for
+	// the gateway to be back. Nothing happens with NoAutoUpdate on.
+	AutoRestart bool `json:"autoRestart,omitempty"`
 	// UpdateMirror is a GitHub download mirror an update's file is fetched
 	// through, its prefix put before the release's github.com URL
 	// (https://mirror.example/https://github.com/…): "" for none, which is
@@ -292,6 +309,10 @@ type Settings struct {
 	// cards are there, the cards alone (KevinXC on Discord); a click on one
 	// still opens the panel, and with no cards the bird is shown.
 	TrayNoBird bool `json:"trayNoBird,omitempty"`
+	// TrayPace puts each window's Pace number beside its figure in the
+	// menu bar ("42% +12%"), as the Usage page's cards have it (fflake33
+	// on Discord); off by default, as it widens every card.
+	TrayPace bool `json:"trayPace,omitempty"`
 	// Lightweight lets the webview of a window closed — the tray panel or
 	// the main window — go once it has stayed closed a while, and makes it
 	// again when it is opened (#580): less memory, a moment's wait. This
@@ -406,6 +427,10 @@ type Settings struct {
 	// is sealed for one (willz on Discord). "" leaves each on the model its
 	// lead asked for.
 	CodexSubagentModel string `json:"codexSubagentModel,omitempty"`
+	// DesktopSubagentModel is the model the gateway puts Claude Desktop's
+	// subagent tool turns on. "" leaves them on the model their lead asks
+	// for; tool-less helpers and the lead's own turns are never moved.
+	DesktopSubagentModel string `json:"desktopSubagentModel,omitempty"`
 	// FullContext has Codex and Claude Code told a model's whole context
 	// window. Off, a window above WorkingWindow is told as WorkingWindow,
 	// so they compact a long conversation there instead of sending ever
@@ -880,7 +905,7 @@ func (s *Settings) KeepOwn(cur Settings) {
 	s.UIFont, s.CodeFont = cur.UIFont, cur.CodeFont
 	s.Window, s.Proxy, s.Port, s.Dock, s.DockWindow, s.Lightweight = cur.Window, cur.Proxy, cur.Port, cur.Dock, cur.DockWindow, cur.Lightweight
 	s.WindowMaximised, s.KeepAwake, s.KeepAwakeDisplay = cur.WindowMaximised, cur.KeepAwake, cur.KeepAwakeDisplay
-	s.TrayUsages, s.TrayUsage, s.TrayUsageEvery, s.TrayNoLogos, s.TrayNoBird = cur.TrayUsages, cur.TrayUsage, cur.TrayUsageEvery, cur.TrayNoLogos, cur.TrayNoBird
+	s.TrayUsages, s.TrayUsage, s.TrayUsageEvery, s.TrayNoLogos, s.TrayNoBird, s.TrayPace = cur.TrayUsages, cur.TrayUsage, cur.TrayUsageEvery, cur.TrayNoLogos, cur.TrayNoBird, cur.TrayPace
 	s.GatewayMode = cur.GatewayMode
 	s.NoWSLAgents = cur.NoWSLAgents
 	s.QuotaReads = cur.QuotaReads
@@ -1184,6 +1209,10 @@ func save(s Settings, recording bool) error {
 	if s.CodexSubagentModel != "" && !strings.Contains(s.CodexSubagentModel, "/") {
 		return fmt.Errorf("the model for Codex's subagents must be a model's id such as codex/gpt-5.5, not %q", s.CodexSubagentModel)
 	}
+	s.DesktopSubagentModel = strings.TrimSpace(s.DesktopSubagentModel)
+	if s.DesktopSubagentModel != "" && !strings.Contains(s.DesktopSubagentModel, "/") {
+		return fmt.Errorf("the model for Claude Desktop's subagents must be a model's id such as deepseek/deepseek-v4, not %q", s.DesktopSubagentModel)
+	}
 	s.Searcher = strings.TrimSpace(s.Searcher)
 	for _, e := range []*string{&s.VisionEffort, &s.SearcherEffort} {
 		if *e = strings.ToLower(strings.TrimSpace(*e)); *e != "" && !slices.Contains(catalog.EffortRank, *e) {
@@ -1215,6 +1244,16 @@ func save(s Settings, recording bool) error {
 		s.CodexAutoReset[i] = strings.ToLower(u)
 	}
 	s.CodexAutoReset = ids(s.CodexAutoReset)
+	only := map[string]string{}
+	for u, c := range s.CodexAutoResetOnly {
+		if u = strings.ToLower(u); (c == "week" || c == "expiring") && slices.Contains(s.CodexAutoReset, u) {
+			only[u] = c
+		}
+	}
+	s.CodexAutoResetOnly = nil
+	if len(only) > 0 {
+		s.CodexAutoResetOnly = only
+	}
 	for i, u := range s.CodexNoCredits {
 		s.CodexNoCredits[i] = strings.ToLower(u)
 	}

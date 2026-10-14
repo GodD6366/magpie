@@ -242,7 +242,8 @@ function gatewayModelsBadge(k) {
     : ms.length ? (ms.length === 1 && !as.length ? ms[0] : t("{n} models", { n: ms.length }))
       : (as.length === 1 ? accountShown(as[0]) : t("{n} accounts", { n: as.length }));
   b.title = (ms.length ? t("Only these models: {list}", { list: ms.join(", ") }) : t("Pick the models this key may use"))
-    + (as.length ? "\n" + t("Only these accounts: {list}", { list: as.map(accountShown).join(", ") }) : "");
+    + (as.length ? "\n" + t("Only these accounts: {list}", { list: as.map(accountShown).join(", ") })
+      + "\n" + t("A provider with no account picked is used on every account; to keep the key off it, pick only other providers' models") : "");
   b.setAttribute("aria-label", t("Models this key may use"));
   b.setAttribute("aria-haspopup", "menu");
   b.setAttribute("aria-expanded", "false");
@@ -255,9 +256,17 @@ function gatewayModelsBadge(k) {
     // by who is signed in, a key by its fingerprint
     const accountsSet = new Set();
     const ofProvider = new Map();
+    // the list holds the key only to the accounts of the providers it
+    // names (#905): a provider none of whose accounts is picked is used on
+    // every one, and its unticked accounts say so (#2077: unticking all of
+    // Codex's left Codex's models served)
+    const named = new Set(as.map((v) => v.split("/")[0].toLowerCase()));
     for (const a of accounts || []) {
       accountsSet.add(a.id);
-      const o = { v: a.id, name: a.name, note: a.plan ? a.providerName + " · " + a.plan : a.providerName, literalName: true };
+      const note = as.length && !named.has(String(a.provider).toLowerCase())
+        ? t("Used: no {provider} account is picked", { provider: a.providerName })
+        : a.plan ? a.providerName + " · " + a.plan : a.providerName;
+      const o = { v: a.id, name: a.name, note, literalName: true };
       ofProvider.set(a.provider, [...(ofProvider.get(a.provider) || []), o]);
     }
     let listed = "";  // the provider whose models the list is in
@@ -333,17 +342,26 @@ function gatewayModelsBadge(k) {
 
 // ---- a gateway key's own limit (#585) ----
 
-// "days" is every N days from when the limit is set or reset (#1509)
-const limitPeriods = ["day", "week", "month", "days"];
-const limitPer = { day: "per day", week: "per week", month: "per month", days: "Every N days" };
-// perWords is a limit's window as the badge says it: "per week", "every 10 days"
-const perWords = (period, days) => period === "days"
+// "days" is every N days from when the limit is set or reset (#1509),
+// "hours" every N hours (#2102), a subscription's 5-hour window's pace
+const limitPeriods = ["day", "week", "month", "days", "hours"];
+const limitPer = { day: "per day", week: "per week", month: "per month", days: "Every N days", hours: "Every N hours" };
+const cyclic = (period) => period === "days" || period === "hours";
+// perWords is a limit's window as the badge says it: "per week", "every
+// 10 days", "every 5 hours"
+const perWords = (period, days, hours) => period === "days"
   ? (days === 1 ? t("every 1 day") : t("every {n} days", { n: days }))
-  : t(limitPer[period] || period);
+  : period === "hours" ? (hours === 1 ? t("every 1 hour") : t("every {n} hours", { n: hours }))
+    : t(limitPer[period] || period);
 // limitDays reads a cycle's days: a whole number from 1 to 3650, else NaN
 function limitDays(v) {
   const s = String(v ?? "").trim();
   return /^\d{1,4}$/.test(s) && +s >= 1 && +s <= 3650 ? +s : NaN;
+}
+// limitHours reads a cycle's hours: a whole number from 1 to 8760, else NaN
+function limitHours(v) {
+  const s = String(v ?? "").trim();
+  return /^\d{1,4}$/.test(s) && +s >= 1 && +s <= 8760 ? +s : NaN;
 }
 
 // limitTokens reads a count as typed: 2000000, 2,000,000, 500k, 2M, 1.5m,
@@ -374,7 +392,7 @@ function gatewayLimitBadge(k) {
     const parts = [];
     if (u.tokenLimit) parts.push(fmtN(u.tokens) + " / " + fmtN(u.tokenLimit));
     if (u.costLimit) parts.push(usd(u.cost) + " / " + usd(u.costLimit));
-    b.textContent = (u.spent ? t("Spent") + " · " : "") + parts.join(" · ") + " · " + perWords(u.period, u.days);
+    b.textContent = (u.spent ? t("Spent") + " · " : "") + parts.join(" · ") + " · " + perWords(u.period, u.days, u.hours);
   }
   b.title = t(u ? "Change this key's limit" : "Set a limit for this key");
   b.setAttribute("aria-label", b.title);
@@ -384,7 +402,7 @@ function gatewayLimitBadge(k) {
     if (gatewayLimit?.id === k.id) gatewayLimit = null;
     else {
       const l = k.limit || {};
-      gatewayLimit = { id: k.id, period: l.period || "day", days: l.days ? String(l.days) : "", tokens: l.tokens ? String(l.tokens) : "", cost: l.cost ? String(l.cost) : "", cacheReads: !!l.cacheReads };
+      gatewayLimit = { id: k.id, period: l.period || "day", days: l.days ? String(l.days) : "", hours: l.hours ? String(l.hours) : "", tokens: l.tokens ? String(l.tokens) : "", cost: l.cost ? String(l.cost) : "", cacheReads: !!l.cacheReads };
     }
     renderGatewayKeys();
   };
@@ -416,7 +434,8 @@ function gatewayLimitEditor(k) {
   const kept = k.limit || {};
   const changed = () => d.period !== (kept.period || "day") || limitTokens(d.tokens) !== (kept.tokens || 0)
     || limitCost(d.cost) !== (kept.cost || 0) || d.cacheReads !== !!kept.cacheReads
-    || (d.period === "days" && limitDays(d.days) !== kept.days);
+    || (d.period === "days" && limitDays(d.days) !== kept.days)
+    || (d.period === "hours" && limitHours(d.hours) !== kept.hours);
   const fields = el("div", "klf");
   // the app's own menu, not a native select
   const period = el("button", "sess-pick klf-period");
@@ -427,8 +446,9 @@ function gatewayLimitEditor(k) {
   const paintPeriod = () => {
     period.dataset.value = d.period;
     period.replaceChildren(el("span", "", t(limitPer[d.period])), svg(CHEV, 11, 1.6));
-    fields.classList.toggle("with-days", d.period === "days");
+    fields.classList.toggle("with-days", cyclic(d.period));
     dl.hidden = d.period !== "days";
+    hl.hidden = d.period !== "hours";
   };
   // the days of a cycle, shown for "every N days"
   const days = input(d.days, "10");
@@ -436,6 +456,12 @@ function gatewayLimitEditor(k) {
   days.inputMode = "numeric";
   const dl = el("label", "klf-field klf-days");
   dl.append(el("span", "klf-name", t("Days")), days);
+  // the hours of a cycle, shown for "every N hours"
+  const hours = input(d.hours, "5");
+  hours.setAttribute("aria-label", t("Hours in a cycle"));
+  hours.inputMode = "numeric";
+  const hl = el("label", "klf-field klf-days klf-hours");
+  hl.append(el("span", "klf-name", t("Hours")), hours);
   paintPeriod();
   const tokens = input(d.tokens, t("No token cap"));
   tokens.setAttribute("aria-label", t("Token limit"));
@@ -449,19 +475,20 @@ function gatewayLimitEditor(k) {
   cl.append(el("span", "klf-name", t("Estimated cost, US$")), cost);
   const pl = el("label", "klf-field");
   pl.append(el("span", "klf-name", t("Window")), period);
-  fields.append(pl, dl, tl, cl);
+  fields.append(pl, dl, hl, tl, cl);
   const cache = el("label", "klf-check");
   const cb = el("input");
   cb.type = "checkbox";
   cb.checked = d.cacheReads;
   cache.append(cb, el("span", "", t("Count cache reads too")));
-  const hint = el("div", "hint", t("Tokens are each call's uncached input, output and cache writes. The cost is an estimate at the Usage page's prices, not a bill. Windows are calendar ones in this computer's time (a week from Monday), or every N days from when the limit is set or reset. Requests from this computer without a key aren't limited."));
+  const hint = el("div", "hint", t("Tokens are each call's uncached input, output and cache writes. The cost is an estimate at the Usage page's prices, not a bill. Windows are calendar ones in this computer's time (a week from Monday), or every N days or N hours from when the limit is set or reset. Requests from this computer without a key aren't limited."));
   const err = el("div", "hint klf-err");
   const unsaved = el("span", "hint munsaved", t("unsaved"));
   unsaved.title = t("Made when you Save; Cancel drops it");
   const save = el("button", "text primary", t("Save"));
   const update = () => {
     const bad = d.period === "days" && Number.isNaN(limitDays(d.days)) ? t("Days is a whole number from 1 to 3650")
+      : d.period === "hours" && Number.isNaN(limitHours(d.hours)) ? t("Hours is a whole number from 1 to 8760")
       : Number.isNaN(limitTokens(d.tokens)) ? t("Tokens is a count, like 2000000 or 2M")
         : Number.isNaN(limitCost(d.cost)) ? t("The cost is US dollars, like 5 or 2.50") : "";
     err.textContent = bad;
@@ -478,14 +505,16 @@ function gatewayLimitEditor(k) {
       paintPeriod();
       update();
       if (v === "days") days.focus({ preventScroll: true });
+      if (v === "hours") hours.focus({ preventScroll: true });
     }, "Limit window", "sess-menu");
   };
   days.oninput = () => { d.days = days.value; update(); };
+  hours.oninput = () => { d.hours = hours.value; update(); };
   tokens.oninput = () => { d.tokens = tokens.value; update(); };
   cost.oninput = () => { d.cost = cost.value; update(); };
   cb.onchange = () => { d.cacheReads = cb.checked; update(); };
   const close = () => { gatewayLimit = null; renderGatewayKeys(); };
-  for (const i of [days, tokens, cost]) i.onkeydown = (e) => {
+  for (const i of [days, hours, tokens, cost]) i.onkeydown = (e) => {
     e.stopPropagation();
     if (e.key === "Escape") close();
     else if (e.key === "Enter" && !save.disabled) save.click();
@@ -498,6 +527,7 @@ function gatewayLimitEditor(k) {
     const tk = limitTokens(d.tokens), c = limitCost(d.cost);
     const limit = tk || c ? { period: d.period, tokens: tk, cost: c, cacheReads: d.cacheReads } : null;
     if (limit && d.period === "days") limit.days = limitDays(d.days);
+    if (limit && d.period === "hours") limit.hours = limitHours(d.hours);
     const out = await gatewayKeyAction("limit-key", { key: k.id, limit });
     if (!out) { update(); return; }
     status(t(limit ? "Limit saved for {name}" : "Limit removed for {name}", { name: k.name }), "ok");
@@ -536,6 +566,7 @@ function askResetLimit(k) {
   head.append(el("b", "", t("Reset {name}'s usage?", { name: k.name })));
   ed.append(head, el("p", "lib-confirm", u.period === "days"
     ? t("The tokens and cost {name} has used go back to 0 together, and a new {n}-day cycle starts now.", { name: k.name, n: u.days })
+    : u.period === "hours" ? t("The tokens and cost {name} has used go back to 0 together, and a new {n}-hour cycle starts now.", { name: k.name, n: u.hours })
     : t("The tokens and cost {name} has used go back to 0 together. Calls so far in this window stop counting; it still resets {when}.", { name: k.name, when: resetClock(new Date(u.reset)) })));
   const bar = el("div", "bar");
   const cancel = el("button", "text", t("Cancel"));

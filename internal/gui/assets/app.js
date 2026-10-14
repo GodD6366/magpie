@@ -3585,7 +3585,9 @@ const MEMORIES = "memories";
 // the model magpie puts every Codex subagent on, whatever its lead asked
 // for (willz on Discord): any model magpie serves (#1633); a subagent
 // whose task a ChatGPT-backed lead sealed stays on its own unless the one
-// set is a ChatGPT account's, the Routing page saying why
+// set is a ChatGPT account's, the Routing page saying why. Claude
+// Desktop's subagent model is the same square: the gateway puts each of
+// its subagents' turns on it
 const SUB_MODEL = "subagent model";
 // Codex's subagents square is [agents] default_subagent_model, the model a
 // subagent starts on only when its lead names none in spawn_agent
@@ -8317,7 +8319,9 @@ function pickedOf(p) {
   const on = p.models.filter((m) => m.on);
   if (!Array.isArray(p.chosen)) return on.map((m) => m.id); // no picks said: those served, as before
   const picks = new Set(p.chosen);
-  return on.filter((m) => picks.has(m.id)).map((m) => m.id);
+  // a pick agents aren't offered for want of its API's URL stays picked
+  // (#2094): it is offered again once the URL is added
+  return p.models.filter((m) => (m.on || m.noAPI) && picks.has(m.id)).map((m) => m.id);
 }
 
 // baseAPIOf is the API a saved provider's Base URL is shown as: the one the
@@ -10146,6 +10150,17 @@ function renderModels(p) {
   // staged as Names & levels stages it, and made with the Save
   const apis = modelAPIs(p);
   const apiNow = (id) => draft.modelPrefs?.[id]?.api ?? p.models.find((m) => m.id === id)?.api ?? "";
+  // a model listed on none of the APIs the provider has a URL for (#2094: a
+  // relay's Claude on /messages alone, at a provider given its chat URL):
+  // agents aren't offered it, so Select all and Free only leave it, and it
+  // is drawn dimmed, saying why. As saved (m.noAPI), or as the API set for
+  // it in this editor makes it
+  const noAPI = (m) => {
+    const set = draft.modelPrefs?.[m.id]?.api;
+    if (set === undefined || !p.speaks?.length) return !!m.noAPI;
+    const on = set ? [set] : (m.auto || []);
+    return on.length > 0 && !on.some((a) => p.speaks.includes(a));
+  };
   const pickAPI = (c, id) => {
     const m = p.models.find((x) => x.id === id) || { id };
     const auto = (m.auto || []).map(apiLabel).join(" · ");
@@ -10273,7 +10288,7 @@ function renderModels(p) {
     // groups alone, those are what the groups use (#1818: drawn as none
     // while the card and the auto groups had all 17); after Select none,
     // none is served
-    const served = draft.chosen.length || decideOnly(p) || draft.none ? new Set() : new Set(p.models.slice(0, 24).map((m) => m.id));
+    const served = draft.chosen.length || decideOnly(p) || draft.none ? new Set() : new Set(p.models.filter((m) => !noAPI(m)).slice(0, 24).map((m) => m.id));
     // a filter is a search: what it doesn't match is left out, picked or not
     for (const m of p.models) {
       const on = draft.chosen.includes(m.id);
@@ -10282,7 +10297,7 @@ function renderModels(p) {
       // asked for: a picked model is never out of sight (#685: 10 picked,
       // 7 shown, and "4 more, filter to find them" with no names to filter by)
       if (shown >= 80 && !f && !showAll && !on) { hidden++; continue; }
-      const c = el("button", "mchip" + (on ? " on" : served.has(m.id) ? " auto" : ""));
+      const c = el("button", "mchip" + (on ? " on" : served.has(m.id) ? " auto" : "") + (noAPI(m) ? " noapi" : ""));
       c.append(el("span", "", m.name && m.name !== m.id ? m.name : m.id));
       // one the plan serves at no cost to it (WorkBuddy's x0.00 credits)
       // or one its vendor names free (#185)
@@ -10295,6 +10310,7 @@ function renderModels(p) {
       if (m.default) c.title = `${m.id} · ${m.default}`;
       else if (m.name && m.name !== m.id) c.title = m.id;
       if (free) c.title = (c.title || m.id) + " · " + t(m.free ? "free: it doesn't use the plan's credits" : "free: so its name says");
+      if (noAPI(m)) c.title = (c.title || m.id) + "\n" + t("{p} has no URL for the API its list serves it on ({apis}), so agents aren't offered it. Add that URL, or set the API it is asked on in Names & levels.", { p: p.name, apis: (apiNow(m.id) ? [apiNow(m.id)] : m.auto || []).map(apiLabel).join(" · ") });
       if (served.has(m.id)) c.title = (c.title || m.id) + "\n" + t(draft.unlisted ? "Routing groups use it: none are picked, so the vendor's list is used" : "Agents see it: none are picked, so the vendor's list is used") + "\n" + t("Click to pick just this model");
       tested(c, m.id);
       menu(c, m.id);
@@ -10719,10 +10735,10 @@ function renderModels(p) {
   // every model at once (those the filter shows, when there is one), or none
   const bulk = el("div", "mbulk");
   const allOn = el("button", "text action", t("Select all"));
-  allOn.title = t("Pick every model listed (those the filter shows)");
+  allOn.title = t("Pick every model listed that this provider can serve (those the filter shows)");
   allOn.onclick = () => {
     const f = (q?.value || "").trim().toLowerCase();
-    const ids = p.models.filter((m) => !f || m.id.toLowerCase().includes(f) || (m.name || "").toLowerCase().includes(f) || (m.default || "").toLowerCase().includes(f)).map((m) => m.id);
+    const ids = p.models.filter((m) => !noAPI(m)).filter((m) => !f || m.id.toLowerCase().includes(f) || (m.name || "").toLowerCase().includes(f) || (m.default || "").toLowerCase().includes(f)).map((m) => m.id);
     draft.chosen = [...draft.chosen, ...ids.filter((id) => !draft.chosen.includes(id))];
     draft.none = true;
     draw();
@@ -10740,7 +10756,7 @@ function renderModels(p) {
     freeOn.title = t("Pick only the free models (those the filter shows), unpicking the others");
     freeOn.onclick = () => {
       const f = (q?.value || "").trim().toLowerCase();
-      draft.chosen = p.models.filter((m) => isFree(m) && (!f || m.id.toLowerCase().includes(f) || (m.name || "").toLowerCase().includes(f) || (m.default || "").toLowerCase().includes(f))).map((m) => m.id);
+      draft.chosen = p.models.filter((m) => isFree(m) && !noAPI(m) && (!f || m.id.toLowerCase().includes(f) || (m.name || "").toLowerCase().includes(f) || (m.default || "").toLowerCase().includes(f))).map((m) => m.id);
       draft.none = true;
       draw();
     };
@@ -12391,7 +12407,11 @@ function renderLoginImport(sub) {
     box.append(tt);
     const done = el("button", "text", t("Done"));
     done.onclick = cancelSignIn;
-    box.append(done);
+    // the next batch is one click away, beside the last one's results,
+    // rather than behind Done (#2131: several Antigravity exports in a row)
+    const more = el("button", "text primary", t("Import more…"));
+    more.onclick = () => startImport(sub.agent);
+    box.append(done, more);
     return box;
   }
   box.append(el("span", "mark", "↑"));
@@ -13044,6 +13064,36 @@ function quotaText(w) {
   const pct = t(quotaLeft ? "{n} left" : "{n} used", { n: (Number.isInteger(n) ? n : n.toFixed(1)) + "%" });
   const count = quotaCount(w);
   return count ? count + " · " + pct : pct;
+}
+// quotaPace: how far a window is from an even pace through it, as a
+// number (fflake33 on Discord): the figure the meter shows less what an
+// even pace would show by now, in points of the window, rounded — used
+// 60% halfway through is +10, and left it is −10; null where the window's
+// start or reset isn't known (startsAt is the gateway's,
+// provider.WithWindowStarts). over says more is used than an even pace
+// would have, whichever way the meter reads.
+function quotaPace(w, now = Date.now()) {
+  if (w.unlimited || w.historyMissing || !w.startsAt || !w.resetsAt) return null;
+  const s = Date.parse(w.startsAt), e = Date.parse(w.resetsAt);
+  if (!(e > s) || now < s || now >= e) return null;
+  const d = Math.max(0, Math.min(100, w.used)) - (100 * (now - s)) / (e - s);
+  const n = Math.round(quotaLeft ? -d : d);
+  return { n: n === 0 ? 0 : n, over: Math.round(d) > 0, under: Math.round(d) < 0, by: Math.abs(Math.round(d)) };
+}
+// paceNumber: +12%, −8% (a true minus), ±0%
+function paceNumber(n) {
+  return (n > 0 ? "+" : n < 0 ? "−" : "±") + Math.abs(n) + "%";
+}
+// paceLine: a window's Pace number for its reset line, with what it means
+// in its tooltip; null with none
+function paceLine(w) {
+  const p = quotaPace(w);
+  if (!p) return null;
+  const span = el("span", "quota-pace" + (p.over ? " over" : ""), t("Pace {n}", { n: paceNumber(p.n) }));
+  span.title = p.over ? t("{n} more of this window is used than an even pace through it would have used by now: at this rate it runs out before it resets", { n: p.by + "%" })
+    : p.under ? t("{n} less of this window is used than an even pace through it would have used by now: at this rate it lasts until it resets", { n: p.by + "%" })
+    : t("Right on an even pace through this window");
+  return span;
 }
 // quotaCount: a window's own count, when its vendor counts in amounts
 // (WorkBuddy's credits, #659) — "355 / 500 credits" used, or what is left
@@ -15052,13 +15102,19 @@ function packUsage() {
 }
 // a card's height or the page's width moved: packed again on the next frame
 // (in the observer's own call the change is owed to it in the same frame,
-// which WebKit reports as a ResizeObserver loop)
+// which WebKit reports as a ResizeObserver loop). A packed card is held to
+// the rows it was given, so one whose content only shrinks (a curve made
+// small again) keeps its own size: what is in it is watched too (#2059,
+// mengyianx: 剩余额度走势 closed left the box as tall as when open).
 const usagePack = new ResizeObserver(() => { if (!usagePackFrame) usagePackFrame = requestAnimationFrame(packUsage); });
 function packUsageNow(list) {
   packUsage();
   usagePack.disconnect();
   usagePack.observe(list);
-  for (const card of list.children) usagePack.observe(card);
+  for (const card of list.children) {
+    usagePack.observe(card);
+    for (const part of card.children) usagePack.observe(part);
+  }
 }
 
 // usageHandle is a card's logo, which is also its handle: drag it to move
@@ -15362,22 +15418,32 @@ function drawQuotaPlot(g, lines, x0, x1, w, h, now, thin) {
   if (!thin) for (const v of [0, 50, 100]) g.append(sv("line", { x1: 0, x2: w, y1: h - (v / 100) * h, y2: h - (v / 100) * h, class: "qc-grid" }));
   const X = (t) => ((t - x0) / (x1 - x0)) * w;
   lines.forEach((l, i) => {
-    const color = `var(--c${(i % 7) + 1})`;
+    // data-series is the window's colour, and in colorblind mode its dash
+    const s = i % 7, color = `var(--c${s + 1})`;
     const c = l.cycle || quotaCycle(l, now);
     // a window far shorter than the span (a 5-hour one over a week) is
     // drawn faint, without its even burn, an all but upright dash
     const short = !thin && c.reset && c.reset - c.start < (x1 - x0) / 12;
     if (c.reset && c.start < c.reset && !short) {
-      const e = sv("line", { x1: X(c.start), y1: 0, x2: X(c.reset), y2: h, class: "qc-even" }, { stroke: color });
+      const e = sv("line", { x1: X(c.start), y1: 0, x2: X(c.reset), y2: h, class: "qc-even", "data-series": s }, { stroke: color });
       g.append(e);
     }
     const d = quotaPaths(l.points, x0, x1, w, h);
-    if (d) g.append(sv("path", { d, class: "qc-line" + (short ? " qc-short" : ""), "data-name": l.name }, { stroke: color }));
+    if (d) g.append(sv("path", { d, class: "qc-line" + (short ? " qc-short" : ""), "data-name": l.name, "data-series": s }, { stroke: color }));
   });
   // a spark ends at now already, and in 16px the dotted now line read as a
   // stray mark under the curve (#1601); the large curve keeps it
   if (!thin && now >= x0 && now <= x1) g.append(sv("line", { x1: X(now), x2: X(now), y1: 0, y2: h, class: "qc-now" }));
 }
+// what the dashes are isn't plain from the plot (John on Discord asked);
+// colorblind mode dashes the windows and dots the even paces. applyPrefs
+// sets it again on every drawn curve when the mode changes.
+function quotaCurveTitle() {
+  return document.documentElement.dataset.colorblind
+    ? t("Each window's line has the dash shown beside its name. Dotted: an even pace, full at the cycle's start to empty at its reset; a line above its dots lasts the cycle, one below runs out before the reset.")
+    : t("Solid: what was left. Dashed: an even pace, full at the cycle's start to empty at its reset; a line above its dashes lasts the cycle, one below runs out before the reset.");
+}
+
 // quotaCurve: an account's windows over time, under its meters, with the
 // range turned for every card at once
 function quotaCurve(sub) {
@@ -15390,8 +15456,6 @@ function quotaCurve(sub) {
   range.type = "button";
   const key = usageAcctKey(sub);
   head.append(el("span", "", t("Left over time")), range);
-  // what the dashes are isn't plain from the plot (John on Discord asked)
-  box.title = t("Solid: what was left. Dashed: an even pace, full at the cycle's start to empty at its reset; a line above its dashes lasts the cycle, one below runs out before the reset.");
   const W = 300, H = 60;
   const g = sv("svg", { viewBox: `0 0 ${W} ${H}`, preserveAspectRatio: "none", class: "qc-plot", role: "img" });
   curveZoom(box, g);
@@ -15401,11 +15465,16 @@ function quotaCurve(sub) {
     legend.replaceChildren();
     shown.forEach((l, i) => {
       const k = el("span", "qc-key");
+      const s = i % 7, color = `var(--c${s + 1})`;
+      k.dataset.series = s;
       const sw = el("i");
-      sw.style.background = `var(--c${(i % 7) + 1})`;
+      sw.style.background = color;
+      // colorblind mode shows this for the dot: the window's line in its dash
+      const sample = sv("svg", { class: "qc-sample", viewBox: "0 0 22 6", "aria-hidden": "true" });
+      sample.append(sv("line", { x1: 1, y1: 3, x2: 21, y2: 3, class: "qc-dash", "data-series": s }, { stroke: color }));
       const last = l.points[l.points.length - 1];
       if (!last) return;
-      k.append(sw, el("span", "", l.label), el("b", "", Math.round(last.left) + "%"));
+      k.append(sw, sample, el("span", "", l.label), el("b", "", Math.round(last.left) + "%"));
       k.title = [t("{name}: {n} left, read {when}", { name: l.label, n: Math.round(last.left) + "%", when: quotaTimeText(last.at, now) }),
         "", t("Latest readings:"), ...quotaReadings(l, now)].join("\n");
       legend.append(k);
@@ -15421,6 +15490,7 @@ function quotaCurve(sub) {
     // at its end belongs to the next cycle, not this cycle's last figure.
     const shown = history?.shown || lines;
     drawQuotaPlot(g, shown, x0, Math.max(x0 + 1, x1), W, H, now);
+    box.title = quotaCurveTitle();
     const r = picked ? t("Past cycle") : t(quotaRange === "2d" ? "2 days" : "Cycle");
     range.textContent = r;
     range.disabled = quotaRange !== "cycle" || !past.cycles.length;
@@ -15542,8 +15612,14 @@ function setQuotaRange(id) {
   // A range also restores today's meters when leaving a historical cycle.
   renderQuotas();
 }
-// quotaSpark: the tray card's thin line of a window's current cycle, the
-// even burn faint under it; none while the curves are off
+// quotaSpark: the tray card's line of a window's current cycle, the even
+// burn faint under it; none while the curves are off. In a card's width a
+// month drawn in a few pixels' height read as one straight line, its dashes
+// all but on it (#2079): it is taller, and the gap between what was left and
+// the even burn is shaded, green where it is above (it lasts) and amber
+// where it is below (it runs out first), so which side it is on shows
+// without reading an angle.
+let sparkClips = 0;
 function quotaSpark(q, w) {
   if (quotaRange === "off") return null;
   const lines = quotaLines({ ...q, windows: [w.window ? { ...w, name: w.window } : w] });
@@ -15551,14 +15627,50 @@ function quotaSpark(q, w) {
   const now = Date.now(), c = quotaCycle(lines[0], now);
   const x1 = c.reset || now;
   if (!(c.start < x1)) return null;
-  const W = 200, H = 16;
+  const W = 200, H = 30;
   const g = sv("svg", { viewBox: `0 0 ${W} ${H}`, preserveAspectRatio: "none", class: "pq-spark", role: "img" });
   g.setAttribute("aria-label", t("{name}: this cycle", { name: t(w.name) }));
   drawQuotaPlot(g, lines, c.start, x1, W, H, now, true);
+  const gap = c.reset && sparkGap(lines[0].points, c.start, c.reset, now, W, H);
+  if (gap) g.prepend(gap);
   const s = el("span", "pq-spark-box");
   s.title = t("{name}: what was left this cycle, against an even burn", { name: t(w.name) });
+  const pace = quotaPace(w, now);
+  if (pace) s.title += "\n" + t("Pace {n}", { n: paceNumber(pace.n) });
   s.append(g);
   return s;
+}
+// sparkGap: the shading between a cycle's readings and its even burn (the
+// diagonal from full at start to empty at reset) on a w×h box, one band
+// clipped to above the diagonal and one to below it; null with fewer than
+// two readings of this cycle
+function sparkGap(points, start, reset, now, w, h) {
+  let pts = [];
+  for (const p of points) {
+    if (p.at < start || p.at > now) continue;
+    if (pts.length && quotaCycleBreak(pts[pts.length - 1], p)) pts = [];
+    pts.push(p);
+  }
+  if (pts.length < 2) return null;
+  const X = (at) => ((at - start) / (reset - start)) * w;
+  const Y = (v) => h - (Math.max(0, Math.min(100, v)) / 100) * h;
+  const E = (at) => ((at - start) / (reset - start)) * h; // the even burn's y
+  const a = pts[0].at, b = pts[pts.length - 1].at;
+  const poly = pts.map((p) => X(p.at).toFixed(1) + "," + Y(p.left).toFixed(1))
+    .concat([X(b).toFixed(1) + "," + E(b).toFixed(1), X(a).toFixed(1) + "," + E(a).toFixed(1)]).join(" ");
+  const id = "spark-gap-" + ++sparkClips;
+  const box = sv("g", { class: "pq-gap" });
+  const defs = sv("defs");
+  // above the diagonal, on screen, is more left than an even burn
+  const above = sv("clipPath", { id: id + "-a" });
+  above.append(sv("polygon", { points: `0,0 ${w},0 ${w},${h}` }));
+  const below = sv("clipPath", { id: id + "-b" });
+  below.append(sv("polygon", { points: `0,0 0,${h} ${w},${h}` }));
+  defs.append(above, below);
+  box.append(defs,
+    sv("polygon", { points: poly, class: "pq-gap-ahead", "clip-path": `url(#${id}-a)` }),
+    sv("polygon", { points: poly, class: "pq-gap-behind", "clip-path": `url(#${id}-b)` }));
+  return box;
 }
 
 // planTerm says when a plan's paid time ends: renewed then, over, or
@@ -16309,7 +16421,7 @@ function resetsWords(r, q) {
     // whether the one that runs out first is kept from going to waste:
     // with Auto-use on it is used shortly before it does (#624, #719)
     if (q && autoResetKept(q)) {
-      const on = autoResetOn(q);
+      const on = autoResetWhen(q).expiring;
       w.append(el("span", "resets-kept" + (on ? " on" : ""), " · " + t(on ? "auto-used before it expires" : "not auto-used")));
       w.title += "\n" + t(on ? "Auto-use is on: the reset that runs out first is used about half an hour before it does, if this account's windows have been used, so what they have left can be used until then and it isn't lost; at once if the account is held up until after then."
         : "Auto-use is off: the reset that runs out first is lost unless it's used by hand before then.");
@@ -16351,23 +16463,61 @@ function autoResetKept(q) {
   return !!(q.user && AUTO_RESET_KEPT[q.provider] && !q.resets?.byWindow);
 }
 function autoResetOn(q) {
-  return autoResetKept(q) && !!(state.settings?.[AUTO_RESET_KEPT[q.provider]] || []).includes(q.user.toLowerCase());
+  const w = autoResetWhen(q);
+  return w.week || w.expiring;
+}
+// autoResetWhen: at which of the two times the account uses one by itself,
+// each its own switch (#2078, alanwalk: Codex resets the week often enough
+// that a used-up week is worth waiting out, while a card about to run out
+// isn't); an account not kept to one (codexAutoResetOnly) uses one at both.
+function autoResetWhen(q) {
+  if (!autoResetKept(q) || !(state.settings?.[AUTO_RESET_KEPT[q.provider]] || []).includes(q.user.toLowerCase())) return { week: false, expiring: false };
+  return autoResetWhenOf(state.settings?.codexAutoResetOnly?.[q.user.toLowerCase()]);
+}
+function autoResetWhenOf(only) {
+  return { week: only !== "expiring", expiring: only !== "week" };
+}
+// AUTO_RESET_CASES: the two times, in the order they're shown, with their
+// words and what each switch's title says on and off.
+const AUTO_RESET_CASES = [
+  { id: "week", say: "when its week runs out",
+    on: "On: a reset is used by itself when this account's week is used up and no other account can answer, one a week at most. The five hours running out never uses one. Click to turn it off.",
+    off: "Off: a used-up week is waited out, and the vendor may start it again sooner; requests go to your other accounts, or are refused with why. Click to turn it on." },
+  { id: "expiring", say: "before one expires",
+    on: "On: the reset that runs out first is used about half an hour before it does, if this account's windows have been used, or at once when the account is held up until after then. Click to turn it off.",
+    off: "Off: a reset that runs out unused is lost. Click to turn it on." },
+];
+// autoResetStatus says what the account does now, after a switch.
+function autoResetStatus(user, w) {
+  if (w.week && w.expiring) return t("{who} uses a reset by itself when its week runs out, or before one expires", { who: user });
+  if (w.week) return t("{who} uses a reset by itself only when its week runs out", { who: user });
+  if (w.expiring) return t("{who} uses a reset by itself only before one expires", { who: user });
+  return t("{who} no longer uses a reset by itself", { who: user });
 }
 
 // autoResetRow is that say on an account's card, whether or not it holds a
-// reset now, so it can be set ahead of one (#719): both times it uses one,
-// in words, and the switch.
+// reset now, so it can be set ahead of one (#719): each of the two times it
+// uses one on a line of its own, in words, with its switch (#2078).
 function autoResetRow(q, cls) {
   if (!autoResetKept(q)) return null;
   const on = autoResetOn(q);
-  const row = el("div", cls + (on ? " on" : ""));
+  const row = el("div", cls + " ar-split" + (on ? " on" : ""));
   const say = el("span", "ar-say");
-  say.append(el("b", "", t("Auto-use resets:")), document.createTextNode(" " + t("when the week runs out, or before one expires")));
-  say.title = autoResetTitle(on);
+  say.append(el("b", "", t("Auto-use resets:")));
   const used = resetsUsedLine(q);
   if (used) say.append(used);
+  const cases = el("div", "ar-cases");
+  const w = autoResetWhen(q);
+  for (const c of AUTO_RESET_CASES) {
+    const line = el("div", "ar-case" + (w[c.id] ? " on" : ""));
+    line.dataset.case = c.id;
+    const words = el("span", "ar-case-say", t(c.say));
+    words.title = t(w[c.id] ? c.on : c.off);
+    line.append(words, autoResetButton(q, c));
+    cases.append(line);
+  }
   row.dataset.user = q.user;
-  row.append(say, autoResetButton(q));
+  row.append(say, cases);
   return row;
 }
 
@@ -16408,30 +16558,35 @@ function autoResetBrief(q) {
   const s = el("span", "acct-auto" + (on ? " on" : ""));
   if (q.resets?.count) s.append(el("span", "acct-auto-n", "↺ " + q.resets.count + " ·"));
   s.append(el("span", "acct-auto-say", t("Auto-use")), autoResetButton(q));
-  s.title = (q.resets?.count ? t(q.resets.count === 1 ? "1 reset" : "{n} resets", { n: q.resets.count }) + "\n" : "") + autoResetTitle(on);
+  const w = autoResetWhen(q);
+  s.title = (q.resets?.count ? t(q.resets.count === 1 ? "1 reset" : "{n} resets", { n: q.resets.count }) + "\n" : "")
+    + t("Auto-use resets:") + "\n" + AUTO_RESET_CASES.map((c) => "· " + t(c.say) + ": " + t(w[c.id] ? "On" : "Off")).join("\n");
   const used = resetsUsedLine(q);
   if (used) s.title += "\n" + used.textContent;
   return s;
 }
 
-// autoResetButton turns that on or off: a switch, its words beside it.
-function autoResetButton(q) {
-  const on = autoResetOn(q);
+// autoResetButton turns that on or off: a switch, its words beside it. With
+// c (one of AUTO_RESET_CASES), at that time alone, the other kept; without,
+// the brief's switch, at both: off when either is on, else on at both.
+function autoResetButton(q, c) {
+  const on = c ? autoResetWhen(q)[c.id] : autoResetOn(q);
   const b = el("button", "lib-switch auto-reset" + (on ? " on" : ""));
   b.type = "button";
   b.setAttribute("role", "switch");
   b.setAttribute("aria-checked", String(on));
-  b.setAttribute("aria-label", t("Auto-use resets"));
-  b.title = autoResetTitle(on);
+  b.setAttribute("aria-label", t("Auto-use resets") + (c ? " · " + t(c.say) : ""));
+  b.title = c ? t(on ? c.on : c.off) : autoResetTitle(on);
+  if (c) b.dataset.case = c.id;
   b.append(el("i"));
   b.onclick = async (e) => {
     e.stopPropagation();
     if (b.disabled) return;
     b.disabled = true;
     try {
-      prefs = await writingPrefs(api("settings/" + q.provider + "-auto-reset", { user: q.user, on: !on }));
+      prefs = await writingPrefs(api("settings/" + q.provider + "-auto-reset", c ? { user: q.user, on: !on, when: c.id } : { user: q.user, on: !on }));
       state.settings = prefs;
-      status(t(on ? "{who} no longer uses a reset by itself" : "{who} uses a reset by itself when its week runs out, or before one expires", { who: q.user }), "ok");
+      status(autoResetStatus(q.user, autoResetWhen(q)), "ok");
       renderQuotas();
       if ($("#codexAutoResetRow")) renderAutoResetOwn(prefs); // Settings › Usage says the same
     } catch (err) {
@@ -16925,6 +17080,24 @@ function holdsLine(h) {
   return line;
 }
 
+// holdsWhy: why a window's whole isn't told (provider.Holds*), for
+// holdsUnknownLine's tooltip; a reason not listed here says nothing.
+const holdsWhy = {
+  low: () => t("Under {n}% of it is used: a rounded share that small is too coarse to scale up", { n: 5 }),
+  clock: () => t("Its reset time isn't known, so neither is when it began"),
+  log: () => t("It began before magpie's request log, so some of its calls weren't seen"),
+  none: () => t("magpie hasn't routed a call through this account in it yet"),
+  credits: () => t("A call in it may have been paid from credits or extra usage, not from the window"),
+};
+// holdsUnknownLine: a window whose whole the server couldn't reckon
+// (#2045): "not enough data", muted, and why in its tooltip, where it said
+// nothing before and a reader couldn't tell a gap from a fault.
+function holdsUnknownLine(why) {
+  const line = el("span", "quota-holds-why", t("Whole: not enough data"));
+  line.title = t("The whole window can't be estimated from magpie's calls yet") + "\n" + holdsWhy[why]();
+  return line;
+}
+
 // isKeyCard: the card of a remote magpie's gateway keys (#1547,
 // remote_key_limits.go), "<remote>/~keys", one account per key; quotaName
 // says so by its name, which is the remote's.
@@ -16933,13 +17106,14 @@ function quotaName(q) {
   return isKeyCard(q) ? t("Gateway keys · {name}", { name: q.name }) : q.name;
 }
 // keyLimitLine: what a gateway key's windows don't say: the length of a
-// cycle of days, the calls made in it, that it is used up, and calls with
+// cycle of days or hours, the calls made in it, that it is used up, and calls with
 // no known price that leave its spend low.
 function keyLimitLine(sub) {
   const g = sub.gatewayKey;
   if (!g?.limited || sub.error) return null;
   const parts = [];
   if (g.period === "days" && g.days) parts.push(t(g.days === 1 ? "1-day cycle" : "{n}-day cycle", { n: g.days }));
+  if (g.period === "hours" && g.hours) parts.push(t(g.hours === 1 ? "1-hour cycle" : "{n}-hour cycle", { n: g.hours }));
   if (g.calls) parts.push(t(g.calls === 1 ? "1 call" : "{n} calls", { n: g.calls }));
   if (g.spent) parts.push(t("Used up: that computer refuses this key until it resets"));
   if (g.unpriced && g.costLeft != null) parts.push(t(g.unpriced === 1 ? "{n} call had no known price and is not counted" : "{n} calls had no known price and are not counted", { n: g.unpriced }));
@@ -17006,6 +17180,13 @@ function quotaWindows(sub) {
       quota.append(r);
       quota.title = sub.history ? t("Last reading {when}", { when: quotaCycleDate(w.recordedAt) }) : resetText(at, at.toLocaleString(intlLang()));
     }
+    // how far it is from an even pace through the window, as a number
+    // (fflake33 on Discord), on the reset's line
+    const pace = !sub.history && r ? paceLine(w) : null;
+    if (pace) {
+      r.lastChild.textContent += " ·";
+      r.append(" ", pace);
+    }
     // credits that run out before then, or with no reset at all
     const out = runsOutText(w);
     if (out) {
@@ -17019,6 +17200,10 @@ function quotaWindows(sub) {
     if (w.holds) {
       if (!r) quota.append(r = el("div", "quota-reset"));
       r.append(holdsLine(w.holds));
+    } else if (w.holdsWhy && holdsWhy[w.holdsWhy] && !sub.history) {
+      // and where it can't be told, so, and why in its tooltip (#2045)
+      if (!r) quota.append(r = el("div", "quota-reset"));
+      r.append(holdsUnknownLine(w.holdsWhy));
     }
     // a model family's figure: its models, level by level, in its tooltip
     if (w.tiers) quota.title = t("{family}: the most used of its models", { family: w.name }) + "\n" + tiersText(w);
@@ -20413,6 +20598,13 @@ function applyPrefs(s, rate) {
       if (applyPrefs.ready) { tintPanel(450); tintTitleBar(460); }
     }
   }
+  if (!!s.colorblind !== !!root.dataset.colorblind) {
+    if (s.colorblind) root.dataset.colorblind = "1";
+    else delete root.dataset.colorblind;
+    // a curve drawn already keeps its lines (CSS dashes them), but its
+    // tooltip says which mode it was drawn in
+    for (const b of document.querySelectorAll(".quota-curve:not(.balance-curve)")) b.title = quotaCurveTitle();
+  }
   applyPrefs.ready = true;
   // accounts hidden while personal data is masked, until chosen otherwise
   window.hideAccounts?.follow(!!s.redactPersonal);
@@ -20813,6 +21005,8 @@ function renderSettings() {
   prefsBase = keep;
   renderFonts(s);
   $("#themeSegs").replaceChildren(segs(THEMES.map(([id, name]) => [id, t(name)]), s.theme, (theme) => savePrefs({ ...keep, theme })));
+  $("#colorblindSegs").title = t("Colorblind-safe chart colors, and each allowance window's line in a dash of its own");
+  $("#colorblindSegs").replaceChildren(segs([["off", t("Off")], ["on", t("On")]], s.colorblind ? "on" : "off", (v) => savePrefs({ ...keep, colorblind: v === "on" })));
   renderLangPick(s, keep);
   renderGatewayMode(s);
   // a browser tab has its own zoom, and magpie leaves it to it
@@ -20973,6 +21167,10 @@ function renderSettings() {
   row(t("Check every"), s.noAutoUpdate ? t("While automatic updates are on") : t("How often magpie looks for a newer version"), "",
     segs(UPDATE_EVERY.map((m) => [m, m < 60 ? t("{n} min", { n: m }) : t("{n} h", { n: m / 60 })]), s.updateEvery || 360,
       (updateEvery) => savePrefs({ ...keep, updateEvery }))).classList.add("update-every-row", ...(s.noAutoUpdate ? ["off"] : []));
+  // whether a downloaded update is restarted into by itself, once no agent
+  // request is in flight (#2096); off, it waits for Restart or for quitting
+  row(t("Restart automatically"), s.noAutoUpdate ? t("While automatic updates are on") : t("Once an update is downloaded, restarts into it when no agent request is in flight"), "",
+    segs([["off", t("Off")], ["on", t("On")]], s.autoRestart ? "on" : "off", (v) => savePrefs({ ...keep, autoRestart: v === "on" }))).classList.add("update-restart-row", ...(s.noAutoUpdate ? ["off"] : []));
   renderUpdateMirror(row(t("Download source"), "", ""), s);
   const open = el("button", "text", t("Open"));
   open.onclick = () => api("settings/reveal", {}).catch((e) => status(e.message, "err"));
@@ -21745,6 +21943,11 @@ function renderTrayUsage(s, keep) {
   $("#trayBirdRow").hidden = !ids.length || !mac;
   $("#trayBirdSegs").replaceChildren(segs([["off", t("Off")], ["on", t("On")]], s.trayNoBird ? "off" : "on",
     (v) => savePrefs({ ...keep, trayNoBird: v === "off" })));
+  // and each window's Pace number beside its figure (fflake33), off unless
+  // asked for, as it widens every card; not where the tray shows no text
+  $("#trayPaceRow").hidden = !ids.length || document.documentElement.classList.contains("win");
+  $("#trayPaceSegs").replaceChildren(segs([["off", t("Off")], ["on", t("On")]], s.trayPace ? "on" : "off",
+    (v) => savePrefs({ ...keep, trayPace: v === "on" })));
 }
 const TRAY_EVERY = [1, 3, 5, 10, 30];
 // the totals the menu bar can show beside the allowances (gui.trayTotal)
@@ -21865,6 +22068,65 @@ function renderProxy(s, keep) {
   modes.onpointerdown = () => { picking = true; };
   for (const button of modes.querySelectorAll("button")) button.onblur = saveOnLeave;
   row.append(modes);
+  renderProxyCheck(s, row);
+}
+
+// renderProxyCheck: Test (#2076, c4ex), whether the proxy in force is the
+// way magpie's requests leave. POST /api/proxy/check asks Cloudflare's
+// trace page through it, as a vendor request goes, and direct; the line
+// under the row's text says the address each left from. The same address
+// both ways says the proxy isn't taking them. A result is kept until the
+// proxy changes, so a redraw doesn't drop it.
+let proxyCheck = null; // { key, busy, out, err }
+function renderProxyCheck(s, row) {
+  const key = (s.proxySource || "") + "|" + (s.proxyNow || "");
+  if (proxyCheck && proxyCheck.key !== key && !proxyCheck.busy) proxyCheck = null;
+  const test = el("button", "text proxy-test", proxyCheck?.busy ? t("Testing…") : t("Test"));
+  test.title = t("Ask Cloudflare through the proxy and direct, and compare the addresses the two leave from");
+  test.disabled = !!proxyCheck?.busy;
+  test.onclick = () => {
+    proxyCheck = { key, busy: true };
+    renderProxyCheck(s, row);
+    api("proxy/check", {})
+      .then((out) => { proxyCheck = { key, out }; })
+      .catch((e) => { proxyCheck = { key, err: t(e.message) }; })
+      .finally(() => {
+        // Settings may have been drawn again meanwhile: draw on the row there now
+        const now = row.isConnected ? row : document.querySelector("#proxySegs .proxy-controls");
+        if (now) renderProxyCheck(now === row ? s : prefs, now);
+      });
+  };
+  row.querySelector(".proxy-test")?.remove();
+  row.prepend(test);
+  let line = document.getElementById("proxyCheck");
+  if (!line) {
+    line = el("div", "sub proxy-check");
+    line.id = "proxyCheck";
+    line.setAttribute("role", "status");
+    $("#proxySub").after(line);
+  }
+  const [text, bad] = proxyCheckText(proxyCheck);
+  line.hidden = !text;
+  line.textContent = line.title = text;
+  line.classList.toggle("err", bad);
+}
+
+// proxyCheckText: what the test found, and whether it is a failure.
+function proxyCheckText(c) {
+  if (!c || c.busy) return ["", false];
+  if (c.err) return [t("The test couldn't run: {error}", { error: c.err }), true];
+  const where = (leg) => leg.loc ? `${leg.ip} (${leg.loc})` : leg.ip;
+  const d = c.out?.direct || {};
+  const direct = d.ip ? where(d) : t("nowhere, they fail ({error})", { error: d.error || "" });
+  const via = c.out?.through;
+  if (!via) {
+    return d.ip
+      ? [t("No proxy in force: requests leave from {where}, {ms} ms", { where: where(d), ms: d.ms || 0 }), false]
+      : [t("No proxy in force, and a direct request failed: {error}", { error: d.error || "" }), true];
+  }
+  if (!via.ip) return [t("The proxy failed: {error}. Direct requests leave from {direct}", { error: via.error || "", direct }), true];
+  if (d.ip && via.ip === d.ip) return [t("Through the proxy requests leave from {where}, the same address as direct ones: they leave as if there were no proxy", { where: where(via) }), true];
+  return [t("Works: through the proxy requests leave from {where}, {ms} ms; direct ones from {direct}", { where: where(via), ms: via.ms || 0, direct }), false];
 }
 
 // renderGitHubToken: the GitHub token the library's requests to GitHub's
@@ -21998,21 +22260,32 @@ function renderAutoResetOwn(s) {
     const name = el("div", "name", user);
     name.title = user;
     who.append(name);
-    const was = on.includes(user.toLowerCase());
-    const pick = segs([["off", t("Off")], ["on", t("On")]], was ? "on" : "off", async (v) => {
-      try {
-        prefs = await writingPrefs(api("settings/codex-auto-reset", { user, on: v === "on" }));
-        if (state) state.settings = prefs;
-        status(t(v === "on" ? "{who} uses a reset by itself when its week runs out, or before one expires" : "{who} no longer uses a reset by itself", { who: user }), "ok");
-        renderSettings();
-        if (quotas) renderQuotas(); // the account's card says the same
-      } catch (e) {
-        status(t(e.message), "err");
-        renderSettings();
-      }
-    });
-    pick.setAttribute("aria-label", t("Auto-use resets") + " · " + user);
-    r.append(who, pick);
+    // each of the two times its own Off/On (#2078)
+    const was = on.includes(user.toLowerCase()) ? autoResetWhenOf(s.codexAutoResetOnly?.[user.toLowerCase()]) : { week: false, expiring: false };
+    const cases = el("div", "ar-own-cases");
+    for (const c of AUTO_RESET_CASES) {
+      const line = el("div", "ar-own-case");
+      line.dataset.case = c.id;
+      const say = el("span", "ar-own-say", t(c.say));
+      say.title = t(was[c.id] ? c.on : c.off);
+      const pick = segs([["off", t("Off")], ["on", t("On")]], was[c.id] ? "on" : "off", async (v) => {
+        try {
+          prefs = await writingPrefs(api("settings/codex-auto-reset", { user, on: v === "on", when: c.id }));
+          if (state) state.settings = prefs;
+          const now = (prefs.codexAutoReset || []).includes(user.toLowerCase()) ? autoResetWhenOf(prefs.codexAutoResetOnly?.[user.toLowerCase()]) : { week: false, expiring: false };
+          status(autoResetStatus(user, now), "ok");
+          renderSettings();
+          if (quotas) renderQuotas(); // the account's card says the same
+        } catch (e) {
+          status(t(e.message), "err");
+          renderSettings();
+        }
+      });
+      pick.setAttribute("aria-label", t("Auto-use resets") + " · " + t(c.say) + " · " + user);
+      line.append(say, pick);
+      cases.append(line);
+    }
+    r.append(who, cases);
     after.after(r);
     after = r;
   }
@@ -22332,11 +22605,43 @@ function renderImageGen(s, keep, box) {
   // a picked model magpie can't find any more is said, as Image recognition's
   const gone = v && v === s.imageGenMissing;
   const r = el("div", "row pref");
+  r.id = "imageGenRow";
   const who = el("div", "who");
-  const sub = el("div", "sub",
+  // An agent draws once it has the Magpie Image tool, which the Library
+  // gives it. The Library can be switched off (Essentials leaves it off)
+  // and gateway mode has none, so the row says how to get there from
+  // where the reader is, and takes them (#2091, nailuoGG)
+  const libOff = featuresOff.has("library");
+  const sub = el("div", "sub wraps",
     v === "off" ? t("Agents given Magpie Image can't generate images or videos: the tool says it is off")
-    : t("The model Magpie Image draws with. Give an agent the tool from Library → MCP servers → Discover → Magpie Image; images are saved in its project"));
+    : gatewayMode ? t("The model Magpie Image draws with, for the agents given the Magpie Image tool; images are saved in their project")
+    : libOff ? t("The model Magpie Image draws with. Agents get the Magpie Image tool from the Library, which is turned off in Plugins › Built-in; images are saved in their project")
+    : t("The model Magpie Image draws with. Agents get the Magpie Image tool from the Library; images are saved in their project"));
   who.append(el("div", "name", t("Image generation")), sub);
+  if (v !== "off" && !gatewayMode) {
+    const go = el("button", "link image-gen-tool", libOff ? t("Turn on the Library") : t("Give agents Magpie Image…"));
+    go.type = "button";
+    go.onclick = async () => {
+      if (!libOff) {
+        if (await show("library") !== false) magpie.call("library", "server", "magpie-image");
+        return;
+      }
+      go.disabled = true;
+      try {
+        const next = await api("plugins/builtin", { id: "library", on: true });
+        if (state.settings) state.settings.builtins = next;
+        applyFeatures(next);
+        status(t("The Library is on"), "ok", 1500);
+        renderSettings();
+      } catch (err) {
+        go.disabled = false;
+        status(t(err.message), "err");
+      }
+    };
+    const line = el("div", "sub image-gen-how");
+    line.append(go);
+    who.append(line);
+  }
   // ChatGPT's images backend picks the model itself, so its one entry says
   // so where it draws, picked or automatic (#1865)
   const draws = v === "off" || gone ? "" : v ? shown : s.imageGenAuto;
@@ -23626,7 +23931,7 @@ function wbCheckinLine(r) {
 
 // prefsKeep is what the settings page sends of s, all of it each time.
 function prefsKeep(s) {
-  return { theme: s.theme, lang: s.lang, tray: s.tray, dock: !!s.dock, dockWindow: !!s.dockWindow, lightweight: !!s.lightweight, keepAwake: !!s.keepAwake, keepAwakeDisplay: !!s.keepAwakeDisplay, noWSLAgents: !!s.noWSLAgents, proxy: s.proxy || "",
+  return { theme: s.theme, colorblind: !!s.colorblind, lang: s.lang, tray: s.tray, dock: !!s.dock, dockWindow: !!s.dockWindow, lightweight: !!s.lightweight, keepAwake: !!s.keepAwake, keepAwakeDisplay: !!s.keepAwakeDisplay, noWSLAgents: !!s.noWSLAgents, proxy: s.proxy || "",
     sessionTerminal: s.sessionTerminal || "",
     uiFont: s.uiFont || null, codeFont: s.codeFont || null,
     otel: s.otel || {},
@@ -23635,8 +23940,8 @@ function prefsKeep(s) {
     claudeWarmup: s.claudeWarmup || "", codexWarmAt: s.codexWarmAt || "", claudeWarmAt: s.claudeWarmAt || "",
     codexWarmAts: warmTimes(s.codexWarmAts, s.codexWarmAt), claudeWarmAts: warmTimes(s.claudeWarmAts, s.claudeWarmAt), workbuddyCheckin: !!s.workbuddyCheckin, traeCheckin: !!s.traeCheckin, minimaxCheckin: !!s.minimaxCheckin, qoderCheckin: !!s.qoderCheckin, noStats: !!s.noStats, noUsageStats: !!s.noUsageStats,
     memberModel: !!s.memberModel, noLoopGuard: !!s.noLoopGuard, refusalRetries: s.refusalRetries ?? null,
-    noUpdatePill: !!s.noUpdatePill, noAutoUpdate: !!s.noAutoUpdate, updateEvery: s.updateEvery || 360,
-    trayUsage: s.trayUsage || "", trayUsageEvery: s.trayUsageEvery || 3, trayNoLogos: !!s.trayNoLogos, trayNoBird: !!s.trayNoBird, vision: s.vision || "", visionEffort: s.visionEffort || "", searcherEffort: s.searcherEffort || "", imageGen: s.imageGen || "", searcher: s.searcher || "", searchFirst: s.searchFirst || "", currency: s.currency || "usd",
+    noUpdatePill: !!s.noUpdatePill, noAutoUpdate: !!s.noAutoUpdate, updateEvery: s.updateEvery || 360, autoRestart: !!s.autoRestart,
+    trayUsage: s.trayUsage || "", trayUsageEvery: s.trayUsageEvery || 3, trayNoLogos: !!s.trayNoLogos, trayNoBird: !!s.trayNoBird, trayPace: !!s.trayPace, vision: s.vision || "", visionEffort: s.visionEffort || "", searcherEffort: s.searcherEffort || "", imageGen: s.imageGen || "", searcher: s.searcher || "", searchFirst: s.searchFirst || "", currency: s.currency || "usd",
     chineseUnits: !!s.chineseUnits, usageAlert: s.usageAlert || 0, balanceAlert: s.balanceAlert || 0, resetReminder: s.resetReminder || 0,
     turnDoneAlert: s.turnDoneAlert || 0 };
 }
@@ -23846,9 +24151,12 @@ const pinSizes = new ResizeObserver(() => {
 function backToReader(v) {
   if (v.hidden) return;
   const pinned = pinnedAt(v);
-  const want = Math.max(0, Math.min(pinned ?? readerAt.get(v) ?? 0, v.scrollHeight - v.clientHeight));
+  // to the nearest whole pixel: WebKit's scrollTop drops the fraction, so
+  // the part kept slid by up to a pixel each time what's above it grew by
+  // one, and two of those by nearly two (#1804)
+  const want = Math.round(Math.max(0, Math.min(pinned ?? readerAt.get(v) ?? 0, v.scrollHeight - v.clientHeight)));
   if (pinned != null) readerAt.set(v, want);
-  if (Math.abs(v.scrollTop - want) < 1) return;
+  if (Math.abs(v.scrollTop - want) < 0.5) return;
   v.scrollTop = want;
   // a field focused out of sight still comes into view, no further than needed
   const f = document.activeElement;

@@ -67,12 +67,33 @@
     stats.append(s);
   }
   foot.append(cap, stats);
+  const main = el("div", "rt-main");
   const log = el("div", "rt-log");
   const logHead = el("div", "rt-log-head");
   const steps = el("ol", "rt-steps");
   // what the request's prompt held: its context window (context.js)
   const ctxBox = el("div", "rt-ctx");
-  log.append(logHead, steps, ctxBox);
+  ctxBox.hidden = true;
+  const ctxToggle = el("button", "ctx-head rt-ctx-toggle");
+  ctxToggle.type = "button";
+  ctxToggle.dataset.unrolls = "";
+  const ctxDetail = el("div", "rt-ctx-detail");
+  ctxDetail.id = "rtContextDetails";
+  ctxToggle.setAttribute("aria-controls", ctxDetail.id);
+  ctxBox.append(ctxToggle, ctxDetail);
+  let contextOpen = false;
+  try {
+    const pref = localStorage.getItem("magpie.routingContext");
+    contextOpen = pref !== null ? pref === "1" : localStorage.getItem("magpie.ctxShut") === "0";
+  } catch {}
+  ctxToggle.onclick = () => {
+    contextOpen = !(contextOpen || !!ctxFor);
+    ctxFor = 0;
+    try { localStorage.setItem("magpie.routingContext", contextOpen ? "1" : "0"); } catch {}
+    ctxKey = "";
+    steady(() => { if (logR) renderCtx(logR); });
+  };
+  log.append(logHead, steps);
   const off = el("div", "none rt-off");
   // over the stage while a replay plays: the time it is replaying, which
   // requests are in flight then, and where it is among them
@@ -85,7 +106,8 @@
   rTrack.append(rHead);
   rbar.append(rTop, rWhat, rTrack);
   rbar.hidden = true;
-  box.append(top, rbar, stage, foot, log, off);
+  main.append(top, rbar, stage, foot, log, off);
+  box.append(main, ctxBox);
 
   // under the stage: every request the gateway keeps, and each account or
   // key as those requests found it
@@ -232,7 +254,8 @@
       for (const [cls, fits] of Object.entries(marks)) node.classList.toggle(cls, fits(w));
     });
   }).observe(node);
-  byWidth(box, { max560: (w) => w <= 560 });
+  byWidth(box, { min800: (w) => w >= 800, min1100: (w) => w >= 1100 });
+  byWidth(main, { max560: (w) => w <= 560 });
   byWidth(list, { max460: (w) => w <= 460, max560: (w) => w <= 560 });
   byWidth(more, { max520: (w) => w <= 520, min1150: (w) => w >= 1150 });
   for (const col of [colA, colB]) byWidth(col, { max440: (w) => w <= 440, max760: (w) => w <= 760 });
@@ -482,7 +505,7 @@
   }
 
   // the model a request went on: the one asked for, or the one set for
-  // Codex's subagents that magpie put a subagent on in its place
+  // an agent's subagents that magpie put a subagent on in its place
   const wentOn = (r) => (r.subagent && !r.subagent.kept ? r.subagent.to : r.model);
 
   // why routing put the first where it did
@@ -1153,6 +1176,10 @@
     return SPARE[h % SPARE.length];
   }
 
+  // foldersOf: the folders routes say, each once, in their order;
+  // lastLevel, a folder's last level ("workspace/magpie" → "magpie")
+  const foldersOf = (rs) => [...new Set(rs.map((r) => r.folder).filter(Boolean))];
+  const lastLevel = (f) => f.split("/").pop();
   function agentNode(id) {
     let a = agents.get(id);
     if (a) return a;
@@ -1327,7 +1354,13 @@
       const a = agents.get(id), r = rs.filter((x) => x.agent === id).pop(), ag = agentOf(id);
       if (a.icon !== (ag?.icon || "generic")) { a.icon = ag?.icon || "generic"; a.ic.replaceChildren(icon(a.icon)); }
       a.name.textContent = agentName(id);
-      a.sub.textContent = r.model;
+      // one agent working in more than one folder at once: which, by
+      // their last level (#1068). The stage holds an agent's latest
+      // request alone, so its others still going, or just done, count too.
+      const n = now(), going = pinned ? [] : [...src().values()].filter((x) => x.agent === id && (!x.done || at(x.time) + (x.ms || 0) > n - LINGER));
+      const fs = foldersOf([...new Set([...going, ...rs.filter((x) => x.agent === id)])].sort((x, y) => x.id - y.id));
+      a.sub.textContent = fs.length > 1 ? fs.map(lastLevel).join(", ") : r.model;
+      a.node.title = [agentName(id), r.model, ...fs.map((f) => t("Folder") + ": " + f)].join("\n");
     }
     // the account sets, the latest of each
     const latest = new Map();
@@ -1613,7 +1646,7 @@
   function renderLog() {
     const r = logR = pinned || cur;
     log.hidden = !r;
-    if (!r) return;
+    if (!r) { hideCtx(); return; }
     const on = () => listed().filter((x) => x.id >= logR.id);
     const head = JSON.stringify([document.documentElement.lang, !!rp, pinned?.id, r.id, r.time, r.done, !!pinned && on().length > 1]);
     if (headKey !== head) {
@@ -1689,33 +1722,53 @@
   // ctxFor is a request opened to see its context window (the Usage
   // page's Context tab): its card shows unfolded, it alone, whatever the
   // reader keeps folded
-  let ctxKey = "", ctxShown = 0, ctxTab = "all", ctxFor = 0;
+  let ctxKey = "", ctxShown = 0, ctxTab = "all", ctxFor = 0, ctxCarry = null;
+  function hideCtx() {
+    ctxBox.hidden = true;
+    box.classList.remove("has-context");
+    ctxKey = "";
+    ctxCarry = null;
+    ctxDetail.replaceChildren();
+    ctxShown = 0;
+  }
   function renderCtx(r) {
-    if (!r.prompt || !window.ctxCard) {
-      // a live request whose prompt the gateway is still reading keeps
-      // the card in its place until it has it, rather than the card
-      // going and coming back a moment later
-      if (!r.prompt && !r.done && !pinned && ctxBox.firstElementChild?.ctxUpdate) return;
-      if (ctxKey) { ctxKey = ""; ctxBox.replaceChildren(); }
+    // A Usage context link opens this request only, without changing the
+    // reader's saved preference for the next request or a reload.
+    if (ctxFor && ctxFor !== r.id) ctxFor = 0;
+    const open = contextOpen || ctxFor === r.id;
+    ctxToggle.setAttribute("aria-expanded", String(open));
+    ctxDetail.hidden = !open;
+    // Keep the last live context in place while the next prompt is read,
+    // including the closed summary. A deliberately picked request is fresh.
+    if (!r.prompt && !r.done && !pinned && !ctxBox.hidden && ctxCarry) r = ctxCarry;
+    ctxBox.hidden = !r.prompt || !window.ctxCard;
+    box.classList.toggle("has-context", !ctxBox.hidden);
+    if (ctxBox.hidden) {
+      ctxKey = "";
+      ctxCarry = null;
+      ctxDetail.replaceChildren();
       return;
     }
-    const sk = sessionKey(r);
+    ctxCarry = r;
+    const sk = open ? sessionKey(r) : "";
     const same = (x) => x.prompt && x.agent === r.agent && !x.kind && (sk ? sessionKey(x) === sk : r.conv && x.conv === r.conv);
-    const series = (sk || r.conv) && !r.kind ? listed().filter(same).sort((a, b) => a.id - b.id)
+    const series = open && (sk || r.conv) && !r.kind ? listed().filter(same).sort((a, b) => a.id - b.id)
       .map((x) => ({ id: x.id, tokens: x.prompt.tokens, time: x.time })) : null;
     if (series && !series.some((x) => x.id === r.id)) series.push({ id: r.id, tokens: r.prompt.tokens, time: r.time });
-    if (ctxFor && ctxFor !== r.id) ctxFor = 0;
-    const key = JSON.stringify([document.documentElement.lang, ctxFor, r.id, r.done, r.prompt.tokens, r.prompt.counted, r.prompt.window, r.usage?.length, series?.map((x) => x.id + ":" + x.tokens).join()]);
+    const key = JSON.stringify([document.documentElement.lang, r.id, r.done,
+      r.prompt, r.usage, series, open]);
     if (key === ctxKey) return;
     ctxKey = key;
+    if (ctxToggle.firstElementChild) window.ctxSummary(r, open, ctxToggle.firstElementChild);
+    else ctxToggle.replaceChildren(window.ctxSummary(r, open), svg(CHEV, 12, 1.6));
+    if (!open) { ctxDetail.replaceChildren(); return; }
+    const sess = groupSession(r) || r.conv || "";
     const still = ctxShown === r.id;
     ctxShown = r.id;
-    const sess = groupSession(r) || r.conv || "";
-    const card = ctxBox.firstElementChild;
-    const draw = card?.ctxUpdate && (still || !pinned) ? card.ctxUpdate : (r, o) => ctxBox.replaceChildren(window.ctxCard(r, o));
+    const card = ctxDetail.firstElementChild;
+    const draw = card?.ctxUpdate && (still || !pinned) ? card.ctxUpdate : (r, o) => ctxDetail.replaceChildren(window.ctxCard(r, o));
     draw(r, {
-      still, series, tab: ctxTab, place: "routing", foldable: true,
-      open: ctxFor === r.id, onFold: () => { ctxFor = 0; },
+      still: true, series, tab: ctxTab, place: "routing", headless: true,
       onTab: (id) => { ctxTab = id; },
       crumbs: [agentName(r.agent), sess && (sess.length > 14 ? sess.slice(0, 12) + "…" : sess), "#" + r.id],
       onPoint: (pt) => {
@@ -1755,6 +1808,7 @@
       ? t("{agent} asked for {model}: {name} serves it, and the vendor is asked for {sent}", { agent: agentName(r.agent), model: r.model, name: main.name, sent: main.model })
       : t("{agent} asked for {model}", { agent: agentName(r.agent), model: r.model }) + " → " + (main?.name || r.provider), ""]);
     if (r.kind) items.push([kindWhy(r), "aside kind"]);
+    else if (r.subagent) items.push([subagentWhy(r), "aside"]);
     if (r.sealedTask) items.push([t(r.group
       ? "This subagent task is encrypted. Only ChatGPT accounts can read it; other providers (such as Claude) are excluded regardless of quota."
       : "This subagent task is encrypted. Only ChatGPT accounts can read it."), "aside"]);
@@ -1905,13 +1959,17 @@
     return k;
   }
   const upstreamWhy = (tr) => t("The aggregator passed the request on to {upstream}, as its reply says: the provider that actually answered it.", { upstream: tr.upstream });
-  function kindWhy(r) {
+  // the model set for an agent's subagents in place of the lead's pick,
+  // or why the lead's pick stood
+  function subagentWhy(r) {
     const agent = agentName(r.agent);
-    // the model set for Codex's subagents in place of the lead's pick, or
-    // why the lead's pick stood
-    if (purposeOf(r.kind) === "kind:collab_spawn" && r.subagent) return r.subagent.kept
+    return r.subagent.kept
       ? t("{agent} requested a subagent on {model} and it stayed there: its subagents are set to {to}, but {why}.", { agent, model: r.subagent.asked, to: r.subagent.to, why: t(r.subagent.kept) })
       : t("{agent} requested a subagent on {model}; magpie put it on {to}, the model set for its subagents.", { agent, model: r.subagent.asked, to: r.subagent.to });
+  }
+  function kindWhy(r) {
+    const agent = agentName(r.agent);
+    if (purposeOf(r.kind) === "kind:collab_spawn" && r.subagent) return subagentWhy(r);
     if (purposeOf(r.kind) === "kind:collab_spawn") return r.group
       ? t("{agent} requested a subagent; magpie selects its model within this routing group.", { agent })
       : t("{agent} requested a subagent on {model}.", { agent, model: r.model });
@@ -1976,11 +2034,13 @@
   // the row no longer says (#337)
   function reqTitle(r, how, tr) {
     const head = `${agentName(r.agent)} · ${r.model} → `;
+    // the folder its agent works in, the last two levels of it (#1068)
+    const folder = r.folder ? "\n" + t("Folder") + ": " + r.folder : "";
     const w = how !== "bad" && r.tries.length > 1 && tr && tried(r, tr);
-    if (!w) return head + r.provider;
+    if (!w) return head + r.provider + folder;
     const first = r.tries[0], f = tried(r, first);
     const from = f && seat(f) !== seat(w) ? "\n" + t("rerouted from {from}", { from: `${where(f)} · ${first.model || f.model}` }) : "";
-    return head + `${where(w)} · ${tr.model || w.model}` + from;
+    return head + `${where(w)} · ${tr.model || w.model}` + from + folder;
   }
 
   // the requests the gateway keeps, newest first: pick one to see how it was routed
@@ -2192,11 +2252,14 @@
       const memory = g.r.agent === "codex" && g.rows.every((r) => purposeOf(r.kind) === "kind:memory_consolidation");
       const suggestions = g.r.agent === "codex" && g.rows.every((r) => purposeOf(r.kind) === "kind:ambient_suggestions");
       const name = g.rows.find((r) => r.sessionTitle)?.sessionTitle || otherTitles.get(ownKey(g.r)) || (memory ? t("Background memory task") : suggestions ? t("Background prompt suggestions") : "");
-      setText(x.name, g.key ? agentName(g.r.agent) + " · " + (name || groupSession(g.r)) : t("No session ID"));
+      // the folder the session works in, as its latest request said it
+      // (#1068): it tells two runs of one agent apart before their titles
+      const folder = g.key ? g.rows.find((r) => r.folder)?.folder || "" : "";
+      setText(x.name, g.key ? [agentName(g.r.agent), folder, name || (folder ? "" : groupSession(g.r))].filter(Boolean).join(" · ") : t("No session ID"));
       const purpose = memory ? t("Codex is organizing memories from earlier chats in the background. This can continue after a chat finishes.") + "\n"
         : suggestions ? kindWhy(g.r) + "\n"
         : g.rows.some((r) => r.parentMatched) ? t("Title requests were automatically matched using the prompt and the applied chat title.") + "\n" : "";
-      x.name.title = g.key ? (name ? name + "\n" : "") + purpose + t("Session id") + ": " + groupSession(g.r) : t("These requests did not provide a session ID; they are not treated as one conversation.");
+      x.name.title = g.key ? (name ? name + "\n" : "") + purpose + (folder ? t("Folder") + ": " + folder + "\n" : "") + t("Session id") + ": " + groupSession(g.r) : t("These requests did not provide a session ID; they are not treated as one conversation.");
       const bits = [t(g.rows.length === 1 ? "{n} request" : "{n} requests", { n: g.rows.length })];
       if (visibleMetrics.includes("tokens") && total.tokens) bits.push(t("{n} tokens", { n: tokens(total.tokens) }));
       if (total.running) bits.push(t("{n} in progress", { n: total.running }));
@@ -5070,7 +5133,7 @@
       n.node.style.setProperty("--agent", hueOf(id));
       n.wire.style.setProperty("--agent", hueOf(id));
       n.node.replaceChildren(icon(ag?.icon || "generic"), el("span", "ps-name", agentName(id)));
-      n.node.title = agentName(id);
+      n.node.title = [agentName(id), ...foldersOf(recent.filter((r) => r.agent === id).slice(0, 20).reverse()).map((f) => t("Folder") + ": " + f)].join("\n");
       return n.node;
     }));
     pTo.replaceChildren(...pDst.map((k) => {

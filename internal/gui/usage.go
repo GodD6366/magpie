@@ -56,7 +56,9 @@ func csvStamp(p usage.Period, day string, now time.Time) string {
 	if p.IsRange() { // the days picked, which already say when
 		return "magpie-requests-" + strings.Replace(string(p), "..", "-to-", 1)
 	}
-	return "magpie-requests-" + string(p) + "-" + now.Format(time.DateOnly)
+	// a rolling window ("last:24h0m0s") without the colon, which Windows
+	// doesn't take in a file name (#2075)
+	return "magpie-requests-" + strings.ReplaceAll(string(p), ":", "-") + "-" + now.Format(time.DateOnly)
 }
 
 // contentJSON is what was said in a request, or why it can't be told.
@@ -188,6 +190,8 @@ func usageRoutes(mux *http.ServeMux, w Windows) {
 		qs := provider.WithCheckins(provider.Quotas(ctx))
 		// and what each window holds whole, by what magpie routed in it
 		qs = usage.WithWindowHolds(qs, usage.Clock())
+		// and when each began, for its Pace number (fflake33)
+		qs = provider.WithWindowStarts(qs, usage.Clock())
 		// an account's card may be the stale copy a read under way will
 		// replace: the page asks again until it has landed (#959)
 		if provider.SubscriptionUsageReading() {
@@ -207,7 +211,7 @@ func usageRoutes(mux *http.ServeMux, w Windows) {
 		ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
 		defer cancel()
 		provider.RefreshUsage(ctx, id, r.URL.Query().Get("user"))
-		writeJSON(rw, usage.WithWindowHolds(provider.WithCheckins(provider.Quotas(ctx)), usage.Clock()))
+		writeJSON(rw, provider.WithWindowStarts(usage.WithWindowHolds(provider.WithCheckins(provider.Quotas(ctx)), usage.Clock()), usage.Clock()))
 	})
 	// WorkBuddy's daily check-in pressed now, from the Usage card, for
 	// each account not in yet today, as `magpie accounts checkin` does; the

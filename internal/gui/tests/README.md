@@ -6,6 +6,18 @@ covers saving and reloading, escaped and non-UTF-8 credentials, masked
 addresses/status, clearing authentication, Tab and Escape, mode switches,
 HTTP compatibility, and narrow windows in English and Chinese on Chromium
 and WebKit.
+## Routing context header
+
+`routing-context-layout.test.cjs` checks one lazy context header, full
+routing reasons, the visible stage caption and original heading, aligned
+wide-card separators, narrow windows, keyboard controls, reload and
+preference retention in both engines and all five languages.
+`MAGPIE_CONTEXT_ASSETS` points at base assets for a negative check.
+The folded-context, live-patch and every-frame suites retain the upstream
+geometry, cache, cell identity and Usage-link assertions using the unified
+header. The live story logo tests retain their upstream fixtures and node
+identity assertions.
+
 ## Installed desktop fonts
 
 `fonts.test.cjs` exercises the interface/code font controls with installed
@@ -406,6 +418,17 @@ model and "unless the lead names another" beside it. Picking a model posts
 `subagent`, and the square still carries the hint. Clicking the first entry
 unsets it again. A click doesn't scroll the page. Claude Code's subagents
 still say "same as model".
+
+`desktop-subagent-model.test.cjs` checks Claude Desktop's gateway-applied
+subagent model in its row opened from the agent link: one square, hidden
+when unwired with no options or value, opening the app's model picker (no
+native select), translated title and Default note, a model posted as
+`subagent_model` and Default as "". No click scrolls, no square or picker
+row has a coloured left border, and the picker fits at 1100px and 560px.
+Desktop routing stories with no kind explain the moved model or the kept
+model with a translated disabled reason. Chromium and WebKit, English,
+Chinese, Traditional Chinese, Japanese and German; all APIs are faked.
+Run with `node --test internal/gui/tests/desktop-subagent-model.test.cjs`.
 
 `tier-effort.test.cjs` draws Claude Code's per-tier effort (#536) in Chromium
 and WebKit, English and Chinese: no tier's effort is a field of its own; the
@@ -1617,13 +1640,18 @@ names the subscription, and reopening the menu shows it ticked. No click
 moves the page. The checks run in English and Chinese, in Chromium and
 WebKit.
 
-`codex-auto-reset.test.cjs` checks the Auto-use toggle beside a Codex
-account's resets, on the Usage page's card and on the menu bar panel's. It is
-off until turned on; a click posts `settings/codex-auto-reset` for that
-account, shows it pressed and says so, and a second click turns it off. A GLM
-team's resets get no toggle. No click moves the page, and nothing has a
-left-border accent. The checks run in English and Chinese, in Chromium and
-WebKit.
+`codex-auto-reset.test.cjs` checks a Codex account's resets used by
+themselves, on the Usage page's card and on the menu bar panel's: the two
+times one is used, its week used up and one about to expire, each on its own
+line with its own switch (#2078). Each is off until turned on; a click posts
+`settings/codex-auto-reset` for that account and that time (`when`), turns
+that switch alone, and says what the account does now; the resets-held line
+says the one about to expire is kept only while that time is on. An account
+in brief has one switch for both, posted without `when`, its title naming
+each time. A GLM team's resets get no switch. No click moves the page, the
+switches fit the card, nothing has a left-border accent and there is no
+native select. The checks run in English, Chinese, Traditional Chinese,
+Japanese and German, 1100 and 420 wide, in Chromium and WebKit.
 
 `library-all.test.cjs` opens the Library with an All chip ahead of each
 server's and skill's agent chips (Discord: MCP 服务器 SKILL 都得一个个选):

@@ -455,6 +455,14 @@ func Run(version string, showMain bool, link string) error {
 		})
 	}
 	updates.onWait = func() { application.InvokeSync(relabel) }
+	// Settings' AutoRestart: the window comes back only if it was up (#2096)
+	updates.autoRestart = func() bool {
+		if restartInto(false, h.MainShown(), "", true) {
+			h.app.Quit()
+			return true
+		}
+		return false
+	}
 	updates.start()
 	news.start()
 	// the library written into the agents again, once: one installed or
@@ -657,6 +665,13 @@ func panelOptions(goos, theme string) application.WebviewWindowOptions {
 		Mac: application.MacWindow{
 			Backdrop:     application.MacBackdropTranslucent,
 			CornerRadius: 12,
+			// On every Space, a full-screen app's among them, as a menu
+			// bar extra's panel is: by default (FullScreenPrimary alone)
+			// it stayed on the desktop Space it was first shown on, and a
+			// click on the icon over a full-screen Chrome showed it there,
+			// out of sight, until the user swiped back (#2141).
+			CollectionBehavior: application.MacWindowCollectionBehaviorCanJoinAllSpaces |
+				application.MacWindowCollectionBehaviorFullScreenAuxiliary,
 		},
 		Windows: application.WindowsWindow{HiddenOnTaskbar: true},
 	}

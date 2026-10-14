@@ -213,6 +213,11 @@ const claudeCapsEnv = "CLAUDE_CODE_MODEL_CAPABILITIES"
 // while one is. One the user set is theirs.
 const claudeReviewEnv = "CLAUDE_CODE_AUTO_MODE_SERVER"
 
+// Claude Code 2.1.295's Explore inherit cap can replace Desktop's
+// mythos-magpie compatibility alias with Opus. Disable that cap while
+// Desktop is on magpie, without forcing other subagents onto a model.
+const claudeExploreEnv = "CLAUDE_CODE_DISABLE_EXPLORE_INHERIT_CAP"
+
 // claudeReviewed reports whether a model Claude Code can reach through
 // magpie has its actions reviewed by Anthropic (gateway.AutoModeReviewed):
 // one shown to the agents in catalogs (Claude Code, Claude Desktop whose
@@ -336,15 +341,15 @@ func claudeCapabilities(first []string, own, desktop bool) string {
 // subscription costs a fraction of Opus's limits (X, AncientTwo: the limits
 // went much faster through magpie than in Claude Code itself).
 //
-// For fable, on a Claude model that is no Fable, it is none: the fable tier
-// is left unset. Claude Code takes the model ANTHROPIC_DEFAULT_FABLE_MODEL
+// For fable, on any model that is no Fable, it is none: the fable tier is
+// left unset. Claude Code takes the model ANTHROPIC_DEFAULT_FABLE_MODEL
 // names for a Fable model (2.1.293: a model id equal to it is Fable), so the
-// main model written there made Claude Opus a Fable model to it, and on a
-// Claude Pro sign-in without Fable it asked for usage credits and fell back
-// to Haiku (Zhenzhen on Discord). Claude Code's own /model fable, asked of
-// the gateway, still runs on the main model (claudeStandInAt). Another
-// vendor's model, which Claude Code knows nothing of, the fable tier still
-// follows, as it does the others.
+// main model written there made it a Fable model to Claude Code, and on a
+// Claude Pro sign-in without Fable it asked for usage credits before the
+// first turn: Claude Opus fell back to Haiku (Zhenzhen on Discord), and
+// another vendor's model, GPT-6.1 Sol through Codex, didn't run at all
+// (#2090). Claude Code's own /model fable, asked of the gateway, still runs
+// on the main model (claudeStandInAt).
 func follow(tier, main string) string {
 	switch tier {
 	case "haiku":
@@ -352,7 +357,7 @@ func follow(tier, main string) string {
 			return l
 		}
 	case "fable":
-		if n := claudeName(main); n != "" && !strings.HasPrefix(n, "claude-fable-") {
+		if !strings.HasPrefix(claudeName(main), "claude-fable-") {
 			return ""
 		}
 	}
@@ -880,6 +885,36 @@ func claudeIn(at place) *Agent {
 	desktopOn := func() bool {
 		return at.id == "" && at.sys == nil && desktopWiredAny(desktopSets(desktopdir.OS, at.home, os.Getenv))
 	}
+	// Desktop's Explore compatibility flag has its own ownership: taking
+	// Claude Code off magpie must leave it while Desktop still needs it.
+	exploreKey := at.key("claude.explore_inherit_cap")
+	writeExplore := func() error {
+		cur, has := edit.GetJSON(path, "env."+claudeExploreEnv)
+		ours := has && cur == "1" && stashLoad()[exploreKey] == "1"
+		if !desktopOn() {
+			if ours {
+				if err := edit.DelJSON(path, "env."+claudeExploreEnv); err != nil {
+					return err
+				}
+			}
+			if stashLoad()[exploreKey] != "" {
+				forget(exploreKey)
+			}
+			return nil
+		}
+		// Presence matters: an explicit empty value is the user's too.
+		if has {
+			if !ours && stashLoad()[exploreKey] != "" {
+				forget(exploreKey)
+			}
+			return nil
+		}
+		if err := edit.SetJSON(path, edit.KV{Path: "env." + claudeExploreEnv, Value: "1"}); err != nil {
+			return err
+		}
+		stash(map[string]string{exploreKey: "1"})
+		return nil
+	}
 	// putCaps is writeCaps with own saying whether Claude Code's own
 	// models are among them, as they are while it runs on magpie
 	putCaps := func(own bool, models ...string) error {
@@ -1072,6 +1107,9 @@ func claudeIn(at place) *Agent {
 	// Claude Code's being wired in wrote them before, so a user who wired
 	// in Desktop alone had 200K for every Desktop model (#1458).
 	desktopOnly := func() error {
+		if err := writeExplore(); err != nil {
+			return err
+		}
 		// the review is turned off only for Claude Code's own requests to
 		// magpie
 		if err := dropReview(); err != nil {
@@ -1366,6 +1404,9 @@ func claudeIn(at place) *Agent {
 			return err
 		}
 		if err := writeReview(models...); err != nil {
+			return err
+		}
+		if err := writeExplore(); err != nil {
 			return err
 		}
 		return writeCaps(models...)
@@ -1767,6 +1808,9 @@ func claudeIn(at place) *Agent {
 				return err
 			}
 			if err := writeReview(models...); err != nil {
+				return err
+			}
+			if err := writeExplore(); err != nil {
 				return err
 			}
 			return writeCaps(models...)

@@ -90,6 +90,19 @@
   --tk-s: #98d8a4; --tk-k: #c4b5fd; --tk-f: #93c5fd; --tk-n: #f2b544; --tk-v: #67e8f9; --tk-o: #f0abfc; --tk-c: #8b8b94;
   --c1: #a5b4fc; --c2: #7dd3fc; --c3: #6ee7b7; --c4: #fcd34d; --c5: #f9a8d4; --c6: #c4b5fd; --c7: #94a3b8;
 }
+/* Okabe–Ito qualitative series (#2073): adjacent series stay apart in hue and
+   lightness in both light and dark themes */
+:root[data-colorblind="1"] {
+  --c1: #0072b2; --c2: #e69f00; --c3: #009e73; --c4: #d55e00; --c5: #cc79a7; --c6: #56b4e9; --c7: #64748b;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"])[data-colorblind="1"] {
+    --c1: #56b4e9; --c2: #fbbf24; --c3: #2dd4bf; --c4: #fb7185; --c5: #e879f9; --c6: #f0e442; --c7: #94a3b8;
+  }
+}
+:root[data-theme="dark"][data-colorblind="1"] {
+  --c1: #56b4e9; --c2: #fbbf24; --c3: #2dd4bf; --c4: #fb7185; --c5: #e879f9; --c6: #f0e442; --c7: #94a3b8;
+}
 /* Windows' own text faces, and Chinese in YaHei UI, its UI face for it, not
    the webview's fallback; the Mac's and Linux's stack is the one above */
 :root.win { --font: "Segoe UI Variable Text", "Segoe UI", "Microsoft YaHei UI", "Microsoft YaHei", system-ui, sans-serif; }
@@ -822,9 +835,14 @@ body.window .field.solo { grid-column: auto; }
 .quota-windows.stacked .quota-n > span { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
 .quota-reset { display: flex; flex-wrap: wrap; column-gap: 4px; margin-top: 4px; font-size: 10px; color: var(--faint); font-variant-numeric: tabular-nums; }
 .quota-reset > span { white-space: nowrap; }
+/* a window's Pace number (fflake33): faint like its line, amber when more
+   is used than an even pace would have */
+.quota-reset .quota-pace { font-variant-numeric: tabular-nums; }
+.quota-reset .quota-pace.over { color: var(--amber); }
 /* a window's whole (WindowHolds): a line of its own under the reset */
 .quota-reset .quota-holds { flex-basis: 100%; display: flex; flex-wrap: wrap; column-gap: 4px; min-width: 0; }
 .quota-reset .quota-holds > span { white-space: nowrap; }
+.quota-reset .quota-holds-why { flex-basis: 100%; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; opacity: .75; cursor: help; }
 .quota-track { height: 4px; border-radius: 2px; background: var(--pill); overflow: hidden; }
 .quota-track i { display: block; height: 100%; border-radius: inherit; background: var(--accent); }
 .subscription-error { font-size: 11px; color: var(--faint); }
@@ -870,6 +888,23 @@ body.window .field.solo { grid-column: auto; }
 .qc-key > span { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
 .qc-key i { flex: none; width: 7px; height: 7px; border-radius: 50%; }
 .qc-key b { color: var(--fg-2); font-weight: 600; font-variant-numeric: tabular-nums; }
+/* colorblind mode (#2073): each quota window's line keeps a dash of its own,
+   and its legend shows a sample of that line for the dot; the even paces go
+   dotted, so no window's dash reads as one. Only drawQuotaPlot and the
+   quota legend set data-series, so the balance curve keeps its solid line,
+   dashed fit and dot. */
+.qc-key .qc-sample { display: none; }
+.qc-sample line { stroke-width: 1.5; stroke-linecap: round; }
+:root[data-colorblind="1"] .qc-key[data-series] i { display: none; }
+:root[data-colorblind="1"] .qc-key[data-series] .qc-sample { display: block; flex: none; width: 22px; height: 6px; }
+:root[data-colorblind="1"] .qc-line.qc-short { stroke-width: 1.35; opacity: .85; }
+:root[data-colorblind="1"] .qc-even[data-series] { stroke-width: 1.4; stroke-dasharray: 0 4; stroke-linecap: round; opacity: .6; }
+:root[data-colorblind="1"] :is(.qc-line, .qc-dash)[data-series="1"] { stroke-dasharray: 8 4; }
+:root[data-colorblind="1"] :is(.qc-line, .qc-dash)[data-series="2"] { stroke-dasharray: 3.5 4; }
+:root[data-colorblind="1"] :is(.qc-line, .qc-dash)[data-series="3"] { stroke-dasharray: 12 4 3.5 4; }
+:root[data-colorblind="1"] :is(.qc-line, .qc-dash)[data-series="4"] { stroke-dasharray: 3.5 4 3.5 9; }
+:root[data-colorblind="1"] :is(.qc-line, .qc-dash)[data-series="5"] { stroke-dasharray: 16 4; }
+:root[data-colorblind="1"] :is(.qc-line, .qc-dash)[data-series="6"] { stroke-dasharray: 12 4 3.5 4 3.5 4; }
 .quota-resets { display: flex; align-items: center; gap: 8px; margin-top: 9px; font-size: 10.5px; font-variant-numeric: tabular-nums; }
 .quota-resets .text { margin-left: auto; flex: none; font-size: 11px; padding: 2px 7px; }
 .subscription-card.several .quota-resets:not([hidden]) + .subscription-account { margin-top: 10px; padding-top: 9px; border-top: 1px solid var(--line); }
@@ -1695,9 +1730,12 @@ body.panel .profiles #save { height: 25px; } /* the field's: the line keeps its 
 .pq-rn2 { display: flex; flex-direction: column; align-items: center; }
 .pq-rn2 > span { max-width: 100%; overflow: hidden; text-overflow: ellipsis; }
 /* the first window's current cycle, a thin line across the card (#651) */
-.pq-spark-box { grid-column: 1 / -1; display: block; height: 16px; }
-.pq-spark { display: block; width: 100%; height: 16px; overflow: hidden; }
-.pq-spark .qc-line { stroke-width: 1.2; }
+.pq-spark-box { grid-column: 1 / -1; display: block; height: 30px; }
+.pq-spark { display: block; width: 100%; height: 30px; overflow: hidden; }
+.pq-spark .qc-line { stroke-width: 1.4; }
+/* the gap to the even burn: ahead of it lasts, behind it runs out (#2079) */
+.pq-gap-ahead { fill: var(--green); opacity: .16; }
+.pq-gap-behind { fill: var(--amber); opacity: .22; }
 /* a Codex account's rate-limit resets, under a hairline across the card */
 .pq-resets { grid-column: 1 / -1; display: flex; align-items: center; gap: 8px; margin-top: 5px; padding-top: 7px; border-top: 1px solid var(--line-2); font-size: 11px; font-variant-numeric: tabular-nums; }
 .resets-words { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -1721,6 +1759,19 @@ body.panel .profiles #save { height: 25px; } /* the field's: the line keeps its 
 .ar-say { flex: 1; min-width: 0; line-height: 1.35; }
 .ar-say b { font-weight: 500; color: var(--fg-2); }
 .ar-used { display: block; margin-top: 2px; color: var(--faint); }
+/* its two times, each a line of its own with its switch (#2078): the
+   say on top, the lines under it, each switch at the line's end */
+.quota-autoreset.ar-split, .pq-autoreset.ar-split { flex-direction: column; align-items: stretch; gap: 3px; }
+.ar-cases { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
+.ar-case { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.ar-case-say { flex: 1; min-width: 0; line-height: 16px; }
+.ar-case.on .ar-case-say { color: var(--fg-2); }
+.ar-case .lib-switch { flex: none; }
+/* Settings › Usage: an account's two times, each with its Off/On */
+.ar-own-cases { display: flex; flex-direction: column; align-items: flex-end; gap: 6px; min-width: 0; }
+.ar-own-case { display: flex; align-items: center; justify-content: flex-end; gap: 10px; min-width: 0; }
+.ar-own-say { min-width: 0; color: var(--muted); font-size: 12px; text-align: right; }
+.ar-own-case .segs { flex: none; }
 .lib-switch.auto-reset, .lib-switch.use-credits { width: 28px; height: 16px; padding: 0; border: 0; cursor: pointer; }
 .lib-switch.auto-reset i, .lib-switch.use-credits i { width: 12px; height: 12px; }
 .lib-switch.auto-reset.on i, .lib-switch.use-credits.on i { transform: translateX(12px); }
@@ -2732,7 +2783,7 @@ body.window .ag-sk-icon { width: 22px; height: 22px; border-radius: 6px; }
 .opt { position: relative; z-index: 1; white-space: nowrap; height: 22px; padding: 0 10px; border-radius: 5px; font-size: 12px; color: var(--muted); transition: color .18s var(--ease), transform .14s var(--ease); }
 .opt.on { color: var(--fg); }
 /* how often magpie checks for updates, while it doesn't by itself */
-.update-every-row.off .segs { opacity: .55; }
+.update-every-row.off .segs, .update-restart-row.off .segs { opacity: .55; }
 /* Command line: each shell's `magpie`, a dot for whether it runs this app */
 .cli-row .sub { overflow-wrap: anywhere; }
 .cli-shells { display: flex; flex-direction: column; gap: 3px; margin-top: 6px; }
@@ -2892,6 +2943,8 @@ body.window .ag-sk-icon { width: 22px; height: 22px; border-radius: 6px; }
 /* served with none picked: the vendor's list stands in for the picks. Drawn
    apart from a pick (no tick, no accent): a click picks it alone (#681) */
 .mchip.auto { border-style: dashed; border-color: var(--muted); }
+/* listed on none of the APIs the provider has a URL for: not offered (#2094) */
+.mchip.noapi { opacity: .5; }
 /* an image model in the editor: listed, not picked */
 .mchip.ro, .mchip.ro:hover { cursor: default; color: var(--muted); border-color: var(--line); }
 .mchip.ro:active { transform: none; }
@@ -3898,3 +3951,9 @@ input[type="checkbox"]:disabled { opacity: .45; }
 .model-chain-inline .model-chain-pick .v { flex: 1; text-align: left; }
 .model-chain-inline > .model-chain-add { align-self: flex-start; margin-left: 138px; padding-left: 0; }
 .model-chain-error { color: var(--red); }
+/* Settings › Images: the way to the Magpie Image tool, under its words (#2091) */
+.image-gen-how .link { padding-left: 0; padding-right: 0; white-space: normal; text-align: start; }
+/* Settings › Proxy's Test result (#2076): under the row's text */
+.row.pref .sub.proxy-check { margin-top: 3px; white-space: normal; overflow-wrap: anywhere; }
+.proxy-check[hidden] { display: none; }
+.row.pref .sub.proxy-check.err { color: var(--red); }
