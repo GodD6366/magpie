@@ -280,7 +280,18 @@ func codexIn(at place) *Agent {
 	// discovery off (#1535) auth.json stays unread, and Codex is taken to be
 	// as magpie last wired it, beside a ChatGPT sign-in or not, so turning
 	// discovery off never rewires Codex by itself.
+	//
+	// A Codex that reaches the gateway from another machine (a WSL distro
+	// under NAT, or MAGPIE_ADDR pinned beyond loopback) is wired as one
+	// with no ChatGPT sign-in: beside its sign-in it would send the gateway
+	// its ChatGPT token, and from there the gateway takes a named key
+	// alone, so every request was a 401 (#2145, lazydao). With magpie as
+	// its provider it sends the key magpie gives it (gwKey); its own models
+	// still go straight to OpenAI on its sign-in.
 	chatGPT := func() bool {
+		if onAnotherMachine(at.gw()) {
+			return false
+		}
 		if settings.AccountDiscoveryOff() {
 			return joined() || beside()
 		}
@@ -722,7 +733,10 @@ func codexIn(at place) *Agent {
 		if p != "" && p != "openai" && !mirror {
 			return nil
 		}
-		on := !disconnected() && codexFailover()
+		// a Codex that reaches the gateway from another machine is never
+		// pointed at the Codex path: the gateway takes a named key there,
+		// so the turn failover handed it came back a 401 (#2145)
+		on := !disconnected() && codexFailover() && !onAnotherMachine(at.gw())
 		// failover is magpie's own idea, not the user's: never handed
 		// Codex's requests while a proxy they'd go through doesn't pass
 		// them on to magpie, which would have every turn fail with 502
@@ -1082,7 +1096,13 @@ func codexIn(at place) *Agent {
 			}
 			return true, settle()
 		},
-		Joined:      joined,
+		// joined as the GUI and drift tell it: Codex's own models in its
+		// list beside magpie's. With magpie its provider (magpie API, or a
+		// ChatGPT account the Codex app holds) they are not, though the
+		// mark stays for Sync to put it back beside the sign-in: the
+		// Agents row said "its own models stay in /model" while the Codex
+		// app was meant to be in its API state (#2267)
+		Joined:      func() bool { return joined() && !asProvider() },
 		Beside:      beside,
 		Routed:      routed,
 		FailingOver: failingOver,

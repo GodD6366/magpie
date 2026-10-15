@@ -358,6 +358,34 @@ func TestKeyUsageWithAccessToken(t *testing.T) {
 	}
 }
 
+// A login token beside sub2api's /v1/usage, which takes only the key, is
+// never sent there either: the panel's query for the account is named in
+// its place, as new-api's is above.
+func TestSub2APIKeyUsageWithLoginToken(t *testing.T) {
+	asked := false
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		asked = true
+		w.WriteHeader(http.StatusUnauthorized)
+		w.Write([]byte(`{"error":"invalid API key"}`))
+	}))
+	defer srv.Close()
+	p := Provider{ID: "panel", Chat: srv.URL, Key: "sk-two",
+		BalanceToken: "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJzIn0.sig",
+		BalanceURL:   srv.URL + "/v1/usage"}
+	_, ok, err := Balance(context.Background(), p)
+	if !ok || err == nil || asked {
+		t.Fatalf("ok %v, err %v, asked %v", ok, err, asked)
+	}
+	if want := srv.URL + "/api/v1/user/profile (Balance field $data.balance)"; !strings.Contains(err.Error(), want) || !strings.Contains(err.Error(), "takes the API key, not the login token") {
+		t.Fatalf("err = %v", err)
+	}
+	// the key alone still asks it
+	p.BalanceToken = ""
+	if _, _, err := Balance(context.Background(), p); !asked || err == nil {
+		t.Fatalf("without the token: asked %v, err %v", asked, err)
+	}
+}
+
 // new-api's /api/user/self with its field left out reads the quota as
 // new-api counts it, $1 to 500000.
 func TestUserSelfDefaultField(t *testing.T) {
@@ -565,5 +593,61 @@ func TestSiliconFlowRetiredBalanceQuery(t *testing.T) {
 		if got, _, err := Balance(context.Background(), p); err != nil || !strings.HasSuffix(got, "88.88") {
 			t.Errorf("%s 200: %q %v", c.base, got, err)
 		}
+	}
+}
+
+// A key usage query that takes only "Authorization: Bearer <key>"
+// (lx_78654 on Discord: a header of "Bearer {token}" went as written, and
+// the vendor said "Authorization header format must be 'Bearer {token}'").
+// The key is put in for each of its names, and the key pasted as the
+// balance token goes as a Bearer too, not bare as an access token.
+func TestBalanceKeyAsBearer(t *testing.T) {
+	const key = "sk-tt-1"
+	var got []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got = append(got, r.Header.Get("Authorization"))
+		if r.Header.Get("Authorization") != "Bearer "+key {
+			w.WriteHeader(http.StatusUnauthorized)
+			w.Write([]byte(`{"code":"INVALID_AUTH_HEADER","message":"Authorization header format must be 'Bearer {token}'"}`))
+			return
+		}
+		w.Write([]byte(`{"data":{"remain":8.5}}`))
+	}))
+	defer srv.Close()
+	base := Provider{ID: "relay", Chat: srv.URL + "/v1", Key: key, BalanceURL: srv.URL + "/key/usage", BalancePath: "$data.remain"}
+	for _, c := range []struct {
+		name    string
+		headers map[string]string
+		token   string
+	}{
+		{name: "no header"},
+		{name: "{token}", headers: map[string]string{"Authorization": "Bearer {token}"}},
+		{name: "{key}", headers: map[string]string{"Authorization": "Bearer {key}"}},
+		{name: "{API_KEY}", headers: map[string]string{"authorization": "Bearer {API_KEY}"}},
+		{name: "{{apikey}}", headers: map[string]string{"Authorization": "Bearer {{apikey}}"}},
+		{name: "${API_KEY}", headers: map[string]string{"Authorization": "Bearer ${API_KEY}"}},
+		{name: "key as token", token: key},
+		{name: "Bearer key as token", token: "Bearer " + key},
+	} {
+		p := base
+		p.Headers, p.BalanceToken = c.headers, c.token
+		got = nil
+		if amount, ok, err := Balance(context.Background(), p); err != nil || !ok || amount != "$8.50" {
+			t.Errorf("%s: balance = %q %v %v, sent %q", c.name, amount, ok, err, got)
+		}
+	}
+	// the key in the URL is escaped there, under any of its names
+	p := base
+	p.BalanceURL = srv.URL + "/key/usage?k={TOKEN}"
+	p.Key = "sk-tt 1"
+	if u := withBalanceKey(p.BalanceURL, p.Key, true); !strings.HasSuffix(u, "?k=sk-tt+1") {
+		t.Fatalf("url = %q", u)
+	}
+	// a token of the account's own, not the key, still goes as it is
+	p = base
+	p.BalanceToken = "tok"
+	got = nil
+	if _, _, err := Balance(context.Background(), p); err == nil || len(got) != 1 || got[0] != "tok" {
+		t.Fatalf("an access token went as %q (%v)", got, err)
 	}
 }

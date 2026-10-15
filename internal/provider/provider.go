@@ -186,7 +186,8 @@ type Provider struct {
 	// out while it keeps failing or keeps being rate limited as soon as
 	// its rest is over (#2008); 0 is the gateway's own, 10 minutes for a
 	// failure and 30 for a rate limit. The vendor's own "try again in"
-	// still stands over it.
+	// still stands over it. RestCapOff (-1): no rest at all after a
+	// failure that says nothing of why, a rate limit's as the gateway's own.
 	RestCap int `json:"restCap,omitempty"`
 
 	// PriceRate is what the provider charges against the official price
@@ -225,6 +226,18 @@ type Provider struct {
 	// OpenAI-only fields left out) fails. Off, the default, keeps that
 	// fitting, which a backend that isn't OpenAI's needs (#350).
 	CodexAsSent bool `json:"codexAsSent,omitempty"`
+
+	// NativeCompaction has Codex's compaction_trigger go to the provider
+	// as Codex sent it, and the compaction the provider writes back go to
+	// Codex as it came (#1099), where magpie otherwise asks the model for
+	// a summary and hands Codex that (its "magpie1:" compaction). Only a
+	// provider whose wire carries it takes it (CarriesCompaction): a
+	// Responses API (Sub2API, a remote magpie), a ChatGPT account, GitHub
+	// Copilot's GPT models. Such a compaction is sealed by the key or
+	// account that wrote it, so its conversation stays there, or is
+	// refused, never sent elsewhere to be dropped. Off, the default,
+	// keeps magpie's summary.
+	NativeCompaction bool `json:"nativeCompaction,omitempty"`
 
 	// PassUserAgent has a request go to the vendor with the User-Agent the
 	// agent that sent it gave (pi, opencode, Claude Code…), in place of
@@ -334,6 +347,14 @@ type Provider struct {
 	// listed since is served beside picks that held every one listed then
 	// (withNewlyListed), and one listed then and left unpicked stays out.
 	PickedFrom []string `json:"pickedFrom,omitempty"`
+	// RefreshEvery, for a provider of the user's own, is how often the
+	// gateway fetches its model list by itself ("6h", "1d"; none, only when
+	// asked), as Fetch models does (#2135). See autolist.go.
+	RefreshEvery string `json:"refreshEvery,omitempty"`
+	// AutoInclude are patterns over a model's id (a glob with *, or a
+	// regular expression after "re:"): a model a fetch newly lists that one
+	// matches joins Models, beside the picks already there (#2135).
+	AutoInclude []string `json:"autoInclude,omitempty"`
 	// Unlisted keeps the provider's own models out of the list agents see:
 	// it serves only through the routing groups it is in, and by its
 	// "provider/model" ids.
@@ -470,6 +491,28 @@ func FileError() error {
 	return err
 }
 
+// Routings is the routing of each provider and group providers.json sets
+// one for, read from the file alone: for what asks often (the rotation
+// plugin's InUse), without building the catalog and reading every sign-in.
+func Routings() ([]string, error) {
+	f, err := read()
+	if err != nil {
+		return nil, err
+	}
+	var out []string
+	for _, p := range f.Providers {
+		if p.Routing != "" {
+			out = append(out, p.Routing)
+		}
+	}
+	for _, g := range f.Groups {
+		if g.Routing != "" {
+			out = append(out, g.Routing)
+		}
+	}
+	return out, nil
+}
+
 // store replaces providers.json whole, through a file renamed over it, so
 // that a read at that moment sees the old catalog or the new one, never a
 // file cut short.
@@ -530,6 +573,7 @@ func (p Provider) clone() Provider {
 	p.Fallback = slices.Clone(p.Fallback)
 	p.Models = slices.Clone(p.Models)
 	p.PickedFrom = slices.Clone(p.PickedFrom)
+	p.AutoInclude = slices.Clone(p.AutoInclude)
 	p.Headers = maps.Clone(p.Headers)
 	p.ExtraBody = maps.Clone(p.ExtraBody)
 	p.AccountProxies = maps.Clone(p.AccountProxies)
@@ -610,6 +654,7 @@ func withPicks(a, pk Provider) Provider {
 	a.Models, a.Unlisted, a.Off, a.Fallback, a.Routing, a.Affinity, a.KeepLogin, a.KeepLoginAs, a.Contexts, a.Family = pk.Models, pk.Unlisted, pk.Off, pk.Fallback, pk.Routing, pk.Affinity, pk.KeepLogin, pk.KeepLoginAs, pk.Contexts, pk.Family
 	a.SwitchOnly = pk.SwitchOnly
 	a.Sink, a.NoModels = pk.Sink, pk.NoModels
+	a.NativeCompaction = pk.NativeCompaction
 	a.Proxy, a.AccountProxies, a.AccountModels = pk.Proxy, pk.AccountProxies, pk.AccountModels
 	a.AccountCaps, a.AccountWindowCaps = pk.AccountCaps, pk.AccountWindowCaps
 	a.AccountNames = pk.AccountNames
@@ -730,7 +775,7 @@ func Save(p Provider) error {
 		if p.ID == "kiro" {
 			key = p.Key
 		}
-		p = Provider{ID: p.ID, Key: key, Models: p.Models, NoModels: p.NoModels, PickedFrom: p.PickedFrom, Unlisted: p.Unlisted, Off: p.Off, Fallback: p.Fallback, Routing: p.Routing, Sink: p.Sink, Affinity: p.Affinity, KeepLogin: p.KeepLogin, KeepLoginAs: p.KeepLoginAs, SwitchOnly: p.SwitchOnly, Contexts: p.Contexts, Family: p.Family, Proxy: p.Proxy, AccountProxies: p.AccountProxies, AccountModels: p.AccountModels, AccountCaps: p.AccountCaps, AccountWindowCaps: p.AccountWindowCaps, AccountNames: p.AccountNames, MaxConcurrency: p.MaxConcurrency, AccountConcurrency: p.AccountConcurrency, QueueLimit: p.QueueLimit, QueueWait: p.QueueWait, MaxRPM: p.MaxRPM, QuotaRest: p.QuotaRest, QuotaResetAt: p.QuotaResetAt, RestCap: p.RestCap, PinUpstream: p.PinUpstream, Hidden: hiddenAccount(p.ID), Quiet: quietAccount(p.ID), Tucked: tuckedAccount(p.ID)}
+		p = Provider{ID: p.ID, Key: key, Models: p.Models, NoModels: p.NoModels, PickedFrom: p.PickedFrom, Unlisted: p.Unlisted, Off: p.Off, Fallback: p.Fallback, Routing: p.Routing, Sink: p.Sink, Affinity: p.Affinity, KeepLogin: p.KeepLogin, KeepLoginAs: p.KeepLoginAs, SwitchOnly: p.SwitchOnly, Contexts: p.Contexts, Family: p.Family, Proxy: p.Proxy, AccountProxies: p.AccountProxies, AccountModels: p.AccountModels, AccountCaps: p.AccountCaps, AccountWindowCaps: p.AccountWindowCaps, AccountNames: p.AccountNames, MaxConcurrency: p.MaxConcurrency, AccountConcurrency: p.AccountConcurrency, QueueLimit: p.QueueLimit, QueueWait: p.QueueWait, MaxRPM: p.MaxRPM, QuotaRest: p.QuotaRest, QuotaResetAt: p.QuotaResetAt, RestCap: p.RestCap, PinUpstream: p.PinUpstream, NativeCompaction: p.NativeCompaction, Hidden: hiddenAccount(p.ID), Quiet: quietAccount(p.ID), Tucked: tuckedAccount(p.ID)}
 	} else {
 		p.AccountProxies = keyProxies(p) // a provider of keys proxies each key apart
 		if subscriptionID(p.ID) && !stored(p.ID) {
@@ -882,6 +927,7 @@ func AddCopy(p Provider, from string) (string, error) {
 	p.Unlisted = p.Unlisted || src.Unlisted
 	p.Searches = p.Searches || src.Searches
 	p.Unredacted = p.Unredacted || src.Unredacted
+	p.NativeCompaction = p.NativeCompaction || src.NativeCompaction
 	p.PassUserAgent = p.PassUserAgent || src.PassUserAgent
 	if p.Website == "" {
 		p.Website = src.Website
@@ -1163,7 +1209,9 @@ func normalize(p Provider) Provider {
 	p.QueueLimit, p.QueueWait = min(max(p.QueueLimit, 0), MaxQueueLimit), min(max(p.QueueWait, 0), MaxQueueWait)
 	p.MaxRPM = min(max(p.MaxRPM, 0), MaxRPMLimit)
 	p.QuotaRest = min(max(p.QuotaRest, 0), MaxQuotaRest)
-	p.RestCap = min(max(p.RestCap, 0), MaxQuotaRest)
+	if p.RestCap != RestCapOff {
+		p.RestCap = min(max(p.RestCap, 0), MaxQuotaRest)
+	}
 	if _, err := ParseResetAt(p.QuotaResetAt); err != nil {
 		p.QuotaResetAt = ""
 	}

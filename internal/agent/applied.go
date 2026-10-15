@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"encoding/json"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"slices"
@@ -14,6 +15,7 @@ import (
 
 	"github.com/yetone/magpie/internal/edit"
 	"github.com/yetone/magpie/internal/gateway"
+	"github.com/yetone/magpie/internal/lastgood"
 	"github.com/yetone/magpie/internal/provider"
 	"github.com/yetone/magpie/internal/usage"
 )
@@ -44,7 +46,15 @@ func appliedLoad() map[string]applied {
 	return out
 }
 
+// appliedSave writes m as applied.json. It holds what magpie set on every
+// agent, and appliedLoad reads a file that doesn't parse as empty: such a
+// file is copied aside first, and one that can't be copied isn't written
+// over (#2263).
 func appliedSave(m map[string]applied) {
+	if err := lastgood.KeepUnparsed(appliedPath(), lastgood.Into[map[string]applied]); err != nil {
+		log.Printf("applied.json wasn't written over: %v", err)
+		return
+	}
 	b, _ := json.MarshalIndent(m, "", "  ")
 	os.MkdirAll(filepath.Dir(appliedPath()), 0o755)
 	os.WriteFile(appliedPath(), b, 0o600)
@@ -527,6 +537,26 @@ const disconnectedKey = ".disconnected"
 // connected it since.
 func (a *Agent) Disconnected() bool { return stashLoad()[a.ID+disconnectedKey] == "1" }
 
+// noModelLeft says why there is no model of magpie's to connect the agent
+// to: none added yet (NoModelsError), or every one taken out of its lists
+// (AllHiddenError); nil while one is left.
+func (a *Agent) noModelLeft() error {
+	shown, hidden := provider.CatalogFor(a.ListsFor())
+	// nothing to connect it to yet: no provider or subscription added,
+	// which said only that it can't be connected (Tystem on Discord)
+	if len(shown)+len(hidden) == 0 {
+		return &NoModelsError{Agent: a.Name}
+	}
+	// magpie has models, and every one of them is taken out of the
+	// agent's lists (a picked model gone with its provider, one hidden by
+	// hand): saying the agent can't be connected sends the user looking
+	// at the agent, when its model list is what emptied it (#1989)
+	if len(shown) == 0 {
+		return &AllHiddenError{Agent: a.Name}
+	}
+	return nil
+}
+
 func (a *Agent) connect() (Connection, error) {
 	forget(a.ID + disconnectedKey)
 	// what it is on now, for Disconnect to put back what it can't
@@ -569,19 +599,8 @@ func (a *Agent) connect() (Connection, error) {
 		}
 	}
 	if f == nil {
-		// nothing to connect it to yet: no provider or subscription added,
-		// which said only that it can't be connected (Tystem on Discord)
-		shown, hidden := provider.CatalogFor(a.ListsFor())
-		if len(shown)+len(hidden) == 0 {
-			return Connection{}, &NoModelsError{Agent: a.Name}
-		}
-		// magpie has models, and every one of them is taken out of the
-		// agent's lists (a picked model gone with its provider, one hidden
-		// by hand): saying the agent can't be connected sends the user
-		// looking at the agent, when its model list is what emptied it
-		// (#1989)
-		if len(shown) == 0 {
-			return Connection{}, &AllHiddenError{Agent: a.Name}
+		if err := a.noModelLeft(); err != nil {
+			return Connection{}, err
 		}
 		return Connection{}, fmt.Errorf("%s can't be connected to magpie", a.Name)
 	}
@@ -607,7 +626,21 @@ func (a *Agent) connect() (Connection, error) {
 	sameRank, alikeRank := -1, -1
 	for _, o := range opts {
 		if o.Value == magpieID {
-			return Connection{How: "magpie", Field: f.Key, Value: magpieID}, a.Apply(f.Key, magpieID)
+			if err := a.Apply(f.Key, magpieID); err != nil {
+				return Connection{}, err
+			}
+			// an app whose picker gets magpie's models as listed for it
+			// (WorkBuddy, ZCode): with none listed, setting magpie wrote
+			// none, and the agent reads as not connected right after a
+			// connect that said it was (Lumens on Discord). One connected
+			// by its address alone (Cursor Private Inference) is connected
+			// all the same.
+			if !a.Wired() {
+				if err := a.noModelLeft(); err != nil {
+					return Connection{}, err
+				}
+			}
+			return Connection{How: "magpie", Field: f.Key, Value: magpieID}, nil
 		}
 		if o.Ref != "" && o.Group == RoutingGroups && group == "" {
 			group = o.Value

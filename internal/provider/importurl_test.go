@@ -32,6 +32,35 @@ func TestParseImportRegionKeys(t *testing.T) {
 	}
 }
 
+// SiliconFlow's international site is another account: its endpoint, key
+// page and console, while the preset's default stays the China site.
+func TestSiliconFlowInternational(t *testing.T) {
+	p, err := ParseImport("magpie://import?preset=siliconflow&region=intl")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.Chat != "https://api.siliconflow.com/v1" || p.KeysURL != "https://cloud.siliconflow.com/account/ak" || p.Website != "https://cloud.siliconflow.com" {
+		t.Fatalf("intl: got %q %q %q", p.Chat, p.KeysURL, p.Website)
+	}
+	if src, ok := balanceSourceOf(p); !ok || !strings.Contains(src.url, "api.siliconflow.com") {
+		t.Fatalf("intl balance: %+v %v", src, ok)
+	}
+	d, err := FromPreset("siliconflow")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d.Chat != "https://api.siliconflow.cn/v1" || d.KeysURL != "https://cloud.siliconflow.cn/account/ak" {
+		t.Fatalf("default: got %q %q", d.Chat, d.KeysURL)
+	}
+	pr := Preset("siliconflow")
+	if r := d.regionOf(pr); r == nil || r.ID != "cn" {
+		t.Fatalf("a China provider saved before the regions sits at %+v", r)
+	}
+	if r := p.regionOf(pr); r == nil || r.ID != "intl" {
+		t.Fatalf("the international one sits at %+v", r)
+	}
+}
+
 func TestParseImportCustom(t *testing.T) {
 	q := url.Values{
 		"name":      {"My Relay"},
@@ -75,6 +104,64 @@ func TestParseImportRegion(t *testing.T) {
 	}
 	if _, err := ParseImport("magpie://import?preset=" + pr.ID + "&region=nowhere"); err == nil {
 		t.Fatal("unknown region accepted")
+	}
+}
+
+// Bailian's decision regions are different hosts. The CLI's region= and
+// plan= put the provider on that host; an import link that names the same
+// region kept the preset's Beijing workspace host, while the key page
+// followed the region.
+func TestParseImportBailianDecisionRegion(t *testing.T) {
+	sg, err := ParseImport("magpie://import?preset=bailian-decision&region=ap-southeast-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sg.Decide != "https://{WorkspaceId}.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1" {
+		t.Fatalf("Singapore decide = %q", sg.Decide)
+	}
+	if sg.KeysURL != "https://modelstudio.console.alibabacloud.com/?tab=playground#/api-key" {
+		t.Fatalf("Singapore keys = %q", sg.KeysURL)
+	}
+	plan, err := ParseImport("magpie://import?preset=bailian-decision&region=token-plan")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if plan.Decide != "https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1" {
+		t.Fatalf("Token Plan decide = %q", plan.Decide)
+	}
+	if plan.KeysURL != "https://bailian.console.aliyun.com/cn-beijing/subscription/token-plan/personal" {
+		t.Fatalf("Token Plan keys = %q", plan.KeysURL)
+	}
+	bj, err := ParseImport("magpie://import?preset=bailian-decision&region=cn-beijing")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bj.Decide != "https://{WorkspaceId}.cn-beijing.maas.aliyuncs.com/compatible-mode/v1" {
+		t.Fatalf("Beijing decide = %q", bj.Decide)
+	}
+}
+
+// A Gemini-compatible relay is added in the app, the TUI and
+// `magpie provider set` with a Gemini URL alone (#1346, #2201); a link
+// naming one was refused as giving no base URL, and a gemini= beside
+// chat= was dropped without a word.
+func TestParseImportGemini(t *testing.T) {
+	p, err := ParseImport("magpie://import?name=Gemini%20Relay&gemini=https://relay.example/v1beta&key=sk-g")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.Gemini != "https://relay.example/v1beta" || p.Chat != "" || p.Responses != "" || p.Anthropic != "" {
+		t.Fatalf("gemini only: got %+v", p)
+	}
+	p, err = ParseImport("magpie://import?name=X&chat=https://relay.example/v1/&gemini=https://relay.example/v1beta")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.Chat != "https://relay.example/v1" || p.Gemini != "https://relay.example/v1beta" {
+		t.Fatalf("chat and gemini: got %+v", p)
+	}
+	if _, err := ParseImport("magpie://import?name=X&gemini=not-a-url"); err == nil {
+		t.Fatal("a bad gemini= was accepted")
 	}
 }
 

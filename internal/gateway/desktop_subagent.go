@@ -51,3 +51,36 @@ func desktopSubagentPick(r *http.Request, agent, named, resolved string, body []
 	}
 	return pick
 }
+
+// desktopSubagentEffort is independent of a model replacement: effort-only
+// picks, an unchanged model and a kept model all take it. A non-nil Desktop
+// model pick already checked the agent id and tools, so the body isn't decoded
+// twice. With no effort set, even that check is left out.
+func desktopSubagentEffort(r *http.Request, agent string, body []byte, pick *SubagentPick) string {
+	level := provider.DesktopSubagentEffort()
+	if level == "" || agent != "claude-desktop" {
+		return ""
+	}
+	if pick == nil {
+		if sub, _ := subagentOf(r.Header); sub == "" || !hasTools(body) {
+			return ""
+		}
+	}
+	return level
+}
+
+// subagentTurnOf is the Claude Code subagent whose turn r is, for the
+// Routing page's tag (Route.SubagentID): its x-claude-code-agent-id on a
+// request that offers tools and names no kind, the turn
+// desktopSubagentPick and desktopSubagentEffort take. Claude Code sends the
+// id from a terminal as from Desktop, so both are tagged; a subagent's
+// tool-less helper calls aren't its turns. known is a Desktop pick or effort
+// that found the turn already, so the body isn't decoded again, and a
+// request without the id isn't decoded at all.
+func subagentTurnOf(r *http.Request, kind string, body []byte, known bool) string {
+	sub, _ := subagentOf(r.Header)
+	if sub == "" || kind != "" || !known && !hasTools(body) {
+		return ""
+	}
+	return sub
+}

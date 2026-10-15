@@ -82,74 +82,6 @@
     return { read: u.cache_read || 0, total };
   }
 
-  // Routing's closed card uses the same counts, health and final-attempt
-  // cache as the full card, including the estimate while a request runs.
-  function ctxState(r) {
-    const p = r.prompt, live = !r.done;
-    // Keep the pill as wide as its widest state in this language, on
-    // both the shared card and Routing's unified header.
-    const state = live ? "live" : p.counted ? "counted" : "est";
-    const st = el("span", "ctx-state " + state), words = el("span", "ctx-state-w");
-    for (const [k, w] of [["live", "Live"], ["counted", "Counted"], ["est", "Estimated"]]) {
-      const word = el("span", k === state ? "on" : "", t(w));
-      if (k !== state) word.setAttribute("aria-hidden", "true");
-      words.append(word);
-    }
-    st.append(el("i"), words);
-    st.title = t(live ? "The request is on its way: the prompt is estimated from what the agent sent"
-      : p.counted ? "As many tokens as the vendor counted; the parts are measured from the request and scaled to it"
-      : "Estimated from what the agent sent: the vendor didn't say how many tokens it read");
-    return st;
-  }
-  function ctxStack(p) {
-    const window = p.window || 0, bar = el("span", "ctx-stack");
-    bar.setAttribute("role", "img");
-    bar.setAttribute("aria-label", t("{used} of {window} tokens used", { used: fmtK(p.tokens), window: fmtK(window || p.tokens) }));
-    const scale = Math.max(window, p.tokens, 1);
-    for (const k of PARTS) {
-      const n = p.parts.find((x) => x.kind === k)?.tokens || 0;
-      const i = el("i", "k-" + k);
-      i.title = partName(k);
-      i.style.width = +(Math.max(0, n) / scale * 100).toFixed(2) + "%";
-      bar.append(i);
-    }
-    return bar;
-  }
-  function ctxSummary(r, open = false, into = null) {
-    const p = r.prompt, window = p.window || 0;
-    const summary = el("span", "ctx-summary");
-    summary.append(el("span", "ctx-title", t("Context window")));
-    if (open) {
-      summary.append(el("span", "grow"), ctxState(r));
-    } else {
-      const figures = el("span", "ctx-summary-numbers");
-      summary.append(figures);
-      const used = el("span", "ctx-summary-used");
-      used.append(el("b", "", fmtK(p.tokens)), window ? " / " + fmtK(window) : " " + t("tokens"));
-      used.title = t(p.counted ? "Counted" : "Estimated");
-      figures.append(used);
-      if (window) {
-        const fill = p.tokens / window, [tone, word] = health(fill);
-        const h = el("span", "ctx-health " + tone, pct(fill));
-        h.title = t(word) + " · " + t("{tokens} free", { tokens: fmtK(Math.max(0, window - p.tokens)) });
-        figures.append(h);
-      }
-      if (!p.counted || !r.done) figures.append(el("span", "ctx-summary-est", t(!r.done ? "Live" : "Estimated")));
-      const cache = cacheOf(r);
-      if (cache && p.counted !== false) figures.append(el("span", "ctx-summary-cache", t("Cache") + " " + pct(cache.read / cache.total)));
-      summary.append(ctxStack(p));
-    }
-    // A disclosure changes what the head contains. Reusing its figures as
-    // the empty spacer would make the click guard follow that child's new
-    // position, even though the head itself stayed put.
-    if (into && !!into.querySelector(".ctx-summary-numbers") === open) {
-      into.replaceChildren(...summary.childNodes);
-      return into;
-    }
-    return into ? morph(into, summary) : summary;
-  }
-  window.ctxSummary = ctxSummary;
-
   // the cells of the grid, each the part and item it shows; a window
   // smaller than the prompt (not known, or overrun) is the prompt
   function cellsOf(p, window) {
@@ -305,9 +237,7 @@
   // Usage page's Context tab), so it shows unfolded, it alone: the next
   // request drawn in the card takes the reader's choice again
   function ctxCard(r, opts = {}) {
-    const headless = !!opts.headless;
-    const card = el("div", (headless ? "ctx-body" : "ctx-card") + (opts.foldable && ctxShut && !opts.open ? " shut" : ""));
-    const overview = headless ? el("div", "ctx-overview") : card;
+    const card = el("div", "ctx-card" + (opts.foldable && ctxShut && !opts.open ? " shut" : ""));
     card.dataset.place = opts.place || "";
     if (cardWidth[card.dataset.place] !== undefined) sizeCard(card, cardWidth[card.dataset.place]);
     cardSizes.observe(card);
@@ -455,6 +385,22 @@
         };
         title = fold;
       }
+      // the state's words are all there, one shown: the pill is as wide as
+      // the widest in any language, so the model beside it doesn't move as
+      // a request goes from Live to Counted (dumplings on Discord: each
+      // request made the card jitter)
+      const state = live ? "live" : p.counted ? "counted" : "est";
+      const st = el("span", "ctx-state " + state);
+      const words = el("span", "ctx-state-w");
+      for (const [k, w] of [["live", "Live"], ["counted", "Counted"], ["est", "Estimated"]]) {
+        const word = el("span", k === state ? "on" : "", t(w));
+        if (k !== state) word.setAttribute("aria-hidden", "true");
+        words.append(word);
+      }
+      st.append(el("i"), words);
+      st.title = t(live ? "The request is on its way: the prompt is estimated from what the agent sent"
+        : p.counted ? "As many tokens as the vendor counted; the parts are measured from the request and scaled to it"
+        : "Estimated from what the agent sent: the vendor didn't say how many tokens it read");
       head.append(title);
       if (opts.foldable) {
         head.append(el("span", "ctx-short", fmtK(p.tokens) + (window ? " / " + fmtK(window) + " · " + pct(full) : "")));
@@ -475,7 +421,7 @@
       }
       head.append(el("span", "grow"));
       if (r.model) head.append(el("code", "ctx-model", r.model));
-      head.append(ctxState(r));
+      head.append(st);
 
       // how full, and the cache
       const top = el("div", "ctx-top");
@@ -602,18 +548,12 @@
 
       if (!parts) {
         parts = { head, top, legend, foot, sp };
-        if (headless) {
-          overview.append(top, grid, legend, foot, ...(sp ? [sp] : []));
-          card.append(overview, contents, tip);
-        } else card.append(head, top, grid, legend, contents, foot, ...(sp ? [sp] : []), tip);
+        card.append(head, top, grid, legend, contents, foot, ...(sp ? [sp] : []), tip);
         return;
       }
       for (const k of ["head", "top", "legend", "foot"]) parts[k] = morph(parts[k], { head, top, legend, foot }[k]);
       if (sp && parts.sp) parts.sp = morph(parts.sp, sp);
-      else if (sp) {
-        parts.sp = sp;
-        if (headless) overview.append(sp); else card.insertBefore(sp, tip);
-      }
+      else if (sp) card.insertBefore(parts.sp = sp, tip);
       else if (parts.sp) { parts.sp.remove(); parts.sp = null; }
     };
     card.ctxUpdate = fill;
@@ -795,6 +735,10 @@
   let ctxDays = "7";
   try { const d = localStorage.getItem("magpie.ctxDays"); if (CTX_RANGES.some(([id]) => id === d)) ctxDays = d; } catch {}
   let ctxData = null, ctxJSON = "", ctxRead = 0, ctxOpen = "", ctxAgent = "all";
+  // the days the pane shows "Reading…" for: a second read before the history
+  // answers (the page opened, then the first state's refresh) leaves it be,
+  // so the advice drawn meanwhile keeps its entrance
+  let ctxWaiting = "";
 
   const SCORE_NAMES = { cache: "Cache", lean: "Lean start", pace: "Pace", reliable: "Reliability" };
   const SCORE_NOTES = {
@@ -918,6 +862,7 @@
     if (a.latestId) {
       const go = el("button", "text", t("Latest request"));
       go.type = "button";
+      go.dataset.feature = "routing"; // it opens on the Routing page
       go.onclick = () => window.openRoute(a.latestId, a.latestTime, { context: true }).catch((e) => status(e.message, "err"));
       foot.append(go);
     }
@@ -954,7 +899,7 @@
         still: true, cache, place: "session",
         series: s.points,
         crumbs: [agentLabel(s.agent), s.title || s.key.slice(0, 12), t("latest request")],
-        onPoint: (pt) => window.openRoute(pt.id, pt.time, { context: true }).catch((e) => status(e.message, "err")),
+        onPoint: (pt) => { if (!featuresOff.has("routing")) window.openRoute(pt.id, pt.time, { context: true }).catch((e) => status(e.message, "err")); },
       }));
     }
     return box;
@@ -983,15 +928,17 @@
   // how far apart, as a share of the axis, two of its labels must sit: a
   // label is about 30px wide, the narrowest card's axis about 280px
   const TICK_GAP = 0.16;
-  function chart(pts, current, best, show) {
+  function chart(pts, current, best, show, timed) {
     if (pts.length < 2) return null;
     const near = (v) => pts.reduce((a, p) => Math.abs(p.value - v) < Math.abs(a.value - v) ? p : a, pts[0]);
     const now = typeof current === "number" ? near(current) : pts.find((p) => p.value === current);
     const top = typeof best === "number" ? near(best) : pts.find((p) => p.value === best);
     if (!top) return null;
     // measured from the advice, not the cheapest point: tune takes the
-    // largest window within 1% of it, and those cost nothing more here
-    const low = top.cost;
+    // largest window within 1% of it, and those cost nothing more here.
+    // Timed, the advice may pass a cheaper window that waits longer, so
+    // each is said against the cheapest
+    const low = timed ? Math.min(...pts.map((p) => p.cost)) : top.cost;
     const extra = (p) => Math.max(0, p.cost - low);
     const most = Math.max(...pts.map(extra));
     if (!(most > 0)) return null;
@@ -1031,7 +978,8 @@
         dot.append(tag);
       }
       dot.dataset.tt = p === top
-        ? t("{value}: the fewest tokens for how you work", { value: show(p.value) })
+        ? timed ? t("{value}: the fewest tokens without waiting longer on compactions", { value: show(p.value) })
+          : t("{value}: the fewest tokens for how you work", { value: show(p.value) })
         : t("{value}: {tokens} more tokens over the range (+{pct})", { value: show(p.value), tokens: fmtK(extra(p)), pct: pct(extra(p) / low) });
       plot.append(dot);
     };
@@ -1051,7 +999,7 @@
       tagged.push(p);
       return label;
     };
-    const bestTag = tag(top, t("Leanest"));
+    const bestTag = tag(top, timed ? t("Tokens + wait") : t("Leanest"));
     const nowTag = now && now !== top ? tag(now, "+" + pct(extra(now) / low)) : "";
     const worstTag = worst !== now && worst !== top ? tag(worst, "+" + pct(extra(worst) / low)) : "";
     if (worst !== now && worst !== top) at(worst, "worst", worstTag);
@@ -1097,11 +1045,13 @@
       return f;
     };
     vals.append(val("Now", cur, "now"));
-    // named for what it is measured by, tokens alone, not "best" (#1854)
-    if (!same) vals.append(el("span", "ctx-tune-arrow", "→"), val("Fewest tokens", best, "best"));
+    // named for what it is measured by, tokens alone, not "best" (#1854);
+    // with the agent's compactions timed, tokens and the wait on them
+    const timed = !!(a.compact && (r.facts || {}).took > 0);
+    if (!same) vals.append(el("span", "ctx-tune-arrow", "→"), val(timed ? "Tokens + wait" : "Fewest tokens", best, "best"));
     row.append(vals);
     const c = a.compact
-      ? chart(a.compact.curve || [], r.current, r.best, show)
+      ? chart(a.compact.curve || [], r.current, r.best, show, timed)
       : chart([{ value: "5m", cost: r.short }, { value: "1h", cost: r.hour }], r.current, r.best, show);
     if (c) row.append(c);
 
@@ -1111,13 +1061,28 @@
       why.textContent = f.compacts
         ? t("Your conversations grow {growth} a call; a compaction leaves {after}, and reading back what it dropped costs {rework}. {n} compactions in the range.", { growth: fmtK(f.growth), after: fmtK(f.after), rework: fmtK(f.rework), n: f.compacts })
         : t("Your conversations grow {growth} a call, and none was compacted in the range.", { growth: fmtK(f.growth) });
+      // how long the agent's own compactions took, from its files: what a
+      // window that compacts more often would have kept the reader waiting
+      if (timed) {
+        const secs = f.took < 120 ? t("{n}s", { n: f.took }) : fmtDur(f.took);
+        why.textContent += " " + (same
+          ? t("Each compaction kept you waiting about {secs} ({n} timed). Over the range that's about {wait} at {value}.", { secs, n: f.timed, wait: fmtDur(r.wait || 0), value: show(cur) })
+          : t("Each compaction kept you waiting about {secs} ({n} timed). Over the range that's about {wait} at {best}, against {now} at {value}.", { secs, n: f.timed, wait: fmtDur(r.wait_best || 0), best: show(best), now: fmtDur(r.wait || 0), value: show(cur) }));
+        // the cheaper window the advice passed over, for waiting longer
+        const cheap = (a.compact.curve || []).find((p) => p.value === r.cheapest);
+        const adv = same ? r.cost : r.low;
+        if (cheap && r.cheapest !== best && adv > 0 && (adv - cheap.cost) / adv >= 0.03 && (r.wait_cheapest || 0) > (same ? r.wait || 0 : r.wait_best || 0))
+          why.textContent += " " + t("{value} would spend {pct} fewer tokens, but wait about {wait}.", { value: show(r.cheapest), pct: pct((adv - cheap.cost) / adv), wait: fmtDur(r.wait_cheapest) });
+      }
     } else {
       why.textContent = t("{quick} of your calls came within 5 minutes of the one before, {pause} after a pause of 5 to 60 minutes.", { quick: pct(f.quick || 0), pause: pct(f.pause || 0) });
     }
     row.append(why);
     // a window advised is weighed by tokens alone: what a compaction loses of
     // the task isn't measured, and a smaller one compacts more often (#1854)
-    if (a.compact && !same) row.append(el("p", "ctx-tune-caveat", t("A token estimate only: it doesn't measure how well the agent keeps the task after a compaction. The lower the window, the more often it compacts.")));
+    if (a.compact && !same) row.append(el("p", "ctx-tune-caveat", timed
+      ? t("Tokens and waiting only: it doesn't measure how well the agent keeps the task after a compaction. The lower the window, the more often it compacts.")
+      : t("A token estimate only: it doesn't measure how well the agent keeps the task after a compaction. The lower the window, the more often it compacts.")));
 
     const foot = el("div", "ctx-tune-foot");
     const verdict = same || applied
@@ -1173,16 +1138,20 @@
       other.setAttribute("aria-expanded", "false");
       other.onclick = (e) => {
         e.stopPropagation();
-        const base = (pts.find((p) => p.value === best) || {}).cost ?? r.low;
+        // timed, the advice may spend over the cheapest to wait no
+        // longer, so each value is said against the cheapest
+        const cheapest = pts.reduce((x, p) => p.cost < x.cost ? p : x, pts[0]);
+        const base = timed ? cheapest.cost : (pts.find((p) => p.value === best) || {}).cost ?? r.low;
         const now = set.ours && set.value != null ? +set.value : cur;
         const near = pts.reduce((x, p) => Math.abs(p.value - now) < Math.abs(x.value - now) ? p : x, pts[0]);
         const opts = pts.map((p) => {
           const extra = Math.max(0, p.cost - base);
-          const spend = p.value === best ? t("Fewest tokens")
+          const spend = p.value === (timed ? cheapest.value : best) ? t("Fewest tokens")
             : base > 0 && extra / base < 0.005 ? t("As few tokens")
             : t("+{tokens} tokens (+{pct})", { tokens: fmtK(extra), pct: pct(base > 0 ? extra / base : 0) });
           const often = p.compacts == null ? "" : p.compacts ? count(p.compacts, "about 1 compaction", "about {n} compactions") : t("no compaction");
-          return { v: String(p.value), name: show(p.value), literalName: true, note: [spend, often].filter(Boolean).join(" · ") };
+          const wait = timed && p.compacts ? t("about {d} waiting", { d: fmtDur(p.wait || 0) }) : "";
+          return { v: String(p.value), name: show(p.value), literalName: true, note: [spend, often, wait].filter(Boolean).join(" · ") };
         });
         openProtoMenu(other, opts, String(near.value), (v) => {
           if (v !== String(now)) send("apply", v);
@@ -1293,7 +1262,8 @@
   async function loadContext() {
     const read = ++ctxRead, days = ctxDays;
     if (tuneData && tuneData.days !== +days) tuneData = null;
-    if (!ctxData || ctxData.days !== +days) { ctxData = null; renderContext(); }
+    if (ctxData && ctxData.days !== +days) ctxData = null;
+    if (!ctxData && (ctxWaiting !== days || !$("#contextPane")?.childElementCount)) { ctxWaiting = days; renderContext(); }
     loadTune().catch((e) => status(e.message, "err"));
     const data = await api("context?days=" + days);
     if (read !== ctxRead) return;
@@ -1309,7 +1279,4 @@
   }
   window.loadContext = loadContext;
   window.renderContext = renderContext;
-  // opened on the Context tab (?view=usage): app.js showed it, and may have
-  // read the state, before this file was here to load it
-  if (view === "usage" && usageTab === "context") loadContext().catch((e) => status(e.message, "err"));
 })();

@@ -41,7 +41,7 @@ var trayIcon []byte // black glyph, tinted by the macOS menu bar
 var trayFlap embed.FS
 
 //go:embed icon.png
-var appIcon []byte // coloured, for other trays
+var appIcon []byte // coloured, for Windows' tray
 
 // The app's own icon: the Mac's Dock (which it replaces the bundle's .icns
 // in, at up to 512pt), window icons and the about box. At 64px it was
@@ -347,7 +347,7 @@ func Run(version string, showMain bool, link string) error {
 		Name:           "magpie",
 		Description:    "one place to pick every agent's model",
 		Icon:           appIconFor(),
-		Assets:         application.AssetOptions{Handler: handler},
+		Assets:         application.AssetOptions{Handler: ownWindow(handler)},
 		Mac:            application.MacOptions{ActivationPolicy: dockPolicy(settings.Load().Dock)},
 		Windows:        windowsOptions(),
 		// the tray stays when lightweight mode has let both windows go
@@ -488,10 +488,16 @@ func Run(version string, showMain bool, link string) error {
 		go dropTrayName()
 	}
 	h.tray.SetTooltip("magpie")
-	if runtime.GOOS == "darwin" {
-		h.tray.SetTemplateIcon(trayIcon)
+	if icon, template := trayIconFor(runtime.GOOS, traySchemeLight()); template {
+		h.tray.SetTemplateIcon(icon)
 	} else {
-		h.tray.SetIcon(appIcon)
+		h.tray.SetIcon(icon)
+	}
+	if runtime.GOOS == "linux" {
+		go watchTrayScheme(func(light bool) {
+			icon, _ := trayIconFor("linux", light)
+			h.tray.SetIcon(icon)
+		})
 	}
 	h.tray.SetMenu(menu)
 	h.tray.AttachWindow(h.panel).WindowOffset(6)

@@ -1225,8 +1225,28 @@ function authOf(provider) {
 // ---- providers and models ----------------------------------------------------
 
 let modelsDev
+let modelsDevMtime = 0
 function mdev() {
-  if (modelsDev === undefined) modelsDev = (modelsDevPath && readJSON(modelsDevPath)) || {}
+  if (modelsDevPath) {
+    try {
+      const st = fs.statSync(modelsDevPath, { throwIfNoEntry: false })
+      const mtime = st ? st.mtimeMs : 0
+      if (modelsDev === undefined || (mtime > 0 && mtime !== modelsDevMtime) || (Object.keys(modelsDev).length === 0 && mtime > 0)) {
+        // a file caught half written (catalog.Sync writes it in place)
+        // reads as unknown: keep what was read before, rather than list the
+        // providers without models.dev, and read it again next time
+        const md = readJSON(modelsDevPath)
+        if (md) {
+          modelsDev = md
+          modelsDevMtime = mtime
+        } else if (modelsDev === undefined) modelsDev = {}
+      }
+    } catch {
+      if (modelsDev === undefined) modelsDev = {}
+    }
+  } else if (modelsDev === undefined) {
+    modelsDev = {}
+  }
   return modelsDev
 }
 
@@ -1813,7 +1833,9 @@ async function load({ provider, account, proxy }) {
 //       word in the ids of the only models it counts), models? / notModels?
 //       (the ids it counts, or all but these; a bare id and its id@size
 //       count as one), aside? (using it up doesn't
-//       stop the account) }],
+//       stop the account), runsOutAt? (ISO or ms: when the soonest
+//       credits left in it are lost, apart from its reset, as WorkBuddy's
+//       packages end) / runsOut? (how many are lost then) }],
 //     signIn?: "expired" | "kept" | "renewed" (what the read means for the
 //       account's sign-in, as a model request's X-Magpie-Sign-In says;
 //       without it an error saying to sign in again marks the account and
@@ -1866,6 +1888,8 @@ async function usageOf(provider, account) {
       models: ids(w?.models),
       notModels: ids(w?.notModels),
       aside: !!w?.aside,
+      runsOutAt: when(w?.runsOutAt),
+      runsOut: Math.max(0, num(w?.runsOut)),
     })),
   }
 }

@@ -12,6 +12,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/yetone/magpie/internal/lastgood"
 	"github.com/yetone/magpie/internal/provider"
 	"github.com/yetone/magpie/internal/settings"
 )
@@ -251,6 +252,12 @@ func DesktopTiers() map[string]string {
 // SetDesktopTier picks the model (a catalog id) Claude Desktop runs a tier
 // on; "" takes the pick away.
 func SetDesktopTier(tier, id string) error {
+	// DesktopTiers reads a file that doesn't parse as no pick: what it held,
+	// every other tier's pick, is kept aside before it is written over or
+	// taken away
+	if err := lastgood.KeepUnparsed(desktopTiersPath(), lastgood.Into[map[string]string]); err != nil {
+		return err
+	}
 	tiers := DesktopTiers()
 	if id == "" {
 		delete(tiers, tier)
@@ -336,13 +343,17 @@ func desktopNames(entries []provider.Entry) []string {
 // aliased is the catalog id an alias Claude Desktop was given stands for:
 // anthropic/magpie-<number> (as it was listed before too),
 // mythos-magpie-<number> or magpie-<number>.anthropic.<claude model>, with
-// or without Claude Code's "[1m]".
+// or without Claude Code's "[1m]"; or Claude Science's,
+// claude-magpie-<number>.
 func aliased(id string) (string, bool) {
 	id = strings.TrimSuffix(id, "[1m]")
 	var number string
 	if n, ok := strings.CutPrefix(id, desktopAlias); ok {
 		number = n
 	} else if n, ok := strings.CutPrefix(id, desktopEffortAlias); ok {
+		number = n
+	} else if n, ok := strings.CutPrefix(id, scienceAlias); ok {
+		// Claude Science's (science.go)
 		number = n
 	} else if rest, ok := strings.CutPrefix(id, "magpie-"); ok {
 		if i := strings.Index(rest, desktopClaudeInfix); i > 0 {
@@ -433,7 +444,14 @@ func desktopTurn(asked string, body []byte, byClaudeCode, bySubagent bool) strin
 	if byClaudeCode {
 		aside = desktopTitle(body)
 	}
-	if unserved(asked) || !tools && aside && desktopAccepts(asked) {
+	title := !tools && aside && desktopAccepts(asked)
+	gone := unserved(asked)
+	if gone && !title {
+		if m := servedBeside(asked, picked); m != "" {
+			return m
+		}
+	}
+	if gone || title {
 		if picked != "" {
 			return picked
 		}
@@ -449,6 +467,51 @@ func desktopTurn(asked string, body []byte, byClaudeCode, bySubagent bool) strin
 		}
 	}
 	return asked
+}
+
+// servedBeside is the catalog id the session's provider serves a Claude
+// model by that Claude Code asked for by Claude's own id, which no entry
+// has as its id or model: another magpie (a Remote magpie provider) lists
+// it under its own provider's prefix, office/claude/claude-sonnet-5 with
+// the model claude/claude-sonnet-5. Its auto mode's classifier asks for
+// its sonnet by name while the session is on office/claude/claude-opus-5-5,
+// and went to that opus, writing an hour's cache for each tiny reply
+// (#2187, SuInk). Only the provider picked is looked at, so another
+// provider's model of the same name doesn't take it; of that provider's,
+// the one beside the picked model (the same subscription there) comes
+// first. "" when the session's provider serves no such model.
+func servedBeside(asked, picked string) string {
+	bare := strings.TrimSuffix(asked, "[1m]")
+	if picked == "" || strings.Contains(bare, "/") || claudeTier(bare) == "" {
+		return ""
+	}
+	cat := provider.Catalog()
+	var pid, dir string
+	for _, e := range cat {
+		if e.ID == strings.TrimSuffix(picked, "[1m]") && e.Group == "" {
+			pid = e.Provider.ID
+			if i := strings.LastIndex(e.Model, "/"); i >= 0 {
+				dir = e.Model[:i+1]
+			}
+			break
+		}
+	}
+	if pid == "" {
+		return ""
+	}
+	found := ""
+	for _, e := range cat {
+		if e.Group != "" || e.Provider.ID != pid || !strings.HasSuffix(e.Model, "/"+bare) {
+			continue
+		}
+		if dir != "" && e.Model == dir+bare {
+			return e.ID + strings.TrimPrefix(asked, bare)
+		}
+		if found == "" {
+			found = e.ID + strings.TrimPrefix(asked, bare)
+		}
+	}
+	return found
 }
 
 // desktopDefault is the model a request Desktop sends before any turn has

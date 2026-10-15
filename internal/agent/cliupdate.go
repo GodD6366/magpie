@@ -25,6 +25,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf16"
 
 	"github.com/yetone/magpie/internal/edit"
 	"github.com/yetone/magpie/internal/netproxy"
@@ -141,8 +142,18 @@ var cliSpecs = map[string]cliSpec{
 			}
 			return nil
 		}},
-	"pi":        {npm: []string{"@earendil-works/pi-coding-agent", "@mariozechner/pi-coding-agent"}, brew: []string{"pi-coding-agent"}},
-	"omp":       {npm: []string{"@oh-my-pi/pi-coding-agent"}},
+	"pi": {npm: []string{"@earendil-works/pi-coding-agent", "@mariozechner/pi-coding-agent"}, brew: []string{"pi-coding-agent"}},
+	// omp: bun's global, or omp.sh's -Binary install, a binary of its own
+	// in ~/.local/bin (install, PI_INSTALL_DIR aside) or
+	// %LOCALAPPDATA%\omp (install.ps1), which omp update replaces with
+	// the release's, as the reporter of #2192 saw it do
+	"omp": {npm: []string{"@oh-my-pi/pi-coding-agent"},
+		self: func(bin, real string) []string {
+			if l := strings.ToLower(real); strings.HasSuffix(l, "/.local/bin/omp") || strings.HasSuffix(l, "/appdata/local/omp/omp.exe") {
+				return []string{bin, "update"}
+			}
+			return nil
+		}},
 	"copilot":   {npm: []string{"@github/copilot"}, brew: []string{"copilot-cli"}},
 	"crush":     {npm: []string{"@charmland/crush"}, brew: []string{"crush"}},
 	"cline":     {npm: []string{"cline"}, brew: []string{"cline"}},
@@ -310,12 +321,12 @@ func fromNodeModules(pkg, bin, real string) *updater {
 		if !isDir(filepath.Join(filepath.FromSlash(modules), filepath.FromSlash(pkg))) {
 			modules = "" // pnpm's shims name a store elsewhere
 		}
-	} else {
+	} else if !bunxNames(bin, pkg) {
 		return nil
 	}
 	lower := strings.ToLower(real + "|" + filepath.ToSlash(bin))
 	switch {
-	case strings.Contains(lower, "/.bun/"):
+	case strings.Contains(lower, "/.bun/") || modules == "" && bunxNames(bin, pkg):
 		bun := filepath.Join(filepath.Dir(bin), exe("bun"))
 		if !isFile(bun) {
 			var err error
@@ -367,6 +378,26 @@ func fromNodeModules(pkg, bin, real string) *updater {
 	}
 	u.cmd = []string{npm, "install", "-g", "--prefix", prefix, pkg + "@latest"}
 	return u
+}
+
+// bunxNames says whether bin is bun's Windows shim of pkg's program: a
+// small opencode.exe that runs what the opencode.bunx beside it names, in
+// UTF-16, from bun's folder: install\global\node_modules\opencode-ai\
+// bin\opencode.exe (bun 1.4.3, #2192). The .exe itself names no package.
+func bunxNames(bin, pkg string) bool {
+	if !strings.EqualFold(filepath.Ext(bin), ".exe") {
+		return false
+	}
+	b, err := os.ReadFile(strings.TrimSuffix(bin, filepath.Ext(bin)) + ".bunx")
+	if err != nil || len(b) > 64<<10 {
+		return false
+	}
+	u := make([]uint16, 0, len(b)/2)
+	for i := 0; i+1 < len(b); i += 2 {
+		u = append(u, uint16(b[i])|uint16(b[i+1])<<8)
+	}
+	named := strings.ReplaceAll(string(utf16.Decode(u)), `\`, "/")
+	return strings.Contains(named, "node_modules/"+pkg+"/")
 }
 
 // shimNames says whether bin is a small script naming pkg's folder.
@@ -702,7 +733,13 @@ func offPath(bin string, dirs []string) bool {
 }
 
 // cliBin is where the agent's CLI is, "" when it has none magpie knows or
-// it isn't on PATH.
+// none is installed. One not on magpie's PATH is looked for where a user's
+// tools are installed (proc.FindTool), on every system as on Windows: a
+// `magpie serve` or a service started with a PATH that lacks ~/.bun/bin, an
+// npm prefix or an nvm Node other than the default never found omp there,
+// so its version stayed unknown and its models offered xhigh in place of
+// max (whqtian on Discord: fixed on Windows and in WSL, still xhigh on
+// Ubuntu).
 func (a *Agent) cliBin() (string, cliSpec) {
 	spec, ok := cliSpecs[a.ID]
 	if !ok || a.WSL != "" {
@@ -724,6 +761,9 @@ func (a *Agent) cliBin() (string, cliSpec) {
 		return "", spec
 	}
 	bin := binAt(a.Bin)
+	if bin == "" {
+		bin = proc.FindTool(a.Bin)
+	}
 	if bin == "" {
 		return "", spec
 	}
@@ -875,7 +915,9 @@ func updateEnv(u *updater) []string {
 			}
 		}
 	}
-	return append(env, "NONINTERACTIVE=1", "HOMEBREW_NO_ENV_HINTS=1", "NO_COLOR=1")
+	// the --version run after an update starts Cline, which would otherwise
+	// check for (and schedule) an update of its own
+	return append(env, "NONINTERACTIVE=1", "HOMEBREW_NO_ENV_HINTS=1", "NO_COLOR=1", "CLINE_NO_AUTO_UPDATE=1")
 }
 
 // updateTimeout bounds an update: a download, or Homebrew updating itself first.

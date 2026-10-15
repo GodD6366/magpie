@@ -201,6 +201,9 @@ type Request struct {
 	// output: format.go), nil for plain text. Text, a Responses client's,
 	// holds it no more: it is asked for again in the upstream's own words.
 	Format *Format
+	// FormatTold is set when Format was told in the system prompt instead
+	// (inSystem): the client still wants the answer as JSON.
+	FormatTold bool
 	// GeminiCompat is the upstream being Gemini's OpenAI-compatible API
 	// (AI Studio's, or a proxy in front of it on this machine or the LAN),
 	// which gives the model's thoughts only when asked in thinking_config.
@@ -627,7 +630,7 @@ func stringOrText(raw json.RawMessage) string {
 				if b.Len() > 0 {
 					b.WriteString("\n")
 				}
-				b.WriteString("Tool " + x.ToolName + " is loaded and can be called now.")
+				b.WriteString(toolLoadedText(x.ToolName))
 			}
 		}
 		return b.String()

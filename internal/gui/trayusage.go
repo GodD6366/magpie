@@ -192,10 +192,7 @@ func trayUsageCards(ctx context.Context, ids []string) []provider.SubscriptionQu
 			continue
 		}
 		if currency == "" {
-			currency = settings.Load().Currency
-			if currency == "cny" {
-				rate = fx.Soon().CNYPerUSD // never waited for, as the Settings page's
-			}
+			currency, rate = trayCurrency()
 		}
 		cards = append(cards, trayTotalCard(id, trayTotalSum(p), currency, rate))
 	}
@@ -220,22 +217,31 @@ func trayTotalPeriod(id string) (usage.Period, bool) {
 	return usage.Period(p), true
 }
 
-// trayTotalSum is a period's sum as the Usage page's Overview has it (its
-// cached summary, without the sessions); a var for tests.
-var trayTotalSum = func(p usage.Period) usage.Totals { return usage.SummarizeTop(p, 0).Totals }
+// trayTotalSum is a period's sum as the Usage page's Requests tab and the
+// panel's Usage tab have it, the pages a click on it opens: the gateway's
+// requests and the calls the agents' session files record beside them,
+// from the ledger's cached index; a var for tests. The Overview's summary,
+// summed before, left those calls out (NextCommit on Discord).
+var trayTotalSum = func(p usage.Period) usage.Totals { return usage.QueryPage(p, usage.Filter{}, 0, 1).Sum }
 
-// trayTotalCard is a total as a card: its rows are the tokens in and out
-// (cache aside, as the Usage page counts them) over the cost, in the
-// currency Settings says, "+" when some calls had no known price; nothing
-// beneath the tokens when none had one. Its name is the tooltip, which
-// spells them out.
+// trayTotalCard is a total as a card: its rows are every token, the
+// cache's too, as the Requests tab's and the panel's Tokens count them,
+// marked Σ so it doesn't read as the input alone (NextCommit on Discord),
+// over the cost, in the currency Settings says, "+" when some calls had no
+// known price; nothing beneath the tokens when none had one. Its name is
+// the tooltip, which spells out the input, output and cache.
 func trayTotalCard(id string, t usage.Totals, currency string, rate float64) provider.SubscriptionQuota {
 	when := "Today"
 	if p, _ := trayTotalPeriod(id); p == usage.Week {
 		when = "Last 7 days"
 	}
-	rows := []string{trayCount(t.Tokens())}
-	tip := when + " in magpie\n" + trayCount(t.Tokens()) + " tokens (" + trayCount(t.Input) + " in · " + trayCount(t.Output) + " out)"
+	all := t.Tokens() + t.CacheRead + t.CacheWrite
+	rows := []string{"Σ" + trayCount(all)}
+	tip := when + " in magpie\n" + trayCount(all) + " tokens (" + trayCount(t.Input) + " in · " + trayCount(t.Output) + " out"
+	if cached := t.CacheRead + t.CacheWrite; cached > 0 {
+		tip += " · " + trayCount(cached) + " cached"
+	}
+	tip += ")"
 	if t.Cost > 0 {
 		c := usage.FormatCost(t.Cost, currency, rate)
 		if t.Unpriced > 0 {
@@ -249,6 +255,39 @@ func trayTotalCard(id string, t usage.Totals, currency string, rate float64) pro
 		tip += fmt.Sprintf(", %d with no known price", t.Unpriced)
 	}
 	return provider.SubscriptionQuota{Provider: id, Name: tip, Balance: strings.Join(rows, " · ")}
+}
+
+// trayCurrency is the currency Settings shows costs in, and the yuan's
+// rate when that is CNY.
+func trayCurrency() (currency string, rate float64) {
+	currency = settings.Load().Currency
+	if currency == "cny" {
+		rate = fx.Soon().CNYPerUSD // never waited for, as the Settings page's
+	}
+	return currency, rate
+}
+
+// trayIdleTip is the tooltip while the menu bar shows no cards: magpie's
+// name over a line of what went through it today, as the panel's Usage tab
+// counts it (ylorn on Discord: a Linux bar's tooltip said only "magpie").
+// The whole of today's total, spelled out, is the usage:today card's.
+func trayIdleTip(t usage.Totals, currency string, rate float64) string {
+	if t.Calls == 0 {
+		return "magpie\nToday: no requests yet"
+	}
+	line := "Today: " + trayCount(t.Tokens()+t.CacheRead+t.CacheWrite) + " tokens"
+	if t.Cost > 0 {
+		c := usage.FormatCost(t.Cost, currency, rate)
+		if t.Unpriced > 0 {
+			c += "+"
+		}
+		line += " · ≈" + c
+	}
+	n := "requests"
+	if t.Calls == 1 {
+		n = "request"
+	}
+	return fmt.Sprintf("magpie\n%s · %d %s", line, t.Calls, n)
 }
 
 // trayCount is a count as the Usage page says it in English: 133M, 1.2M,

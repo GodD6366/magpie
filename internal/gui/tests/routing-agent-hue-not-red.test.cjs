@@ -50,10 +50,10 @@ async function redsOf() {
 
 test("no colour an agent can be marked with reads as the failure red", async () => {
   const reds = await redsOf();
-  const js = await fs.readFile(path.join(assets, "routing.js"), "utf8");
+  const js = await fs.readFile(path.join(assets, "plugins/routing/client.js"), "utf8");
   const hues = js.match(/const HUES = \{([\s\S]*?)\};/);
   const spare = js.match(/const SPARE = \[([^\]]*)\]/);
-  assert(hues && spare, "hueOf's palette not found in routing.js");
+  assert(hues && spare, "hueOf's palette not found in routing/client.js");
   const all = [...hues[1].matchAll(/(\w+):\s*"(#[0-9a-f]{6})"/gi)].map((m) => [m[1], m[2]])
     .concat([...spare[1].matchAll(/"(#[0-9a-f]{6})"/gi)].map((m) => ["spare", m[1]]));
   assert(all.length > 10, "palette too small: " + JSON.stringify(all));
@@ -96,18 +96,6 @@ function serve(lang) {
   };
 }
 
-// History can be below the phone footer after the full story paints.
-// Reach it with user input; click scrolling is intentionally blocked.
-async function reach(page, target, width) {
-  for (let i = 0; i < 20; i++) {
-    const box = await target.boundingBox(), view = await page.locator("#view-routing").boundingBox();
-    if (box && box.y >= view.y && box.y + box.height <= view.y + view.height) break;
-    await page.mouse.move(width / 2, 380);
-    await page.mouse.wheel(0, box && box.y < view.y ? -250 : 250);
-    await page.waitForTimeout(100);
-  }
-}
-
 for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium", "webkit"])) {
   for (const lang of ["en", "zh", "zh-TW", "ja", "de"]) {
     for (const width of [1100, 420]) {
@@ -128,12 +116,8 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
           await browser.close();
         });
         await page.goto("http://magpie.test/?view=routing");
-        const day = page.locator(".rt-days .rt-day").nth(1);
-        await reach(page, day, width);
-        await day.click();
-        const row = page.locator(".rt-req").first();
-        await reach(page, row, width);
-        await row.click();
+        await page.locator(".rt-days .rt-day").nth(1).click();
+        await page.locator(".rt-req").first().click();
         const src = page.locator(".rt-src").filter({ hasText: "OpenAI" });
         await src.waitFor();
         const got = await src.evaluate((n) => ({

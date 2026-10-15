@@ -221,7 +221,8 @@ type agentJSON struct {
 	// account failover alone (agent.Agent.FailingOver, #1385)
 	Failover bool `json:"failover,omitempty"`
 	// CLIMissing: its settings are here, its CLI isn't (#843), which
-	// the row says, and Install another agent offers it again
+	// the row says with none of its settings offered (#2177), and Install
+	// another agent offers it again where magpie knows how
 	CLIMissing bool               `json:"cliMissing,omitempty"`
 	Native     *agent.NativeState `json:"native,omitempty"`
 }
@@ -874,7 +875,7 @@ func Handler(w Windows, gw *gateway.Server) http.Handler {
 			return
 		}
 		s := state()
-		if a.Notice != nil && (!f.Live || !wired) {
+		if a.Notice != nil && (!f.Live || !wired && a.Wired()) {
 			s.Notice = a.Notice()
 		}
 		writeJSON(rw, s)
@@ -1228,6 +1229,7 @@ func Handler(w Windows, gw *gateway.Server) http.Handler {
 		// in their Agents rows
 		in.CodexSubagentModel = cur.CodexSubagentModel
 		in.DesktopSubagentModel = cur.DesktopSubagentModel
+		in.DesktopSubagentEffort = cur.DesktopSubagentEffort
 		in.ChinaMirror = cur.ChinaMirror // the Plugins page's, set on its own
 		// which Codex accounts spend a reset by themselves, set on the Usage card
 		in.CodexAutoReset = cur.CodexAutoReset

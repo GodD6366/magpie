@@ -121,6 +121,9 @@ func lockAuth() func() {
 
 func listPath() string { return filepath.Join(settings.Dir(), "plugins.json") }
 
+// ListPath is plugins.json's path.
+func ListPath() string { return listPath() }
+
 // pluginsList is plugins.json as last read, with the bytes it was parsed
 // from. The file is read every time: an edit that keeps the file's size and
 // time (a swap of two accounts of one length, a replaced file whose time is
@@ -281,10 +284,15 @@ func checkList() {
 }
 
 // IsPath is whether spec names a file or folder rather than a package,
-// as OpenCode tells them apart.
+// as OpenCode tells them apart. A path rooted the way any system roots
+// one counts on every system, since plugins.json travels between
+// machines in a backup or a sync: a leading / or \ (a UNC path among
+// them) on Windows as well, and a drive letter off it (#2229).
 func IsPath(spec string) bool {
-	return strings.HasPrefix(spec, "file://") || strings.HasPrefix(spec, ".") || filepath.IsAbs(spec) || regexp.MustCompile(`^[A-Za-z]:[\\/]`).MatchString(spec)
+	return strings.HasPrefix(spec, "file://") || strings.HasPrefix(spec, ".") || strings.HasPrefix(spec, "/") || strings.HasPrefix(spec, `\`) || filepath.IsAbs(spec) || driveRooted.MatchString(spec)
 }
+
+var driveRooted = regexp.MustCompile(`^[A-Za-z]:[\\/]`)
 
 var pkgName = regexp.MustCompile(`^(@[a-z0-9][a-z0-9._~-]*/)?[a-z0-9][a-z0-9._~-]*$`)
 
@@ -672,8 +680,28 @@ func install(ctx context.Context, spec string) error {
 			return err
 		}
 	}
+	defer installMu.Unlock()
+	err = bunAdd(ctx, bun, spec)
+	// a @magpie-community package or version npm doesn't have (a new
+	// one waits for an owner to publish it there) comes from the
+	// community repo's dist branch; one Bun's minimumReleaseAge holds
+	// back stays held, as the user's bunfig asks
+	if name, version, ok := distWanted(spec); ok && err != nil && !minAge.MatchString(err.Error()) {
+		if derr := installDist(ctx, bun, name, version); derr != nil {
+			return fmt.Errorf("%w (and from the community repo's dist branch: %v)", err, derr)
+		}
+		err = nil
+	}
+	if err == nil {
+		pruneDist()
+	}
+	return err
+}
+
+// bunAdd adds spec to plugins/ with bun, its scripts left unrun.
+// installMu held.
+func bunAdd(ctx context.Context, bun, spec string) error {
 	out, err := bunCommand(ctx, bun, Dir(), "add", "--ignore-scripts", spec).CombinedOutput()
-	installMu.Unlock()
 	if err != nil {
 		if hint := missingLibs(string(out)); hint != "" {
 			return fmt.Errorf("bun add %s: %s: %w", spec, hint, err)

@@ -172,6 +172,26 @@ var rtkSpecs = map[string]rtkSpec{
 		},
 		dir: func(*agent.Agent) string { return filepath.Join(home(), ".copilot") },
 	},
+	// Antigravity CLI (agy): rtk 0.51 on writes a plugin of its own into
+	// Antigravity's global customization folder, ~/.gemini/config, shared
+	// by the CLI and the IDE (src/hooks/init/antigravity.rs): plugin.json,
+	// hooks.json (PreToolUse → rtk hook antigravity) and rules/AGENTS.md,
+	// all in plugins/rtk. agy discovers a plugin there by its plugin.json.
+	// The Antigravity branch reads no patch mode, so --auto-patch isn't
+	// given; rtk's own uninstaller for it ran Claude Code's
+	// (rtk-ai/rtk#3404), so the folder is taken out by magpie.
+	"agy": {
+		flags: []string{"--agent", "antigravity"}, blocked: agyBlocked,
+		has: func(*agent.Agent) bool {
+			return contains(filepath.Join(agyPlugin(), "hooks.json"), "rtk hook antigravity")
+		},
+		files: func(*agent.Agent) []string {
+			d := agyPlugin()
+			return []string{filepath.Join(d, "plugin.json"), filepath.Join(d, "hooks.json"), filepath.Join(d, "rules", "AGENTS.md")}
+		},
+		remove: func(*agent.Agent) error { return os.RemoveAll(agyPlugin()) },
+		dir:    func(*agent.Agent) string { return filepath.Dir(filepath.Dir(agyPlugin())) },
+	},
 	"pi":  extensionSpec("pi"),
 	"omp": extensionSpec("omp"),
 	// Hermes's folder is the agent's (appdir.HermesHome): $HERMES_HOME,
@@ -244,6 +264,20 @@ func codexBlocked() string {
 		return ""
 	}
 	return fmt.Sprintf("Codex's hook needs RTK 0.50 or newer, and this RTK is %s: older ones only add @RTK.md to AGENTS.md, which rewrites no command. Update RTK (brew upgrade rtk, or its installer again), then switch it on", v)
+}
+
+// agyPlugin is the folder rtk's installer writes its Antigravity plugin to.
+func agyPlugin() string { return filepath.Join(home(), ".gemini", "config", "plugins", "rtk") }
+
+// agyBlocked: rtk installs for Antigravity globally from 0.51.0 on; 0.50
+// knows it only per project and fails rtk init -g --agent antigravity
+// ("Antigravity is project-scoped"), so an older rtk isn't run for it.
+func agyBlocked() string {
+	v := rtkVersion()
+	if v == "" || !older(v, 0, 51) {
+		return ""
+	}
+	return fmt.Sprintf("Antigravity CLI's hook needs RTK 0.51 or newer, and this RTK is %s, which installs it only per project, not for every project. Update RTK (brew upgrade rtk, or its installer again), then switch it on", v)
 }
 
 // older says whether version v is before major.minor.
@@ -626,7 +660,11 @@ func rtkAgents(agents []*agent.Agent) []*agent.Agent {
 	}
 	var out []*agent.Agent
 	for _, a := range agents {
-		if _, ok := rtkSpecs[a.ID]; ok {
+		sp, ok := rtkSpecs[a.ID]
+		// an uninstall that left the folder behind (#2254) isn't given rtk,
+		// as the library gives it nothing (Targets); one with rtk's hook
+		// still shows, so the hook can be taken out
+		if ok && (!a.CLIMissing() || sp.has(a)) {
 			out = append(out, a)
 		}
 	}
@@ -653,7 +691,7 @@ func ReadRTK() *RTKView {
 		v.Agents = append(v.Agents, ra)
 	}
 	for _, a := range agents {
-		if why, ok := rtkNoHook[a.ID]; ok {
+		if why, ok := rtkNoHook[a.ID]; ok && !a.CLIMissing() {
 			v.Agents = append(v.Agents, RTKAgent{ID: a.ID, Name: a.Name, Icon: a.Icon, Blocked: why, NoHook: true})
 		}
 	}

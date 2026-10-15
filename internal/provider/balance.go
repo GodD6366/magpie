@@ -17,6 +17,7 @@ import (
 	"math"
 	"net/http"
 	"net/url"
+	"regexp"
 	"slices"
 	"strconv"
 	"strings"
@@ -40,6 +41,7 @@ type balanceSource struct {
 // balanceSourceOf is the provider's own endpoint when it named one, else
 // the one its host is known to have.
 func balanceSourceOf(p Provider) (balanceSource, bool) {
+	p = keyQueryOf(p)
 	if p.BalanceURL != "" {
 		path := balancePathOf(p)
 		// a token saved beside it (a new-api relay's access token, its
@@ -84,6 +86,7 @@ func balanceSourceOf(p Provider) (balanceSource, bool) {
 // balancePathOf is the balance field of a provider that named its Balance
 // URL.
 func balancePathOf(p Provider) string {
+	p = keyQueryOf(p)
 	if strings.TrimSpace(p.BalancePath) != "" {
 		return p.BalancePath
 	}
@@ -131,6 +134,61 @@ const (
 	sub2APIKeyUsage = "/v1/usage"
 )
 
+// tokenQueries are the account queries that only a balance token can
+// ask, each with the same panel's query for a key and the field magpie
+// reads from the account's reply when none is given.
+var tokenQueries = []struct{ account, key, field string }{
+	{sub2APIProfile, sub2APIKeyUsage, "$data.balance"},
+	{newAPIUserSelf, newAPIKeyUsage, newAPIQuotaPath},
+}
+
+// keyQueryOf is p asking its panel's query for a key when its Balance URL
+// is an account query left without the token it needs: the token removed
+// after the editor's "Use …/api/v1/user/profile" (lx_78654 on Discord),
+// where the key could only be refused and the card said "Allowance
+// unavailable" for good. The same panel's key query is asked with the key
+// instead, its field read as that query's unless the user wrote one of
+// their own. The saved URL is left as the user set it; a token pasted
+// again asks the account query again. One with an Authorization or Cookie
+// header of the user's own still asks it as they set it.
+func keyQueryOf(p Provider) Provider {
+	p = keyNotToken(p)
+	if p.BalanceURL == "" || strings.TrimSpace(p.BalanceToken) != "" {
+		return p
+	}
+	for k, v := range p.Headers {
+		if strings.TrimSpace(v) != "" && (strings.EqualFold(k, "Authorization") || strings.EqualFold(k, "Cookie")) {
+			return p
+		}
+	}
+	u, err := url.Parse(strings.TrimSpace(p.BalanceURL))
+	if err != nil || u.Host == "" {
+		return p
+	}
+	path := strings.TrimRight(u.Path, "/")
+	for _, q := range tokenQueries {
+		base, ok := strings.CutSuffix(path, q.account)
+		if !ok {
+			continue
+		}
+		u.Path, u.RawPath, u.RawQuery, u.Fragment = base+q.key, "", "", ""
+		p.BalanceURL = u.String()
+		if f := strings.TrimSpace(p.BalancePath); f == q.field {
+			p.BalancePath = ""
+		}
+		return p
+	}
+	return p
+}
+
+// BalanceQuery is the Balance URL and field the provider's balance is
+// asked at, which differ from the saved ones for an account query left
+// without its token (keyQueryOf).
+func BalanceQuery(p Provider) (balanceURL, field string) {
+	p = keyQueryOf(p)
+	return p.BalanceURL, p.BalancePath
+}
+
 // balanceURLPath is a balance URL's path, without a slash at its end.
 func balanceURLPath(raw string) string {
 	u, err := url.Parse(strings.TrimSpace(raw))
@@ -148,7 +206,25 @@ func errKeyUsageWithToken(raw string) error {
 	if u, err := url.Parse(strings.TrimSpace(raw)); err == nil && u.Host != "" {
 		self = u.Scheme + "://" + u.Host + newAPIUserSelf
 	}
-	return fmt.Errorf("the Balance URL %s takes the API key, not the access token: set it to %s (Balance field %s) for the account's balance, or remove the token for the key's own", raw, self, newAPIQuotaPath)
+	return errKeyQueryWithToken(raw, self, newAPIQuotaPath, "access token")
+}
+
+// errSub2APIKeyUsageWithToken is a login token beside sub2api's query for a
+// key, which takes the key alone as new-api's does: the panel's query for
+// the account is named in its place.
+func errSub2APIKeyUsageWithToken(raw string) error {
+	profile := sub2APIProfile
+	if u, err := url.Parse(strings.TrimSpace(raw)); err == nil && u.Host != "" {
+		profile = u.Scheme + "://" + u.Host + sub2APIProfile
+	}
+	return errKeyQueryWithToken(raw, profile, "$data.balance", "login token")
+}
+
+// errKeyQueryWithToken is a balance token beside a panel's query for a key
+// (new-api's /api/usage/token, sub2api's /v1/usage), which never takes it:
+// what to name in its place is said.
+func errKeyQueryWithToken(raw, accountURL, accountField, token string) error {
+	return fmt.Errorf("the Balance URL %s takes the API key, not the %s: set it to %s (Balance field %s) for the account's balance, or remove the token for the key's own", raw, token, accountURL, accountField)
 }
 
 // balanceRefusal is what a reply of {"success":false,"message":…} says, a
@@ -1069,12 +1145,18 @@ func Balance(ctx context.Context, p Provider) (amount string, ok bool, err error
 // limits, readSub2APIKeyLimits).
 func balanceRead(ctx context.Context, p Provider) (amount string, parts []BalancePart, ws []QuotaWindow, ok bool, err error) {
 	ctx = p.Via(ctx)
+	p = keyQueryOf(p)
 	src, ok := balanceSourceOf(p)
 	if !ok || p.Account != nil || p.Key == "" {
 		return "", nil, nil, false, nil
 	}
-	if src.token != "" && p.BalanceURL != "" && balanceURLPath(p.BalanceURL) == newAPIKeyUsage {
-		return "", nil, nil, true, errKeyUsageWithToken(p.BalanceURL)
+	if src.token != "" && p.BalanceURL != "" {
+		switch balanceURLPath(p.BalanceURL) {
+		case newAPIKeyUsage:
+			return "", nil, nil, true, errKeyUsageWithToken(p.BalanceURL)
+		case sub2APIKeyUsage:
+			return "", nil, nil, true, errSub2APIKeyUsageWithToken(p.BalanceURL)
+		}
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, withBalanceKey(src.url, p.Key, true), nil)
 	if err != nil {
@@ -1156,14 +1238,20 @@ func balanceRead(ctx context.Context, p Provider) (amount string, parts []Balanc
 // query for a key, whose reply tells the key's own limits when it has
 // some.
 func sub2APIKeyLimits(p Provider) bool {
+	p = keyQueryOf(p)
 	return p.BalanceURL != "" && balanceURLPath(p.BalanceURL) == sub2APIKeyUsage
 }
 
 // balanceKeyNames are what a Balance URL or a header's value names the
 // key by, for a vendor that wants it somewhere of its own, in the query
-// most often (…/balance?key={key}): each key the provider has on is put in
-// its own ask, so each card tells that key's balance.
-var balanceKeyNames = []string{"{key}", "{apiKey}", "{api_key}"}
+// most often (…/balance?key={key}) or a header (Authorization: Bearer
+// {token}): each key the provider has on is put in its own ask, so each
+// card tells that key's balance. Any case, in one or two braces or as
+// ${…}: {key}, {apiKey}, {api_key}, {API_KEY}, {token}, {{key}}, ${API_KEY}.
+// {token} is the key too: it is what a vendor's own error names the value
+// in "Authorization: Bearer {token}" (lx_78654 on Discord, whose header
+// went with "{token}" in it as written, and the vendor refused it).
+var balanceKeyNames = regexp.MustCompile(`(?i)\$?\{\{?\s*(?:key|api[_-]?key|token)\s*\}?\}`)
 
 // withBalanceKey is s with the key in place of its names, escaped for a
 // URL's query when inURL.
@@ -1171,10 +1259,23 @@ func withBalanceKey(s, key string, inURL bool) string {
 	if inURL {
 		key = url.QueryEscape(key)
 	}
-	for _, n := range balanceKeyNames {
-		s = strings.ReplaceAll(s, n, key)
+	return balanceKeyNames.ReplaceAllLiteralString(s, key)
+}
+
+// keyNotToken is p without a balance token that is only its own key
+// pasted there: the query is asked as with no token, the key as a Bearer
+// the way a chat request sends it, not the key bare in Authorization as
+// a new-api access token goes, which a vendor that wants "Bearer <key>"
+// refuses (lx_78654 on Discord).
+func keyNotToken(p Provider) Provider {
+	t := strings.TrimSpace(p.BalanceToken)
+	if len(t) > 7 && strings.EqualFold(t[:7], "bearer ") {
+		t = strings.TrimSpace(t[7:])
 	}
-	return s
+	if t != "" && t == strings.TrimSpace(p.Key) {
+		p.BalanceToken = ""
+	}
+	return p
 }
 
 var keyBalanceCache struct {

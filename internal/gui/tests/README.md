@@ -6,18 +6,6 @@ covers saving and reloading, escaped and non-UTF-8 credentials, masked
 addresses/status, clearing authentication, Tab and Escape, mode switches,
 HTTP compatibility, and narrow windows in English and Chinese on Chromium
 and WebKit.
-## Routing context header
-
-`routing-context-layout.test.cjs` checks one lazy context header, full
-routing reasons, the visible stage caption and original heading, aligned
-wide-card separators, narrow windows, keyboard controls, reload and
-preference retention in both engines and all five languages.
-`MAGPIE_CONTEXT_ASSETS` points at base assets for a negative check.
-The folded-context, live-patch and every-frame suites retain the upstream
-geometry, cache, cell identity and Usage-link assertions using the unified
-header. The live story logo tests retain their upstream fixtures and node
-identity assertions.
-
 ## Installed desktop fonts
 
 `fonts.test.cjs` exercises the interface/code font controls with installed
@@ -424,11 +412,24 @@ subagent model in its row opened from the agent link: one square, hidden
 when unwired with no options or value, opening the app's model picker (no
 native select), translated title and Default note, a model posted as
 `subagent_model` and Default as "". No click scrolls, no square or picker
-row has a coloured left border, and the picker fits at 1100px and 560px.
-Desktop routing stories with no kind explain the moved model or the kept
-model with a translated disabled reason. Chromium and WebKit, English,
+row has a coloured left border, and the picker fits at 1100px and 420px.
+The effort square opens the shared effort slider, takes the selected model's levels, posts a level or Default without changing the model, and explains
+that Default keeps Claude Code's requested effort. Desktop routing stories
+with no kind explain the moved or kept model and the configured effort,
+including an effort-only pick with no model replacement. Chromium and WebKit, English,
 Chinese, Traditional Chinese, Japanese and German; all APIs are faked.
 Run with `node --test internal/gui/tests/desktop-subagent-model.test.cjs`.
+
+`claude-subagent-tag.test.cjs` checks the Routing page's tag on a Claude Code
+subagent's turn, Desktop's and a terminal's, which has no kind but a
+`subagentId` in its route. It reads as Codex's subagents do, with Codex's
+reasons under the pointer (moved, in a routing group, on the model asked for):
+beside the model in the request list, by request and by session, in the story
+(the reason said once), in the replay and in the tray panel. A kind wins over
+a stray id, the lead and a route kept before the id have no tag, and the
+Purpose filter keeps the tagged turns under Unmarked. Nothing is cut out of
+its row. Chromium and WebKit, five languages, 1100 and 420 wide; all APIs are
+faked. Run with `node --test internal/gui/tests/claude-subagent-tag.test.cjs`.
 
 `tier-effort.test.cjs` draws Claude Code's per-tier effort (#536) in Chromium
 and WebKit, English and Chinese: no tier's effort is a field of its own; the

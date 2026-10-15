@@ -44,12 +44,14 @@ func TestBuiltinSwitch(t *testing.T) {
 		if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
 			t.Fatal(err)
 		}
-		if len(out) != 6 {
+		if len(out) != 11 {
 			t.Fatalf("the built-ins: %+v", out)
 		}
 		for _, b := range out {
-			// the gateway page is essential: on in every preset
-			if b.On != (b.ID == "library" || b.ID == "gateway") || b.On != (b.State == pluginrt.Active) {
+			// the Gateway, Routing and Usage pages, the routing strategies,
+			// the gateway middleware and privacy masking are essential: on in
+			// every preset
+			if b.On != (b.ID == "library" || b.ID == "gateway" || b.ID == "middleware" || b.ID == "redact" || b.ID == "rotation" || b.ID == "routing" || b.ID == "usage") || b.On != (b.State == pluginrt.Active) {
 				t.Fatalf("after library on: %+v", out)
 			}
 		}
@@ -194,9 +196,9 @@ func TestBuiltinClientsLoaded(t *testing.T) {
 		}
 		return i
 	}
-	kernel, app := at("kernel.js"), at("app.js")
-	if kernel > app {
-		t.Fatal("kernel.js after app.js")
+	kernel, app, start := at("kernel.js"), at("app.js"), at("start.js")
+	if kernel > app || app > start {
+		t.Fatal("kernel.js, app.js and start.js out of order")
 	}
 	n := 0
 	for _, m := range pluginrt.Registered() {
@@ -210,6 +212,12 @@ func TestBuiltinClientsLoaded(t *testing.T) {
 				attr = "href"
 				if i := at(name); i > strings.Index(src, "</head>") {
 					t.Errorf("%s isn't in the head", name)
+				}
+			} else if c == "page.js" {
+				// a page's code that runs on app.js's helpers: after app.js,
+				// before start.js shows the first page
+				if i := at(name); i < app || i > start {
+					t.Errorf("%s isn't between app.js and start.js", name)
 				}
 			} else if i := at(name); i < kernel || i > app {
 				t.Errorf("%s isn't between kernel.js and app.js", name)

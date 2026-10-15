@@ -129,6 +129,9 @@ type SubscriptionQuota struct {
 	// AsOf is when an allowance shown in place of one that couldn't be
 	// read was read (see keepLast); nil for a reading just made.
 	AsOf *time.Time `json:"asOf,omitempty"`
+	// ReadDeferred distinguishes a reading deliberately not requested from
+	// a request that failed. AsOf and ReadAt still date the cached values.
+	ReadDeferred bool `json:"readDeferred,omitempty"`
 	// ReadAt is when what is shown was read: a key's balance, kept a
 	// minute (KeyBalances), or an account's allowance, which a cache (a
 	// minute's, or a Claude account's until Claude Code tells it again)
@@ -641,14 +644,15 @@ var claudeUsage struct {
 }
 
 type claudeUsageEntry struct {
-	at    time.Time
-	ws    []QuotaWindow
-	heard time.Time     // when Claude Code last told it, answering
-	tried time.Time     // when /usage was last run, answered or not
-	asked uint64        // the ask generation that run answered
-	wait  time.Duration // how long after tried it runs again unasked
-	err   error         // what the last run said, when it failed
-	whole bool          // /usage was read: ws has every window the account has
+	at       time.Time
+	ws       []QuotaWindow
+	heard    time.Time     // when Claude Code last told it, answering
+	heardSeq uint64        // that telling's place among the readings (quotaReadSequence)
+	tried    time.Time     // when /usage was last run, answered or not
+	asked    uint64        // the ask generation that run answered
+	wait     time.Duration // how long after tried it runs again unasked
+	err      error         // what the last run said, when it failed
+	whole    bool          // /usage was read: ws has every window the account has
 }
 
 // windows is what e keeps as of now, partial where /usage never read it.

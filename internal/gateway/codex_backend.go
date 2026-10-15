@@ -22,6 +22,7 @@ import (
 	"github.com/yetone/magpie/internal/catalog"
 	"github.com/yetone/magpie/internal/codexcat"
 	"github.com/yetone/magpie/internal/provider"
+	"github.com/yetone/magpie/internal/settings"
 	"github.com/yetone/magpie/internal/usage"
 )
 
@@ -148,7 +149,9 @@ func (s *Server) codexBackend(w http.ResponseWriter, r *http.Request) {
 			}
 			// a sealed subagent task goes to a ChatGPT account the model
 			// or group has, or is turned away (serve, sealedReader)
-			body, compact := codexInput(body, true)
+			// a provider set to compact natively is asked Codex's own
+			// compaction, and its sealed item goes back as it came (#1099)
+			body, compact := codexInputAs(body, true, s.nativeCompactionFor(model))
 			if compact {
 				s.codexCompact(w, r, body)
 				return
@@ -206,12 +209,25 @@ func (s *Server) codexBackend(w http.ResponseWriter, r *http.Request) {
 // itself, which fork_turns="none" doesn't change (#1855).
 func sealedTaskError(model, lead, earlier string) string {
 	if earlier != "" {
-		return fmt.Sprintf("This subagent's task was sealed by the ChatGPT backend, which answered the agent that sent it on one of Codex's own models (a subagent of this thread put there, or the lead after a switch), and only a ChatGPT account can open it. %s can't. %s answered the lead's earlier turns, but it neither seals a task nor opens one. "+sealedTaskItself+" Set Codex's subagent model on magpie's Agents page to a model of a ChatGPT account added in magpie, or to one that isn't served by the ChatGPT backend, so subagents get tasks they can read. To go on with this task, have it spawned again from an agent that isn't on Codex's own models.", model, earlier)
+		return fmt.Sprintf("This subagent's task was sealed by the ChatGPT backend, which answered the agent that sent it on one of Codex's own models (a subagent of this thread put there, or the lead after a switch), and only a ChatGPT account can open it. %s can't. %s answered the lead's earlier turns, but it neither seals a task nor opens one. "+sealedTaskItself+" Set Codex's subagent model on magpie's Agents page to a model of a ChatGPT account added in magpie, or to one that isn't served by the ChatGPT backend, so subagents get tasks they can read. To go on with this task, have it spawned again from an agent that isn't on Codex's own models."+sealedWayOut(), model, earlier)
 	}
 	if lead != "" {
-		return fmt.Sprintf("This subagent's task was sealed by the server that answered its lead (%s), and only that server can open it; %s can't. "+sealedTaskItself+" Give the subagent the lead's model, or a lead model that isn't served by the ChatGPT backend, so its subagents get a task they can read. To go on with this task, use a model on %s for the lead and the subagent, or have the lead spawn the subagent again.", lead, model, lead)
+		return fmt.Sprintf("This subagent's task was sealed by the server that answered its lead (%s), and only that server can open it; %s can't. "+sealedTaskItself+" Give the subagent the lead's model, or a lead model that isn't served by the ChatGPT backend, so its subagents get a task they can read. To go on with this task, use a model on %s for the lead and the subagent, or have the lead spawn the subagent again."+sealedWayOut(), lead, model, lead)
 	}
-	return fmt.Sprintf("This subagent's task was sealed by the ChatGPT backend that answered its lead, and only that backend can open it: a ChatGPT account, or the Responses API provider that answered the lead. %s is neither: magpie has no record of it answering the lead in the last 30 days. "+sealedTaskItself+" Give the subagent the lead's model, or a lead model that isn't served by the ChatGPT backend, so its subagents get a task they can read. To go on with this task, use the lead's model, or have the lead spawn the subagent again.", model)
+	return fmt.Sprintf("This subagent's task was sealed by the ChatGPT backend that answered its lead, and only that backend can open it: a ChatGPT account, or the Responses API provider that answered the lead. %s is neither: magpie has no record of it answering the lead in the last 30 days. "+sealedTaskItself+" Give the subagent the lead's model, or a lead model that isn't served by the ChatGPT backend, so its subagents get a task they can read. To go on with this task, use the lead's model, or have the lead spawn the subagent again."+sealedWayOut(), model)
+}
+
+// sealedWayOut is the way to subagents on any model from a lead on
+// Codex's own models (#2245): Settings' "Codex subagents on any model"
+// (settings.CodexAgentsV1, #141) has the lead hand its subagents their
+// tasks as text. Off, the refusal names it; on, a thread still sealing
+// its tasks is on V2 all the same: begun before it was on, or held there
+// by Codex's own features.multi_agent_v2.
+func sealedWayOut() string {
+	if settings.Load().CodexAgentsV1 {
+		return ` "Codex subagents on any model" is on in magpie's Settings, but this thread runs Codex's multi-agent V2, whose tasks are sealed: it began before the setting was turned on, or Codex's own features.multi_agent_v2 is on in its config. Start a new thread, with features.multi_agent_v2 off.`
+	}
+	return ` For subagents on any model while the lead is on a ChatGPT model, turn on "Codex subagents on any model" in magpie's Settings and start a new thread: the lead then hands its subagents their tasks as text.`
 }
 
 // sealedTaskItself says what a sealed task is (#1855): spawn_agent's
@@ -669,8 +685,13 @@ func (s *Server) codexUpstreamOn(w http.ResponseWriter, r *http.Request, rest st
 	usage.Saw(agentOf(r))
 	if r.Method == http.MethodPost {
 		var unmask func()
-		w, body, unmask = redacted(w, body)
+		var err error
+		w, body, unmask, err = redacted(w, body)
 		defer unmask()
+		if err != nil {
+			writeError(w, provider.Responses, http.StatusServiceUnavailable, err.Error())
+			return
+		}
 	}
 	base := provider.CodexBase
 	if apiKey(r.Header) && rest != "/models" {
@@ -1348,6 +1369,13 @@ func codexListTag() string {
 // replaces Codex's compaction trigger with a request to summarise the input.
 // OpenAI's own models keep the trigger for their backend to handle.
 func codexInput(body []byte, magpieModel bool) (_ []byte, compact bool) {
+	return codexInputAs(body, magpieModel, false)
+}
+
+// codexInputAs is codexInput, the trigger kept for a magpie model too
+// when native says its provider compacts natively (NativeCompaction,
+// #1099): the summaries magpie made before are still restored.
+func codexInputAs(body []byte, magpieModel, native bool) (_ []byte, compact bool) {
 	var q map[string]json.RawMessage
 	if json.Unmarshal(body, &q) != nil {
 		return body, false
@@ -1372,7 +1400,7 @@ func codexInput(body []byte, magpieModel bool) (_ []byte, compact bool) {
 				out = append(out, userMessage(codexSummaryPrefix+"\n"+string(b)))
 			}
 		case "compaction_trigger":
-			if !magpieModel {
+			if !magpieModel || native {
 				out = append(out, it)
 				continue
 			}

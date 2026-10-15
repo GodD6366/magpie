@@ -195,19 +195,41 @@ func (p Provider) Fetch(ctx context.Context) ([]catalog.Model, error) {
 // A pick the old list didn't have was typed in by hand, and stays; a
 // fetch that fails, or that answers no model at all, changes nothing.
 func (p Provider) Refetch(ctx context.Context) ([]catalog.Model, []string, error) {
+	ms, dropped, _, err := p.RefetchTaking(ctx)
+	return ms, dropped, err
+}
+
+// RefetchTaking is Refetch, and says which models the provider's
+// AutoInclude rules took into its picks: those the list fetched now has,
+// the one before didn't, and a rule matches (takeMatching, #2135).
+func (p Provider) RefetchTaking(ctx context.Context) (ms []catalog.Model, dropped, taken []string, err error) {
+	ms, dropped, before, err := p.refetch(ctx)
+	if err != nil || !p.ownList() || len(p.AutoInclude) == 0 {
+		return ms, dropped, nil, err
+	}
+	taken, terr := takeMatching(p.ID, func(id string) bool { return !before[id] })
+	if terr != nil {
+		log.Println(p.ID + ": " + terr.Error())
+	}
+	return ms, dropped, taken, nil
+}
+
+// refetch is Refetch, with the ids the provider's list had before it
+// (none for an account's, a plugin's or a decision-only provider's).
+func (p Provider) refetch(ctx context.Context) ([]catalog.Model, []string, map[string]bool, error) {
 	if p.IsPlugin() {
 		// its plugin's list, read again: a pick it had and has no more
 		// goes as a built-in's does (plugin_relist.go)
 		before := plugin.Cached()
 		ms, err := p.fetch(ctx)
 		if err != nil {
-			return ms, nil, err
+			return ms, nil, nil, err
 		}
-		return ms, dropGonePluginPicks(before, plugin.Cached())[p.ID], nil
+		return ms, dropGonePluginPicks(before, plugin.Cached())[p.ID], nil, nil
 	}
 	if p.Account != nil || p.DecideOnly() {
 		ms, err := p.fetch(ctx)
-		return ms, nil, err
+		return ms, nil, nil, err
 	}
 	before := liveIDs(p.ID)
 	ms, err := p.fetch(ctx)
@@ -218,17 +240,17 @@ func (p Provider) Refetch(ctx context.Context) ([]catalog.Model, []string, error
 		}
 	}
 	if err != nil || len(before) == 0 {
-		return ms, nil, err
+		return ms, nil, before, err
 	}
 	now := liveIDs(p.ID)
 	if len(now) == 0 {
-		return ms, nil, nil
+		return ms, nil, before, nil
 	}
 	dropped, derr := dropGonePicks(p.ID, before, now)
 	if derr != nil {
 		log.Println(p.ID + ": " + derr.Error())
 	}
-	return ms, dropped, nil
+	return ms, dropped, before, nil
 }
 
 // liveIDs are the ids of every model in the provider's fetched list.
@@ -640,6 +662,12 @@ func (p Provider) fetchOne(ctx context.Context) (fetched, error) {
 		if proto == Gemini {
 			if p.Gemini == "" {
 				continue // Factory's, whose list is its sign-in's
+			}
+			if p.IsOpenCode() {
+				// OpenCode's Gemini models are in the list its other
+				// APIs share, asked at its chat URL; it has no Gemini
+				// list of its own
+				continue
 			}
 			// listed as the Gemini API lists them, the key in its header,
 			// and merged like any other protocol's list (#1346)
@@ -1623,6 +1651,9 @@ func (p Provider) ListPrice(model string) (catalog.Price, bool) {
 	if pr, ok := p.cursorFastPrice(model); ok {
 		return pr, true
 	}
+	if pr, ok := p.factoryFastPrice(model); ok {
+		return pr, true
+	}
 	names := pricedNames(model)
 	if p.kimiCodeMember() {
 		if id, ok := kimiCodeAPI[strings.ToLower(strings.TrimSpace(model))]; ok {
@@ -1726,6 +1757,49 @@ func (p Provider) cursorFastPrice(model string) (catalog.Price, bool) {
 		pr.Tiers = slices.Clone(pr.Tiers)
 	}
 	return pr, ok
+}
+
+// factoryFastTimes is how many times its base model's list price each
+// Fast Mode model Factory offers is billed at by the model's maker
+// (droid's ids, the factory plugin's MODELS): Anthropic's fast mode is 2x
+// on Opus 5.5 ($8 / $40), Opus 5 and Opus 4.8 ($10 / $50), cache prices
+// with it; OpenAI's priority tier is 2.5x on GPT-5.5 and 2x on GPT-5.4 and
+// GPT-5.3-Codex, cache with it (models.dev's vercel gpt-5.5-fast $12.5 /
+// $75 / $1.25 cached, gpt-5.4-fast $5 / $30, gpt-5.3-codex-fast $3.5 /
+// $28). No catalog lists Factory's -fast ids, so a call on one was priced
+// at its served model's standard price, Factory naming the base model in
+// its reply (plugins#119, psylch).
+var factoryFastTimes = map[string]float64{
+	"claude-opus-5-5": 2, "claude-opus-5": 2, "claude-opus-4-8": 2,
+	"gpt-5.5": 2.5, "gpt-5.4": 2, "gpt-5.3-codex": 2,
+}
+
+// servedByFactory is whether p is a Factory account: the built-in's or the
+// Factory plugin's.
+func (p Provider) servedByFactory() bool {
+	if p.Account == nil {
+		return false
+	}
+	return p.Account.Agent == "factory" || p.PluginProvider() == "factory"
+}
+
+// factoryFastPrice is a Factory Fast Mode model's list price: its base
+// model's at factoryFastTimes, tiers and cache included, on a Factory
+// account only. Elsewhere a "-fast" id is a model of its own.
+func (p Provider) factoryFastPrice(model string) (catalog.Price, bool) {
+	if !p.servedByFactory() {
+		return catalog.Price{}, false
+	}
+	base, ok := strings.CutSuffix(strings.ToLower(strings.TrimSpace(model)), "-fast")
+	times := factoryFastTimes[base]
+	if !ok || times == 0 {
+		return catalog.Price{}, false
+	}
+	pr, ok := p.ListPrice(base)
+	if !ok {
+		return catalog.Price{}, false
+	}
+	return pr.Times(times), true
 }
 
 // membershipCatalogs are models.dev catalogs of a membership's own

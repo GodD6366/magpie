@@ -136,7 +136,7 @@ var presets = []PresetDef{
 		Website: "https://docs.cloud.google.com/gemini-enterprise-agent-platform/models",
 		NoList:  true,
 		Models: []string{"gemini-3.8-flash", "gemini-3.7-flash", "gemini-3.6-flash", "gemini-3.5-flash", "gemini-3.5-flash-lite",
-			"gemini-3.1-pro-preview", "gemini-3.1-pro-preview-customtools", "gemini-3.1-flash-lite", "gemini-3-flash-preview",
+			"gemini-4-argon", "gemini-3.1-pro-preview", "gemini-3.1-pro-preview-customtools", "gemini-3.1-flash-lite", "gemini-3-flash-preview",
 			"gemini-2.5-pro", "gemini-2.5-flash", "gemini-2.5-flash-lite"},
 		HeaderHints: []string{"X-Vertex-AI-LLM-Request-Type", "X-Vertex-AI-LLM-Shared-Request-Type"}},
 	{ID: "deepseek", Name: "DeepSeek", Icon: "deepseek-color", Kind: KindVendor, Catalog: "deepseek",
@@ -472,7 +472,13 @@ var presets = []PresetDef{
 		Website: "https://fireworks.ai", KeysURL: "https://app.fireworks.ai/settings/users/api-keys"},
 	{ID: "siliconflow", Name: "SiliconFlow", Icon: "siliconcloud-color", Kind: KindRelay, Catalog: "siliconflow",
 		Chat:    "https://api.siliconflow.cn/v1",
-		Website: "https://cloud.siliconflow.cn", KeysURL: "https://cloud.siliconflow.cn/account/ak"},
+		Website: "https://cloud.siliconflow.cn", KeysURL: "https://cloud.siliconflow.cn/account/ak",
+		// the international site is another account, keys and balance (in $)
+		Regions: []Region{
+			{ID: "cn", Name: "China", Chat: "https://api.siliconflow.cn/v1"},
+			{ID: "intl", Name: "Global", Chat: "https://api.siliconflow.com/v1",
+				Website: "https://cloud.siliconflow.com", KeysURL: "https://cloud.siliconflow.com/account/ak"},
+		}},
 	// NVIDIA's hosted NIM endpoints (#197): chat completions only; its
 	// /v1/responses answers for a few models alone, 404 for the rest
 	{ID: "nvidia", Name: "NVIDIA NIM", Icon: "nvidia-color", Kind: KindRelay, Catalog: "nvidia",

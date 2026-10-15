@@ -69,14 +69,16 @@ var (
 // is done with the vendor, and false with no slot taken when ctx ended
 // first. A limit of 0 takes no slot.
 func (l *lanes) acquire(ctx context.Context, who string, limit int) (release func(), ok bool) {
-	release, err := l.take(ctx, who, limit, 0, 0)
+	release, _, err := l.take(ctx, who, limit, 0, 0)
 	return release, err == nil
 }
 
 // take is acquire with at most queue waiting (0: no bound) for at most
 // wait (0: as long as it takes): errQueueFull, errQueueWait, or ctx's
-// error when it ended first, with no slot taken.
-func (l *lanes) take(ctx context.Context, who string, limit, queue int, wait time.Duration) (release func(), err error) {
+// error when it ended first, with no slot taken. waited is how long it
+// stood in the queue: 0 when a slot was free at once or there is no
+// limit, so a request that never queued never reads as queued (#2153).
+func (l *lanes) take(ctx context.Context, who string, limit, queue int, wait time.Duration) (release func(), waited time.Duration, err error) {
 	l.mu.Lock()
 	if l.m == nil {
 		l.m = map[string]*lane{}
@@ -89,7 +91,7 @@ func (l *lanes) take(ctx context.Context, who string, limit, queue int, wait tim
 			ln.grant()
 		}
 		l.mu.Unlock()
-		return func() {}, nil
+		return func() {}, 0, nil
 	}
 	if ln == nil {
 		ln = &lane{}
@@ -100,15 +102,17 @@ func (l *lanes) take(ctx context.Context, who string, limit, queue int, wait tim
 	if ln.busy < limit && len(ln.queue) == 0 {
 		ln.busy++
 		l.mu.Unlock()
-		return l.releaser(who, ln), nil
+		return l.releaser(who, ln), 0, nil
 	}
 	if queue > 0 && len(ln.queue) >= queue {
 		l.mu.Unlock()
-		return nil, errQueueFull
+		return nil, 0, errQueueFull
 	}
 	ch := make(chan struct{})
 	ln.queue = append(ln.queue, ch)
 	l.mu.Unlock()
+	defer notePhase(ctx, "slot")()
+	queued := time.Now()
 	var timeout <-chan time.Time
 	if wait > 0 {
 		t := time.NewTimer(wait)
@@ -117,26 +121,27 @@ func (l *lanes) take(ctx context.Context, who string, limit, queue int, wait tim
 	}
 	select {
 	case <-ch:
-		return l.releaser(who, ln), nil
+		return l.releaser(who, ln), time.Since(queued), nil
 	case <-ctx.Done():
 		err = ctx.Err()
 	case <-timeout:
 		err = errQueueWait
 	}
+	waited = time.Since(queued)
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	for i, c := range ln.queue {
 		if c == ch {
 			ln.queue = append(ln.queue[:i], ln.queue[i+1:]...)
 			l.drop(who, ln)
-			return nil, err
+			return nil, waited, err
 		}
 	}
 	// granted as it gave up: the slot is given on to the next
 	ln.busy--
 	ln.grant()
 	l.drop(who, ln)
-	return nil, err
+	return nil, waited, err
 }
 
 // free says whether a request for who would be sent at once: no limit, or
@@ -240,6 +245,7 @@ type Lane struct {
 // of those wait for a slot, and tools the Claude Code turns waiting on
 // their caller's tool results, which are not requests. Each is 0 when
 // idle, never left out.
+// active lists those requests one by one (Active), [] when idle.
 func (s *Server) concurrency(w http.ResponseWriter, r *http.Request) {
 	if !local(r) && !sharedWith(r) {
 		writeError(w, provider.Chat, http.StatusForbidden, "magpie's concurrency is told to another machine only when magpie is shared on the local network and the request carries its API key")
@@ -254,7 +260,7 @@ func (s *Server) concurrency(w http.ResponseWriter, r *http.Request) {
 		waiting += ln.Waiting
 	}
 	b := s.Busy()
-	writeJSON(w, 200, map[string]any{"object": "concurrency", "data": lanes, "requests": b.Requests, "waiting": waiting, "tools": b.Tools})
+	writeJSON(w, 200, map[string]any{"object": "concurrency", "data": lanes, "requests": b.Requests, "waiting": waiting, "tools": b.Tools, "active": s.Active()})
 }
 
 // Lanes is how each key or account with requests out or waiting under a

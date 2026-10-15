@@ -16,9 +16,9 @@ package provider
 //
 // A group's member may be another group ("group/<id>"): to the group it is
 // one member, which a rule can put first like a model; its models are its
-// own group's, ordered by its own routing and rules. A group can't be in
-// itself, however deep: SaveGroup refuses the loop, and one written into
-// providers.json by hand is cut where it closes.
+// own group's, ordered by its own routing, rules and Sink. A group can't
+// be in itself, however deep: SaveGroup refuses the loop, and one written
+// into providers.json by hand is cut where it closes.
 
 import (
 	"errors"
@@ -312,6 +312,9 @@ func groupsIn(entries []Entry) []Group {
 			g = withoutRemoved(g, have)
 		}
 		out = append(out, withMatches(entries, g.own()))
+	}
+	if !served(f.Groups) { // plugins/groups is off: the user's own aren't served
+		out = slices.DeleteFunc(out, func(g Group) bool { return !g.Auto })
 	}
 	if f.NoAutoGroups {
 		return orderedGroups(out, f.GroupOrder)
@@ -746,8 +749,9 @@ func membersOff(entries []Entry, all []Group, g Group, off func(pid, model strin
 // levels the members have in common, as before, but for those fixed at
 // an effort of their own, which take whatever the agent asks, and those
 // whose levels nothing magpie reads knows (levelsUnknown), which are
-// sent it as asked, and those that think with no levels to pick from,
-// which are sent it as asked up to high (the gateway's fitFor). With
+// sent it as asked, those that think with no levels to pick from,
+// which are sent it as asked up to high (the gateway's fitFor), and those
+// known not to think, which are sent no reasoning ask (Quiet). With
 // every member fixed, the group offers the levels they are fixed at, so
 // that an agent still asks it to reason. A group that names its own
 // levels (Group.Levels) offers those, and so does a group in it for its
@@ -773,7 +777,6 @@ func groupEntries(entries []Entry) []Entry {
 		// gateway sends max to the members that have no ultra
 		ultra := false
 		chatgpt := false // a ChatGPT account answers for a member
-		smallest := 0    // the smallest window a member is known to have
 		for i, m := range ms {
 			chatgpt = chatgpt || m.Provider.Account != nil && m.Provider.Account.Agent == "codex"
 			if !slices.ContainsFunc(ms[:i], func(o Member) bool { return o.Provider.ID == m.Provider.ID }) {
@@ -794,10 +797,8 @@ func groupEntries(entries []Entry) []Entry {
 			// to think is sent none of it, as a text-only member is sent
 			// no image (#756's rule for images, applied to reasoning).
 			// One that doesn't think is no reason to tell the agent the
-			// group can't. Which levels the group offers is left as it
-			// was: a member known to take none still leaves the group
-			// none (#597), and the group is then Levelless, a shape
-			// magpie serves
+			// group can't, nor does it take the others' levels away
+			// (below)
 			e.Reasoning = e.Reasoning || thinks
 			// the reply agents are told is the longest a member gives: the
 			// gateway asks each member for no more than its own
@@ -822,9 +823,6 @@ func groupEntries(entries []Entry) []Entry {
 			// for the one free model among them that holds 200k (#712)
 			if ctx > e.Context {
 				e.Context = ctx
-			}
-			if ctx > 0 && (smallest == 0 || ctx < smallest) {
-				smallest = ctx
 			}
 			if i == 0 {
 				e.ImageInput = imageInput
@@ -864,6 +862,14 @@ func groupEntries(entries []Entry) []Entry {
 				// Discord: routing group 在接入 harness 的时候，没有设置
 				// reasoning_efforts)
 				continue
+			} else if len(efforts) == 0 {
+				// it is known not to think (Quiet): the gateway sends it no
+				// reasoning ask (quiet.go, #950), so it doesn't take the
+				// others' levels away either. It left the group none, and a
+				// group that reasons with none to pick from is a model Codex
+				// offers no effort control for, at its own medium (#2127:
+				// a 高性能 group's sessions and subagents ran at medium)
+				continue
 			}
 			ultra = ultra || slices.Contains(efforts, "ultra")
 			if !levelled {
@@ -892,13 +898,40 @@ func groupEntries(entries []Entry) []Entry {
 		ruledEntry(&e, g.Live(), ms, entries)
 		if g.Context > 0 {
 			e.Context, e.WindowSet = g.Context, true
-		} else if g.Context == ContextSmallest && smallest > 0 {
-			e.Context = smallest
+		} else if smallest, typed := smallestWindow(entries, ms); g.Context == ContextSmallest && smallest > 0 {
+			e.Context, e.WindowSet = smallest, typed
 		}
 		e.Family = g.Family
 		out = append(out, e)
 	}
 	return out
+}
+
+// smallestWindow is the smallest window a member of ms is known to have
+// (0 when none is), and whether the user typed it, on the member's
+// provider for its model or all of its models. A group told its
+// smallest member's window is then told one the user typed (#2224: a
+// group following its smallest member, a 500K the user set on it, was
+// handed to Claude Desktop and Codex as magpie's default 272K, which a
+// group set to 500K itself wasn't). A tie counts as typed: the window is
+// the user's either way.
+func smallestWindow(entries []Entry, ms []Member) (n int, typed bool) {
+	for _, m := range ms {
+		ctx, set := 0, false
+		for _, x := range entries {
+			if x.Provider.ID == m.Provider.ID && x.Model == m.Model {
+				ctx, set = x.Context, x.WindowSet
+			}
+		}
+		switch {
+		case ctx <= 0:
+		case n == 0 || ctx < n:
+			n, typed = ctx, set
+		case ctx == n:
+			typed = typed || set
+		}
+	}
+	return n, typed
 }
 
 // levelsUnknown reports whether nothing magpie reads says which reasoning
