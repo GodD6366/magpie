@@ -39,6 +39,7 @@
   const PLUG = "M6 2v3 M10 2v3 M4.5 5h7v2.5a3.5 3.5 0 0 1-7 0z M8 11v3";
   const PIPE = "M1.5 8h3 M11.5 8h3 M4.5 4.5h7v7h-7z";
   const TERM = "M2 3.5h12v9H2z M4.5 6.5l2 1.5-2 1.5 M8 9.5h3";
+  const PAGE = "M2 3.5h12v9H2z M2 6h12 M4 4.75h.01";
   const FOLDER = "M14.7 12.7a1.3 1.3 0 0 1-1.3 1.3H2.6a1.3 1.3 0 0 1-1.3-1.3V3.3A1.3 1.3 0 0 1 2.6 2h3.3l1.3 2h6.2a1.3 1.3 0 0 1 1.3 1.3z";
 
   // a folder's path is its name whole, as plugin.Name: C:\Users\me@corp\…
@@ -112,11 +113,13 @@
   // subscription and serves its models; middleware ("mw") runs in the
   // gateway on every agent's requests and replies, whatever serves them;
   // an agent ("ag") is one magpie has no wiring of its own for, which it
-  // then connects as it does its own
+  // then connects as it does its own; a page ("pg") is a page of its own
+  // in the window's sidebar (pluginpages.js)
   const KINDS = {
     pv: [PLUG, "Provider", "Signs in to a subscription and serves its models"],
     mw: [PIPE, "Middleware", "Runs in magpie's gateway on the requests your agents send and on the replies"],
     ag: [TERM, "Agent", "Adds an agent magpie has no setup of its own for: pick its model on the Agents page and it goes through magpie"],
+    pg: [PAGE, "Page", "Adds a page of its own to the sidebar. It runs shut off from the rest of magpie and can read only what its row lists"],
   };
   const kindOf = (l) => l.kind === "middleware" ? "mw" : l.kind === "agent" ? "ag" : "pv";
   function kindChip(kind) {
@@ -129,7 +132,7 @@
   function logo(ic, big, kind) {
     const box = el("span", "pm-logo" + (big ? " big" : ""));
     if (ic) box.append(icon(ic));
-    else box.append(glyph(kind === "mw" ? PIPE : kind === "ag" ? TERM : PUZZLE, big ? 22 : 17, 1.4));
+    else box.append(glyph(kind === "mw" ? PIPE : kind === "ag" ? TERM : kind === "pg" ? PAGE : PUZZLE, big ? 22 : 17, 1.4));
     return box;
   }
 
@@ -145,6 +148,8 @@
     try {
       mine = await api("plugins");
       failed = "";
+      // a plugin turned on or off brings its page's tab, or takes it
+      window.loadPluginPages?.();
     } catch (e) {
       failed = e.message;
     }
@@ -515,8 +520,8 @@
     if (e?.error && !e.off) meta.append(el("span", "pm-chip bad", t("Didn't load")));
     else if (e?.off) meta.append(el("span", "pm-chip", t("Off")));
     if (l.replaces) {
-      const b = el("span", "pm-chip soft", t("Also built in"));
-      b.title = t("magpie also signs in to this itself, for now; the plugin keeps it working if the built-in one is retired");
+      const b = el("span", "pm-chip soft", t("Replaces built-in"));
+      b.title = t("magpie's own sign-in to this subscription is deprecated: this plugin takes its place, and accounts signed in there move to it");
       meta.append(b);
     }
     c.append(top, sum, meta);
@@ -567,9 +572,16 @@
   // more than a few to look through (counted before the page's search, so
   // they don't go away under someone typing). Both narrow what the page's
   // search has already found; only the section is drawn again.
+  // What's installed is the other question the section is read with (the
+  // owner: 加一个未安装), and it cuts across the kinds: a reader after a
+  // middleware they haven't got picks Middleware and Not installed. So it
+  // is a second strip beside the kinds, each counting what the other, the
+  // field and the page's search leave — the counts follow the picks as
+  // they are made — and the two narrow the grid together.
   // The section, its head and its field are made once and kept in the
   // page, as the page's search field is (#1055).
   let ghKind = "";       // "" (all) | "pv" | "mw" | "ag"
+  let ghHave = "";       // "" (all) | "have" | "none"
   let ghQuery = "";
   let ghList = [];       // what the page's search left of the repositories
   const ghSec = el("section", "pm-sec pm-ghsec");
@@ -606,13 +618,33 @@
     const found = ghList.filter(ghMatch);
     const kinds = ["pv", "mw", "ag"].filter((k) => ghList.some((l) => kindOf(l) === k));
     if (!kinds.includes(ghKind)) ghKind = "";
-    const n = (k) => found.filter((l) => !k || kindOf(l) === k).length;
+    // which of them are here, asked once each: the counts below would ask
+    // it again for every pick in both strips. Like a kind alone, a list
+    // that is all installed or all not has nothing to pick out, and a pick
+    // that can no longer be seen doesn't go on narrowing the grid.
+    const here = new Map(ghList.map((l) => [l, !!entryOf(l.package)]));
+    const have = (l) => here.get(l);
+    const both = ghList.some(have) && ghList.some((l) => !have(l));
+    if (!both) ghHave = "";
+    // the field and the other strip narrow it, so each count is what a
+    // pick in this strip would leave; the kind's own pick is the one left
+    // out, or every count but All would be the picked kind's alone
+    const n = (k, h) => found.filter((l) => (!k || kindOf(l) === k) && (!h || have(l) === (h === "have"))).length;
     const bar = [];
     if (kinds.length > 1) {
-      const pick = segs([["", t("All") + " · " + n("")], ...kinds.map((k) => [k, t(KINDS[k][1]) + " · " + n(k)])], ghKind, (k) => { ghKind = k; drawGh(); });
+      const pick = segs([["", t("All") + " · " + n("", ghHave)], ...kinds.map((k) => [k, t(KINDS[k][1]) + " · " + n(k, ghHave)])], ghKind, (k) => { ghKind = k; drawGh(); });
       pick.classList.add("pm-ghkinds");
       pick.setAttribute("role", "group");
       pick.setAttribute("aria-label", t("Kind of plugin"));
+      bar.push(pick);
+    }
+    // what's installed, on both sides of it: a reader looks for what to
+    // add as much as for what they have
+    if (both) {
+      const pick = segs([["", t("All") + " · " + n(ghKind, "")], ["have", t("Installed") + " · " + n(ghKind, "have")], ["none", t("Not installed") + " · " + n(ghKind, "none")]], ghHave, (h) => { ghHave = h; drawGh(); });
+      pick.classList.add("pm-ghhave");
+      pick.setAttribute("role", "group");
+      pick.setAttribute("aria-label", t("Installed or not"));
       bar.push(pick);
     }
     bar.push(el("span", "grow"), ghFind);
@@ -620,7 +652,7 @@
     ghQ.setAttribute("aria-label", t("Filter the plugins on GitHub"));
     if (ghQ.value !== ghQuery) ghQ.value = ghQuery;
     replaceKeeping(ghBar, bar);
-    const shown = found.filter((l) => !ghKind || kindOf(l) === ghKind);
+    const shown = found.filter((l) => (!ghKind || kindOf(l) === ghKind) && (!ghHave || have(l) === (ghHave === "have")));
     if (shown.length) {
       ghGrid.replaceChildren(...shown.map(card));
       replaceKeeping(ghSec, [ghHead, ghBar, ghGrid]);
@@ -629,7 +661,7 @@
     const none = el("div", "pm-ghnone");
     const all = el("button", "text", t("Show all"));
     all.type = "button";
-    all.onclick = () => { ghKind = ""; ghQuery = ""; drawGh(); ghQ.focus(); };
+    all.onclick = () => { ghKind = ""; ghHave = ""; ghQuery = ""; drawGh(); ghQ.focus(); };
     none.append(el("span", "", t("No plugin on GitHub matches")), all);
     replaceKeeping(ghSec, [ghHead, ghBar, none]);
   }
@@ -1015,7 +1047,10 @@
     const ag = e.agent;
     if (mw || e.isMiddleware) nm.append(kindChip("mw"));
     if (ag || e.isAgent) nm.append(kindChip("ag"));
-    if (e.providers?.length || !(e.middlewareOnly || e.inMagpieOnly || (mw && !e.isMiddleware) || (ag && !e.isAgent))) nm.append(kindChip("pv"));
+    // a plugin of tools alone signs in to nothing: no Provider chip
+    const toolsOnly = !!e.tools?.length && !e.providers?.length;
+    if (e.page) nm.append(kindChip("pg"));
+    if (e.providers?.length || !(e.middlewareOnly || e.inMagpieOnly || toolsOnly || (mw && !e.isMiddleware) || (ag && !e.isAgent))) nm.append(kindChip("pv"));
     who.append(nm);
     const subs = subsOf(pkg);
     const sub = el("div", "sub");
@@ -1046,8 +1081,8 @@
         else if (!x.signedIn && subs.some((y) => y.signedIn)) s.title = t("{name} is a subscription of its own; {other} works without it", { name: x.name, other: subs.find((y) => y.signedIn).name });
         sub.append(s);
       }
-    } else if ((mw || ag) && !e.providers.length) {
-      // only middleware or an agent: its own line says what it does
+    } else if ((mw || ag || toolsOnly || e.page && e.inMagpieOnly) && !e.providers.length) {
+      // only middleware, an agent, tools or a page: its own line says what it does
     } else if (clashes.length && !e.providers.length) {
       // its own line below says whose it is
     } else if (e.providers.length) sub.textContent = t("Signs in to {names}", { names: e.providers.join(t(", ")) });
@@ -1060,10 +1095,13 @@
     if (!ask) for (const c of clashes) who.append(clashLine(e, c, nameOfSpec));
     if (mw && !e.off && !ask) who.append(mwLine(mw));
     if (ag && !e.off && !ask) who.append(agentLine(ag));
+    if (e.tools?.length && !e.off && !ask) who.append(toolsLine(e.tools));
+    // off too: what its page may read is said before it is turned on
+    if (e.page && !ask) who.append(pageLine(e.page));
     if (mw && !e.off && !ask && editing?.pkg === pkg) who.append(optionsEditor(e));
     // the plugin's own picture (package.json's magpie.icon) before its
     // first provider's, which a plugin of several gives each its own (#1775)
-    r.append(logo(l?.icon || l?.npm?.icon || e.icon || subs[0]?.icon || ag?.icon, false, e.middlewareOnly ? "mw" : e.inMagpieOnly && e.isAgent && !e.isMiddleware ? "ag" : ""), who);
+    r.append(logo(l?.icon || l?.npm?.icon || e.icon || subs[0]?.icon || ag?.icon, false, e.middlewareOnly ? "mw" : e.inMagpieOnly && e.isAgent && !e.isMiddleware ? "ag" : e.inMagpieOnly && e.page && !e.isAgent && !e.isMiddleware ? "pg" : ""), who);
     const val = el("div", "val");
     const b = busy.get(pkg) || busy.get(e.spec);
     // npm's newer version, or a git one's repository at a newer commit
@@ -1224,6 +1262,32 @@
     return d;
   }
 
+  // toolsLine is the tools a plugin gives, which magpie's plugin tools MCP
+  // server offers every agent: each by the name an agent sees, its
+  // description on hover, and the server's address to copy into an agent
+  function toolsLine(tools) {
+    const d = el("div", "sub pm-mw pm-tools");
+    d.append(el("span", "", t("Tools for every agent: {names}", { names: tools.map((x) => x.mcp || x.name).join(t(", ")) })));
+    d.title = tools.map((x) => (x.mcp || x.name) + (x.description ? " — " + x.description : "")).join("\n");
+    const url = mcpAddress(state.settings || {}, "/mcp/magpie/tools");
+    const b = copyBtn(url, t("MCP server address"));
+    b.title = t("Copy the MCP server's address ({url}): add it to an agent as an MCP server (Streamable HTTP)", { url });
+    d.append(b);
+    return d;
+  }
+
+  // what a plugin's page may read of magpie's: what its package.json's
+  // magpie.permissions declares, each a read with no secret in it
+  const READS = { "usage:summary": "your usage totals, by model", "providers:list": "your providers' names" };
+  function pageLine(p) {
+    const d = el("div", "sub pm-mw pm-page");
+    const reads = (p.reads || []).map((r) => t(READS[r] || r));
+    d.textContent = d.title = reads.length
+      ? t("Adds a page to the sidebar, which can read {reads}", { reads: reads.join(t(", ")) })
+      : t("Adds a page to the sidebar, which reads nothing of magpie's");
+    return d;
+  }
+
   function mwLine(m) {
     const d = el("div", "sub pm-mw");
     if (m.error) {
@@ -1233,13 +1297,26 @@
       return d;
     }
     const lang = intlLang();
-    let s = t("Gateway middleware: {hooks}", { hooks: m.hooks.join(t(", ")) });
-    if (m.calls) s += " · " + t("{n} calls, {us} µs each", { n: m.calls.toLocaleString(lang), us: m.avgMicros < 10 ? m.avgMicros.toFixed(1) : Math.round(m.avgMicros).toLocaleString(lang) });
-    d.append(el("span", "", s));
+    // a gateway module's hooks, the routings it serves (strategies) and
+    // its usage observer (onUsage), each said when it has it
+    const parts = [];
+    if (m.hooks.length) {
+      let s = t("Gateway middleware: {hooks}", { hooks: m.hooks.join(t(", ")) });
+      if (m.calls) s += " · " + t("{n} calls, {us} µs each", { n: m.calls.toLocaleString(lang), us: m.avgMicros < 10 ? m.avgMicros.toFixed(1) : Math.round(m.avgMicros).toLocaleString(lang) });
+      parts.push(s);
+    }
+    if (m.strategies?.length) parts.push(t("Routings: {routings}", { routings: m.strategies.join(t(", ")) }) + (m.orders ? " · " + t("asked {n} times", { n: m.orders.toLocaleString(lang) }) : ""));
+    if (m.usage) parts.push(t("Usage observer: {n} rows", { n: (m.rows || 0).toLocaleString(lang) }));
+    d.append(el("span", "", parts.join(" · ")));
     if (m.events?.length) d.title = t("onEvent sees only {events} events", { events: m.events.join(t(", ")) });
     if (m.failures) {
       const f = el("span", "pm-mw-fail", t("{n} failed", { n: m.failures.toLocaleString(lang) }));
       f.title = t("A failed call leaves the request or reply as it was") + (m.lastError ? "\n" + t("Last: {error}", { error: m.lastError }) : "");
+      d.append(el("span", "sep", " · "), f);
+    }
+    if (m.dropped) {
+      const f = el("span", "pm-mw-fail", t("{n} rows dropped", { n: m.dropped.toLocaleString(lang) }));
+      f.title = t("Rows that came while onUsage was still busy are dropped: a request never waits for it");
       d.append(el("span", "sep", " · "), f);
     }
     return d;
@@ -1307,7 +1384,7 @@
       w.append(glyph(SHIELD, 12, 1.5), el("span", "", t(from, { owner: l.github.owner, topic })));
       main.append(w);
     }
-    if (l.replaces) main.append(el("p", "pm-note", t("magpie also signs in to this itself, for now; the plugin keeps it working if the built-in one is retired.")));
+    if (l.replaces) main.append(el("p", "pm-note", t("magpie's own sign-in to this subscription is deprecated: this plugin takes its place, and accounts signed in there move to it.")));
     const readme = el("div", "pm-readme");
     readme.append(el("div", "pm-rskel"), el("div", "pm-rskel short"), el("div", "pm-rskel"));
     main.append(readme);

@@ -1,6 +1,7 @@
 package plugin
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -39,6 +40,17 @@ func (m Method) KeyTitle(name string) string {
 	return l
 }
 
+// Cost is a model's price as a plugin gives it: OpenCode's cost, in USD
+// per 1M tokens, 0 where it gives none.
+type Cost struct {
+	Input  float64 `json:"input"`
+	Output float64 `json:"output"`
+	Cache  struct {
+		Read  float64 `json:"read"`
+		Write float64 `json:"write"`
+	} `json:"cache"`
+}
+
 // Model is a model a plugin's provider serves, as OpenCode lists it.
 type Model struct {
 	ID        string   `json:"id"`
@@ -64,10 +76,9 @@ type Model struct {
 	// m.rateWas); 0 is none.
 	Rate    float64 `json:"rate"`
 	RateWas float64 `json:"rateWas"`
-	Cost    *struct {
-		Input  float64 `json:"input"`
-		Output float64 `json:"output"`
-	} `json:"cost"`
+	// Cost is the model's price as the plugin gives it (Devin's own list,
+	// 0.1.18)
+	Cost *Cost `json:"cost"`
 	// ImageSaid is whether the plugin (or models.dev) said if it takes
 	// images: Image false without it is not known
 	ImageSaid bool `json:"imageSaid"`
@@ -248,12 +259,34 @@ func commitProviders(ps []Provider, epoch *uint64) []Provider {
 	}
 	ps = keepListed(ps, provCache)
 	ps = keepUnloaded(ps, provCache)
+	was := provCache
 	provCache, provGood, provTried = ps, true, true
 	provMu.Unlock()
-	if b, err := json.Marshal(ps); err == nil {
+	b, err := json.Marshal(ps)
+	if err == nil {
+		if was == nil {
+			// what an earlier run kept: a start that lists the same is no
+			// change
+			if kept, err := steady.ReadFile(providersPath()); err == nil {
+				_ = json.Unmarshal(kept, &was)
+			}
+		}
 		_ = writeWhole(providersPath(), b)
 	}
+	if err != nil || !sameList(was, b) {
+		listed()
+	}
 	return ps
+}
+
+// sameList reports whether the providers was and the list b marshals to
+// say the same.
+func sameList(was []Provider, b []byte) bool {
+	if was == nil {
+		return false
+	}
+	w, err := json.Marshal(was)
+	return err == nil && bytes.Equal(w, b)
 }
 
 // refreshDeadline bounds one providers RPC after host initialization: a plugin host

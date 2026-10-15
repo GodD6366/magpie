@@ -22,6 +22,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/exec"
 	"os/user"
 	"path/filepath"
 	"regexp"
@@ -193,6 +194,9 @@ func (p Provider) Sign(ctx context.Context, req *http.Request, proto Protocol, b
 	if p.Account != nil && p.Account.sign != nil {
 		return p.Account.sign(ctx, req, body)
 	}
+	// OpenCode's gateway routes nothing that names no session; the user's
+	// own header, below, still has the last word
+	OpenCodeSession(req.Header, req.URL.String())
 	if p.IsVertex() {
 		// a Google token, which goes nowhere but the project's own address
 		if base := p.vertexBase(); base == "" || !strings.HasPrefix(req.URL.String(), base+"/") {
@@ -350,11 +354,20 @@ var (
 	claudeCacheC   claudeCredentials
 	claudeCacheLoc claudeCredentialLocation
 	claudeCacheOK  bool
+
+	claudeAskMu sync.Mutex
+	claudeAskAt time.Time // a keychain read that may have shown a dialog
 )
 
 // claudeCacheTTL keeps All() from spawning `security` on every gateway
 // request while still noticing a fresh login quickly.
 const claudeCacheTTL = 10 * time.Second
+
+// keychainDeniedTTL is how long a keychain read that may have shown the
+// user a dialog is not asked again, as copilotCLISecret doesn't re-ask a
+// denied one at once (#723, #2408): with the item's trust list holding no
+// `security`, every ask can show the dialog again.
+const keychainDeniedTTL = 10 * time.Minute
 
 type claudeAuth struct {
 	AccessToken      string   `json:"accessToken"`
@@ -489,6 +502,14 @@ type claudeKeychainItem struct {
 	hex       bool
 }
 
+// keychainDenied says whether a failed `security find-generic-password`
+// could have been a dialog the user answered no to: 44 is the item not
+// being there, which asks nobody.
+func keychainDenied(err error) bool {
+	var xe *exec.ExitError
+	return errors.As(err, &xe) && xe.ExitCode() != 44
+}
+
 // readClaudeKeychainItem reads the item for a keychain account, or by
 // service alone when the account is "". Either way it is the one under
 // $USER that a sign-in is written back to.
@@ -499,6 +520,11 @@ func readClaudeKeychainItem(account string) claudeKeychainItem {
 	}
 	out, err := proc.Command("security", args...).Output()
 	if err != nil {
+		if keychainDenied(err) {
+			claudeAskMu.Lock()
+			claudeAskAt = time.Now()
+			claudeAskMu.Unlock()
+		}
 		return claudeKeychainItem{}
 	}
 	b, wasHex := keychainText(bytes.TrimSpace(out))
@@ -560,7 +586,16 @@ func claudeCredential() (claudeCredentials, claudeCredentialLocation, bool) {
 	}
 	claudeCacheMu.Lock()
 	defer claudeCacheMu.Unlock()
-	if time.Since(claudeCacheAt) < claudeCacheTTL {
+	ttl := claudeCacheTTL
+	if !claudeCacheOK {
+		claudeAskMu.Lock()
+		ask := claudeAskAt
+		claudeAskMu.Unlock()
+		if time.Since(ask) < keychainDeniedTTL {
+			ttl = keychainDeniedTTL
+		}
+	}
+	if time.Since(claudeCacheAt) < ttl {
 		return claudeCacheC, claudeCacheLoc, claudeCacheOK
 	}
 	c, loc, ok := readClaudeCredential()
@@ -579,6 +614,9 @@ func forgetClaudeCredential() {
 	claudeCacheMu.Lock()
 	claudeCacheAt = time.Time{}
 	claudeCacheMu.Unlock()
+	claudeAskMu.Lock()
+	claudeAskAt = time.Time{}
+	claudeAskMu.Unlock()
 }
 
 func saveClaudeCredential(loc claudeCredentialLocation, c claudeCredentials) error {
@@ -971,8 +1009,10 @@ func codexAccount(home string) (Provider, bool) {
 	if settings.AccountDiscoveryOff() {
 		return Provider{}, false
 	}
-	path := filepath.Join(appdir.CodexHomeIn(home), "auth.json")
-	b, err := readAccountFile(path)
+	dir := appdir.CodexHomeIn(home)
+	// where Codex's config.toml keeps it: auth.json, or the macOS
+	// keychain item (#2367)
+	b, _, err := readCodexLogin(dir, false)
 	var a codexAuth
 	if err != nil || json.Unmarshal(b, &a) != nil || a.Tokens.AccessToken == "" || a.AuthMode == "apikey" {
 		return Provider{}, false
@@ -987,7 +1027,7 @@ func codexAccount(home string) (Provider, bool) {
 		// the email is "email · Team · <workspace>" (#1424)
 		acct.User = codexLiveName(acct.User, bytes.TrimSpace(b))
 	}
-	acct.sign = codexSign(func(ctx context.Context) (string, string, error) { return codexToken(ctx, path) })
+	acct.sign = codexSign(func(ctx context.Context) (string, string, error) { return codexToken(ctx, dir) })
 	acct.body = codexBody
 	acct.models = catalog.Codex
 	acct.fetch = func(ctx context.Context) ([]catalog.Model, error) {
@@ -1003,44 +1043,70 @@ func codexAccount(home string) (Provider, bool) {
 	return Provider{ID: "codex", Name: "Codex", Icon: "codex-color", Responses: CodexBase, Website: "https://chatgpt.com/codex", Account: acct}, true
 }
 
-// codexToken returns a usable access token, refreshing it through OpenAI
-// when it is about to expire. A refresh rotates the tokens, so the new
-// ones go back into auth.json for Codex CLI to find.
-func codexToken(ctx context.Context, path string) (tok, accountID string, err error) {
+// codexToken returns a usable access token for the Codex home dir,
+// refreshing it through OpenAI when it is about to expire. A refresh
+// rotates the tokens, so the new ones go back where Codex keeps its
+// sign-in (auth.json or the keychain item, codexStore.write) for Codex to
+// find.
+func codexToken(ctx context.Context, dir string) (tok, accountID string, err error) {
 	codexMu.Lock()
 	defer codexMu.Unlock()
+	b, st, err := readCodexLogin(dir, false)
 	var a codexAuth
-	if !readJSON(path, &a) || a.Tokens.AccessToken == "" {
-		return "", "", errors.New("Codex is signed out; run codex login")
+	if err == nil && json.Unmarshal(b, &a) == nil && a.Tokens.AccessToken != "" {
+		if exp, _ := jwtClaims(a.Tokens.AccessToken)["exp"].(float64); exp == 0 || time.Until(time.Unix(int64(exp), 0)) > 5*time.Minute {
+			return a.Tokens.AccessToken, codexAccountID(a), nil
+		}
+		// about to be refreshed: the store's own, not a kept read, which
+		// Codex may have rotated since (its refresh token spent)
+		if st.keychain {
+			b, st, err = readCodexLogin(dir, true)
+			a = codexAuth{}
+			if err == nil && json.Unmarshal(b, &a) == nil && a.Tokens.AccessToken != "" {
+				if exp, _ := jwtClaims(a.Tokens.AccessToken)["exp"].(float64); exp == 0 || time.Until(time.Unix(int64(exp), 0)) > 5*time.Minute {
+					return a.Tokens.AccessToken, codexAccountID(a), nil
+				}
+			}
+		}
 	}
-	accountID = a.Tokens.AccountID
-	if accountID == "" {
-		accountID = claimString(jwtClaims(a.Tokens.IDToken), "https://api.openai.com/auth", "chatgpt_account_id")
-	}
-	if exp, _ := jwtClaims(a.Tokens.AccessToken)["exp"].(float64); exp == 0 || time.Until(time.Unix(int64(exp), 0)) > 5*time.Minute {
-		return a.Tokens.AccessToken, accountID, nil
+	var se *codexStoreError
+	if errors.As(err, &se) {
+		return "", "", se
 	}
 	var raw map[string]any
-	if !readJSON(path, &raw) {
+	if err != nil || a.Tokens.AccessToken == "" || json.Unmarshal(b, &raw) != nil {
 		return "", "", errors.New("Codex is signed out; run codex login")
 	}
+	accountID = codexAccountID(a)
 	tok, err = codexRefresh(ctx, raw)
 	if err != nil {
 		return "", "", err
 	}
-	// keep every other field of the file as Codex CLI wrote it. The file
-	// is the user's own sign-in, which Codex CLI and the Codex app read:
-	// written beside it, flushed and renamed in, never truncated in place,
-	// so a machine going down mid-write leaves the old one whole and a
-	// file held for a moment on Windows is waited out (#2239, #1505). A
-	// write that still fails loses the rotation, said in the log; the
-	// fresh access token in hand still serves this request.
+	// keep every other field as Codex wrote it. auth.json is the user's
+	// own sign-in, which Codex CLI and the Codex app read: written beside
+	// it, flushed and renamed in, never truncated in place, so a machine
+	// going down mid-write leaves the old one whole and a file held for a
+	// moment on Windows is waited out (#2239, #1505). A write that still
+	// fails loses the rotation, said in the log; the fresh access token in
+	// hand still serves this request.
 	if out, err := json.MarshalIndent(raw, "", "  "); err == nil {
-		if werr := writePrivate(path, append(out, '\n')); werr != nil {
-			log.Printf("codex: the refreshed sign-in didn't reach %s: %v", path, werr)
+		if werr := st.write(out); werr != nil {
+			where := st.file()
+			if st.keychain {
+				where = "the keychain item " + codexKeychainService
+			}
+			log.Printf("codex: the refreshed sign-in didn't reach %s: %v", where, werr)
 		}
 	}
 	return tok, accountID, nil
+}
+
+// codexAccountID is the ChatGPT account a sign-in's requests name.
+func codexAccountID(a codexAuth) string {
+	if a.Tokens.AccountID != "" {
+		return a.Tokens.AccountID
+	}
+	return claimString(jwtClaims(a.Tokens.IDToken), "https://api.openai.com/auth", "chatgpt_account_id")
 }
 
 // codexRefresh renews the tokens of an auth.json-shaped sign-in in place,

@@ -125,7 +125,10 @@ async function api(path, body, heads, signal) {
     // reader's language
     if (data?.code === "no_models") err.message = t("Add a provider or subscription in magpie first, then connect {agent}", { agent: data.agent });
     // magpie has models, and none is left in the agent's model list (#1989)
-    if (data?.code === "all_hidden") err.message = t("None of magpie's models is left in {agent}'s model list: pick one under Model list → Pick, then connect {agent}", { agent: data.agent });
+    if (data?.code === "all_hidden") {
+      err.code = data.code;
+      err.message = t("None of magpie's models is left in {agent}'s model list: pick one under Model list → Pick, then connect {agent}", { agent: data.agent });
+    }
     if (data?.why) err.why = data.why; // a failed move's reason, said in the reader's language
     // an account the agent is signed in to, refused removal while it has
     // another: said in the reader's language
@@ -282,7 +285,7 @@ function maskSpan(src, failed) {
   if (failed) load.then((ok) => ok || failed());
   return m;
 }
-const pngIcons = new Set(["crush", "zcode", "alma", "hanako", "cindy", "typesafe", "atomcode", "snow", "mlx-serve"]);
+const pngIcons = new Set(["crush", "zcode", "alma", "hanako", "cindy", "lody", "typesafe", "atomcode", "snow", "mlx-serve", "mothx"]);
 
 function icon(name) {
   const kept = keptIcons?.get(name || "")?.shift();
@@ -1098,6 +1101,8 @@ function connectSwitch(a) {
   s.setAttribute("aria-label", t("Connect {agent} to magpie", { agent: a.name }));
   s.title = a.wired ? t("Connected · switch off to put back what {agent} had before magpie", { agent: a.name }) : t("Switch on and {agent}'s model list gets magpie's models", { agent: a.name });
   s.append(el("i"));
+  // the list opened from a failed connect, drawn again while it is open
+  if (!a.wired) holdAgentModels(a, s);
   s.onclick = async (e) => {
     e.stopPropagation();
     if (a.wired) { askDisconnect(a); return; }
@@ -1114,6 +1119,15 @@ function connectSwitch(a) {
     } catch (err) {
       s.disabled = false;
       s.classList.remove("on");
+      // every model taken out of its list: the Pick that puts one back is
+      // in a connected agent's row only, so its list opens here (塔哥 on
+      // Discord: Grok Build, all hidden, then switched off, couldn't be
+      // connected again)
+      if (err.code === "all_hidden") {
+        status(t("None of magpie's models is left in {agent}'s model list: pick one, then connect {agent}", { agent: a.name }), "err");
+        openAgentModels(a, s, e);
+        return;
+      }
       status(t(err.message), "err");
     }
   };
@@ -1267,7 +1281,8 @@ function connectLine(a, kind) {
   const say = (s, cls) => { words.textContent = s; if (cls) line.classList.add(cls); };
   if (kind === "no") { say(t(NATIVE_ONLY[a.id])); return line; }
   if (kind === "link") {
-    if (a.added) say(t("Added · magpie is a provider in {agent}", { agent: a.name }), "on");
+    if (a.added == null) say(t("Opens {name} to add magpie as a provider — confirm it there", { name: a.name }));
+    else if (a.added) say(t("Added · magpie is a provider in {agent}", { agent: a.name }), "on");
     else say(t("Not added · {agent} asks to add magpie when its link opens", { agent: a.name }));
     return line;
   }
@@ -1608,7 +1623,7 @@ function guideCard(g) {
       b.disabled = !ready || !!guideBusy;
       b.classList.toggle("busy", guideBusy === a.id);
       b.title = ready ? t("Switch on and {agent}'s model list gets magpie's models", { agent: a.name }) : t("Add a key or a subscription first; then there are models to connect");
-      b.onclick = (e) => { e.stopPropagation(); guideConnect(a); };
+      b.onclick = (e) => { e.stopPropagation(); guideConnect(a, e); };
       chips.append(b);
     }
     if (found.length > GUIDE_CHIPS) chips.append(el("span", "guide-more", t("+{n} more below", { n: found.length - GUIDE_CHIPS })));
@@ -1672,7 +1687,7 @@ function guideRedraw() {
   fit();
 }
 
-async function guideConnect(a) {
+async function guideConnect(a, ev) {
   if (guideBusy) return;
   guideBusy = a.id;
   guideRedraw();
@@ -1686,6 +1701,14 @@ async function guideConnect(a) {
   } catch (err) {
     guideBusy = "";
     guideRedraw();
+    // every model taken out of its list: its list opens at its chip, as
+    // at the row's switch (connectSwitch)
+    const chip = err.code === "all_hidden" && document.querySelector(`.guide-agent[data-id="${CSS.escape(a.id)}"]`);
+    if (chip) {
+      status(t("None of magpie's models is left in {agent}'s model list: pick one, then connect {agent}", { agent: a.name }), "err");
+      openAgentModels(a, chip, ev);
+      return;
+    }
     status(t(err.message), "err");
   }
 }
@@ -3983,7 +4006,7 @@ async function renderUpdateBadge() {
     delete b.dataset.pulling;
     b.classList.remove("busy");
   }
-  const on = pulling || (!!u && !updatePillOff(u.latest) && (u.state === "ready" || u.state === "available" || (u.state === "error" && u.retry)));
+  const on = pulling || (!!u && !updatePillOff(u.latest) && (u.state === "ready" || u.state === "available" || u.state === "found" || (u.state === "error" && u.retry)));
   if (b.hidden !== !on) b.hidden = !on;
   if (!on) return;
   const hide = $("#updateHide");
@@ -4042,6 +4065,7 @@ async function renderUpdateBadge() {
   label.textContent = u.state === "ready" && u.error ? t("Update failed") : t("Update");
   b.title = u.state === "ready" ? t("Restart to update to {v}", { v: u.latest })
     : u.state === "error" ? t("Couldn't download {v}", { v: u.latest }) + " · " + t("Click to try again")
+    : u.state === "found" ? t("{v} is out", { v: u.latest }) + (u.size ? " · " + t("{done} MB", { done: (u.size / 1e6).toFixed(1) }) : "") + " · " + t("Click to download and restart")
     : u.stuck ? updateStuck(u) + " " + t("Click to open the download page.")
     : t("{v} is out", { v: u.latest });
   if (u.error) b.title += "\n" + u.error;
@@ -4049,7 +4073,8 @@ async function renderUpdateBadge() {
     // what changed is shown first, and a click there restarts (#844); one
     // that failed restarts again at once
     if (u.state === "ready") return u.error ? restart() : confirmUpdate(u, restart);
-    if (u.state === "error") {
+    // found (#2296) or failed: a click downloads it, and restarts once it's in
+    if (u.state === "error" || u.state === "found") {
       b.dataset.pulling = "1";
       b.classList.add("busy");
       label.textContent = t("Downloading…");
@@ -4173,7 +4198,7 @@ async function openWhatsNew(u, b) {
   const w = await api(updatePath("whatsnew?all=1")).catch(() => null);
   if (b) { b.disabled = false; b.classList.remove("busy"); }
   const list = [...(w?.releases || [])];
-  if (u?.notes && u.latest && ["ready", "available", "downloading"].includes(u.state) && !list.some((r) => r.version === u.latest)) {
+  if (u?.notes && u.latest && ["ready", "available", "downloading", "found"].includes(u.state) && !list.some((r) => r.version === u.latest)) {
     list.unshift({ version: u.latest, notes: u.notes, url: u.url, pending: true });
   }
   const failed = !w || !!w.error;
@@ -7666,6 +7691,9 @@ function asTyped() {
   if (xb.value) body.extraBody = xb.value;
   const proxy = draft.proxyMode === undefined ? null : proxyOfDraft();
   if (proxy !== null) body.proxy = proxy;
+  // asked unchecked as it would be saved; magpie takes it only for a
+  // provider of the user's own
+  body.insecureTLS = !!draft.insecureTLS;
   return body;
 }
 
@@ -8400,7 +8428,7 @@ function baseAPIOf(p) {
 
 // draftOf is a saved provider as its editor's form holds it.
 function draftOf(p) {
-  return { id: p.id, name: p.name, preset: p.preset, chat: p.chat, responses: p.responses, anthropic: p.anthropic, gemini: p.gemini || "", catalog: p.catalog, decide: p.decide || "", key: "", api: baseAPIOf(p), chosen: pickedOf(p), none: !!p.noModels, extra: [], headers: headerRows(p.headers), extraBody: extraBodyText(p.extraBody), icon: p.icon || "", fallback: [...(p.fallback || [])], unlisted: !!p.unlisted, searches: !!p.searches, unredacted: !!p.unredacted, nativeCompaction: !!p.nativeCompaction, passUserAgent: !!p.passUserAgent, pinUpstream: !!p.pinUpstream, authHeader: p.authHeader || "", balanceURL: p.balanceURL || "", balancePath: p.balancePath || "", modelsURL: p.modelsURL || "", contexts: contextsText(p.contexts), outputs: contextsText(p.outputs), compacts: contextsText(p.compacts), keysUrl: p.keysUrl || "", ...proxyDraft(p), ...concurrencyDraft(p) };
+  return { id: p.id, name: p.name, preset: p.preset, chat: p.chat, responses: p.responses, anthropic: p.anthropic, gemini: p.gemini || "", catalog: p.catalog, decide: p.decide || "", key: "", api: baseAPIOf(p), chosen: pickedOf(p), none: !!p.noModels, extra: [], headers: headerRows(p.headers), extraBody: extraBodyText(p.extraBody), icon: p.icon || "", fallback: [...(p.fallback || [])], unlisted: !!p.unlisted, searches: !!p.searches, unredacted: !!p.unredacted, insecureTLS: !!p.insecureTLS, nativeCompaction: !!p.nativeCompaction, passUserAgent: !!p.passUserAgent, pinUpstream: !!p.pinUpstream, authHeader: p.authHeader || "", balanceURL: p.balanceURL || "", balancePath: p.balancePath || "", balanceMethod: p.balanceMethod || "", modelsURL: p.modelsURL || "", contexts: contextsText(p.contexts), outputs: contextsText(p.outputs), compacts: contextsText(p.compacts), keysUrl: p.keysUrl || "", ...proxyDraft(p), ...concurrencyDraft(p) };
 }
 
 // duplicateProvider opens the Add form on a copy of p (#268): its URLs,
@@ -8454,11 +8482,9 @@ function drawEditor(p, presetID) {
     h.append(icon(p?.icon || (copyOf && draft.icon) || pr?.icon || "generic"), el("b", "", p ? p.name : copyOf ? t("Copy of {name}", { name: copyOf.name }) : pr ? pr.name : t("Custom provider")));
     if (pr?.kind === "partner") { if (partnerNote(pr)) h.append(el("span", "note", partnerNote(pr))); } else if (pr?.note) h.append(el("span", "note", t(pr.note)));
     h.append(el("span", "grow"));
-    // a plugin's provider has plugin://<id> for its base, and its id is no
-    // address to open: only a host with a dot or a port makes a link
     // a region with docs of its own (Tencent Cloud's plan and TokenHub) has
     // its page here, following the region picked below
-    const site = regionAt(pr, draft)?.website || pr?.website || p?.website || (/[.:]/.test(p?.host || "") ? "https://" + p.host : "");
+    const site = regionAt(pr, draft)?.website || pr?.website || p?.website || hostSite(p);
     if (site) {
       const b = el("button", "link site", hostOf(site) + " ↗");
       b.dataset.url = site;
@@ -8520,6 +8546,16 @@ function drawEditor(p, presetID) {
     wrap.append(name, hint);
     ed.append(el("label", "", t("Name")), wrap);
   }
+  // an added preset's name is the user's, as a custom provider's is: two
+  // of a vendor's sites (Kimi and Kimi (China)) named as they tell them
+  // apart, in the list and every picker (yapechan on Discord). Left empty,
+  // it is the preset's again
+  if (p && pr && !p.account) {
+    name = input(draft.name === pr.name ? "" : draft.name, pr.name);
+    name.className = "provider-name";
+    name.oninput = () => { draft.name = name.value.trim() || pr.name; };
+    ed.append(...field(t("Name"), name));
+  }
   // an added provider's id can change: its models are picked by it, and
   // the agents and routing groups on them move to the new one
   const idField = () => {
@@ -8548,6 +8584,9 @@ function drawEditor(p, presetID) {
   // the Redaction row, shown while every address is on this computer or
   // the local network
   let showLocal = () => {};
+  // the Certificate row, shown while a provider of the user's own has an
+  // https:// address (#2383)
+  let showTLS = () => {};
   // the Key header row, shown while the provider has a third-party
   // Anthropic API, which is sent its key in both headers by default
   let showAuth = () => {};
@@ -8600,6 +8639,7 @@ function drawEditor(p, presetID) {
       fillEndpoints();
       showSearch();
       showLocal();
+      showTLS();
       showAuth();
       showCompaction();
     };
@@ -8609,7 +8649,7 @@ function drawEditor(p, presetID) {
     url.oninput = () => {
       draft[apiField[draft.api]] = url.value;
       if (carried) { draft[carried.from] = carried.value; carried = null; fillEndpoints(); }
-      showSearch(); showLocal(); showAuth(); showCompaction();
+      showSearch(); showLocal(); showTLS(); showAuth(); showCompaction();
     };
     const urlWrap = el("div", "stack");
     urlWrap.append(seg, url);
@@ -8937,6 +8977,22 @@ function drawEditor(p, presetID) {
     ed.append(...row);
   }
 
+  // a provider the user added whose server has a certificate nothing
+  // trusts (a vLLM on the LAN, Ollama behind a self-signed cert, a
+  // company CA, #2383) may be asked without checking it: only its own
+  // https:// hosts, never a preset's or a sign-in's (provider.TakesInsecureTLS)
+  const tlsTakes = () => custom && (!p || !!p.takesInsecureTLS);
+  const onHTTPS = () => ["chat", "responses", "anthropic", "gemini", "decide"].map(addressOf).some((u) => /^\s*https:\/\//i.test(u));
+  if (tlsTakes()) {
+    const [ctk, ccb] = tick(t("Don't check its certificate"), !!draft.insecureTLS);
+    ctk.classList.add("insecure-tls");
+    ccb.onchange = () => { draft.insecureTLS = ccb.checked; };
+    const row = field(t("Certificate"), ctk, t("For your own server with a self-signed certificate or one from your company's CA. magpie then can't tell it from another machine answering at its address: turn it on only on a network you trust."));
+    showTLS = () => { for (const e of row) e.style.display = onHTTPS() ? "" : "none"; };
+    showTLS();
+    ed.append(...row);
+  }
+
   // a vendor that tells the whole account's balance only to a token of its
   // own (AiHubMix's system access token), where a key knows just its own
   // — or a custom provider's, whose Balance URL may not be named yet: a
@@ -8973,7 +9029,7 @@ function drawEditor(p, presetID) {
   // StepFun tells a Step Plan's 5-hour, weekly and credit windows only to
   // its platform's sign-in, never to a key: signed in once in a window of
   // magpie's, the Usage page shows them
-  if (p?.stepPlan) ed.append(...field(t("Step Plan allowances"), renderStepPlan(p.stepPlan), t("A key tells only the balance. The Step Plan's 5-hour, weekly and credit windows are told only to a StepFun sign-in: bring yours here once and magpie keeps it (for 30 days), used for nothing else.")));
+  if (p?.stepPlan) ed.append(...field(t("Step Plan allowances"), renderStepPlan(p.stepPlan, p.id), t("A key tells only the balance. The Step Plan's 5-hour, weekly and credit windows are told only to a StepFun sign-in: bring yours here once and magpie keeps it (for 30 days), used for nothing else.")));
 
   // a key on a team's GLM Coding Plan is told the team's windows only with
   // the team's organization and project, which the console shows (#236)
@@ -9160,7 +9216,7 @@ function drawEditor(p, presetID) {
       const add = (label, key, ph, hint) => {
         if (apiField[draft.api] === key) return;
         const i = input(draft[key], ph, "url");
-        i.oninput = () => { draft[key] = i.value; if (carried?.from === key) carried = null; showSearch(); showLocal(); showAuth(); showCompaction(); };
+        i.oninput = () => { draft[key] = i.value; if (carried?.from === key) carried = null; showSearch(); showLocal(); showTLS(); showAuth(); showCompaction(); };
         eps.append(...field(t(label), i, t(hint)));
       };
       add("OpenAI URL", "chat", "https://…/v1", "if the vendor also serves chat completions");
@@ -9179,7 +9235,16 @@ function drawEditor(p, presetID) {
     const bal = input(draft.balanceURL, "https://…/api/usage/token", "url");
     bal.classList.add("bal-url");
     bal.oninput = () => { draft.balanceURL = bal.value; balPath.placeholder = balanceFieldOf(bal.value); };
-    inner.append(...field(t("Balance URL"), bal, t("Where the vendor tells what is left on the key, asked with it like a chat request; {key} in it or in a header is each key's own, for a vendor that takes the key in the URL (…?key={key}); shown on the Usage page")));
+    // how the URL is asked: GET, or POST with no body for a vendor that
+    // answers only a POST (#2368)
+    const method = segs([["", "GET"], ["POST", "POST"]], draft.balanceMethod === "POST" ? "POST" : "", (v) => { draft.balanceMethod = v; });
+    method.classList.add("bal-method");
+    method.setAttribute("role", "group");
+    method.setAttribute("aria-label", t("Balance request method"));
+    method.title = t("How the Balance URL is asked: GET, or POST with no body for a vendor that answers only a POST");
+    const balAsk = el("div", "pair bal-ask");
+    balAsk.append(method, bal);
+    inner.append(...field(t("Balance URL"), balAsk, t("Where the vendor tells what is left on the key, asked with it like a chat request; {key} in it or in a header is each key's own, for a vendor that takes the key in the URL (…?key={key}); shown on the Usage page")));
     const balPath = input(draft.balancePath, balanceFieldOf(draft.balanceURL));
     balPath.classList.add("bal-path");
     balPath.oninput = () => { draft.balancePath = balPath.value; };
@@ -9196,7 +9261,7 @@ function drawEditor(p, presetID) {
       check.onclick = async () => {
         check.classList.add("busy");
         res.className = "bal-res wait"; res.textContent = "…"; res.title = "";
-        const body = { id: p.id, balanceURL: (draft.balanceURL || "").trim(), balancePath: (draft.balancePath || "").trim(), headers: headersOf(draft.headers) };
+        const body = { id: p.id, balanceURL: (draft.balanceURL || "").trim(), balancePath: (draft.balancePath || "").trim(), balanceMethod: draft.balanceMethod || "", headers: headersOf(draft.headers) };
         if (draft.balanceToken) body.balanceToken = draft.balanceToken;
         else if (draft.clearBalanceToken) body.clearBalanceToken = true;
         try {
@@ -9256,12 +9321,13 @@ function drawEditor(p, presetID) {
       }
       body.baseAPI = draft.api === "openai" ? "chat" : draft.api;
     }
-    if (custom) { body.icon = draft.icon || "generic"; body.balanceURL = (draft.balanceURL || "").trim(); body.balancePath = (draft.balancePath || "").trim(); body.modelsURL = (draft.modelsURL || "").trim(); }
+    if (custom) { body.icon = draft.icon || "generic"; body.balanceURL = (draft.balanceURL || "").trim(); body.balancePath = (draft.balancePath || "").trim(); body.balanceMethod = draft.balanceMethod || ""; body.modelsURL = (draft.modelsURL || "").trim(); }
     if (p) { body.fallback = draft.fallback; body.unlisted = draft.unlisted; body.noModels = noneChosen(); body.modelPrefs = modelPrefsOfDraft(); Object.assign(body, routingOfDraft(p)); }
     body.searches = !!draft.searches && searchable();
     body.pinUpstream = !!draft.pinUpstream;
     if (twoKeyHeaders()) body.authHeader = draft.authHeader || "";
     body.unredacted = !!draft.unredacted && onLAN();
+    if (tlsTakes()) body.insecureTLS = !!draft.insecureTLS && onHTTPS();
     if (!decideOnly(p || pr)) body.nativeCompaction = !!draft.nativeCompaction && carriesCompaction();
     body.passUserAgent = !!draft.passUserAgent && uaPassable();
     const cx = parseContexts(draft.contexts || "");
@@ -9581,9 +9647,9 @@ async function openImportApps(discovered) {
   renderProviders();
 }
 
-// appIcon is an import source's logo; Claude Code has its mark among the
-// vendor icons rather than an app tile of its own.
-const appIcon = (id) => id === "claude-code" ? "icons/claudecode-color.svg" : id === "codex" ? "icons/codex-color.svg" : `icons/app-${id}.png`;
+// appIcon is an import source's logo; Claude Code, Codex and OpenCode have
+// their marks among the vendor icons rather than an app tile of their own.
+const appIcon = (id) => id === "claude-code" ? "icons/claudecode-color.svg" : id === "codex" ? "icons/codex-color.svg" : id === "opencode" ? "icons/opencode.svg" : `icons/app-${id}.png`;
 
 function renderImportApps(ia) {
   const ed = el("div", "editor new importapps");
@@ -10550,7 +10616,7 @@ function renderModels(p) {
       const sameNow = () => prefs[id]?.same ?? m.same ?? "";
       const sameBox = el("label", "msame");
       const same = input(sameNow(), m.merge || m.id);
-      same.title = t("The model other providers serve that {id} is the same as: the routing groups magpie finds put them together. Empty: by its own id", { id: m.id });
+      same.title = t("The model other providers serve that {id} is the same as: the routing groups magpie finds put them together, and when no list prices {id}, its calls are costed at that model's list price. Empty: by its own id", { id: m.id });
       same.spellcheck = false;
       same.onchange = () => {
         const v = same.value.trim();
@@ -11033,14 +11099,28 @@ const ROUTINGS = [
 // (plugins/rotation): off, their options leave the page, as anything marked
 // data-feature does, and Smart is left — one in use keeps it on
 const ROTATION = new Set(["order", "rotate", "usage", "pace", "weight"]);
-// routingSegs: segs of routings, theirs marked as the plugin's
+// jsRoutings: the routings JS gateway plugins serve now ("<plugin>/<name>",
+// settings' jsRoutings, plugins/middleware's), and saved, a routing none
+// serves now, shown as it is: its pool is tried in its listed order
+function jsRoutings(saved) {
+  const out = (state.settings?.jsRoutings || []).map((r) => [r.id, r.id,
+    t("Routed by {name}, a routing of the gateway plugin {plugin}: it orders the accounts or keys for each request. If it fails or takes too long, they are tried in their listed order.", { name: r.name, plugin: r.plugin }), true]);
+  if (saved && !ROUTINGS.some(([id]) => id === saved) && !out.some(([id]) => id === saved))
+    out.push([saved, saved, t("No plugin serves this routing now, so requests go to the accounts or keys in their listed order. Turn on the gateway plugin that serves it on the Plugins page.")]);
+  return out;
+}
+// routingSegs: segs of routings, theirs marked as the plugin's: the
+// built-in rotation's, and the JS gateway plugins' (plugins/middleware)
 function routingSegs(items, current, onPick) {
   const box = segs(items, current, onPick);
-  [...box.querySelectorAll(".opt")].forEach((b, i) => { if (ROTATION.has(items[i][0])) b.dataset.feature = "rotation"; });
+  [...box.querySelectorAll(".opt")].forEach((b, i) => {
+    if (ROTATION.has(items[i][0])) b.dataset.feature = "rotation";
+    else if (items[i][3]) b.dataset.feature = "middleware";
+  });
   return box;
 }
 // weight is a key's share: offered for a provider with keys only
-const routingsOf = (p) => p.account ? ROUTINGS.filter(([id]) => id !== "weight") : ROUTINGS;
+const routingsOf = (p) => [...(p.account ? ROUTINGS.filter(([id]) => id !== "weight") : ROUTINGS), ...jsRoutings(p.routing || "")];
 // as on the Routing page's list of these (routing/client.js AFF_OPTS)
 const STAYS = [
   ["", "Auto", "A conversation stays with the account or key that answered it while what the vendor cached of it is worth keeping — within a turn always, across turns while it's fresh."],
@@ -11092,15 +11172,15 @@ function renderRouting(p) {
   };
   const rHint = el("div", "hint"), rUnsaved = unsaved();
   const drawRouting = () => {
-    const cur = ROUTINGS.find(([id]) => id === routingNow()) || ROUTINGS[0];
-    rHint.textContent = t(cur[2]) + own(cur[0]);
+    const cur = routingsOf(p).find(([id]) => id === routingNow()) || ROUTINGS[0];
+    rHint.textContent = (ROUTINGS.includes(cur) ? t(cur[2]) : cur[2]) + own(cur[0]);
     rUnsaved.hidden = routingNow() === (p.routing || "");
     // in turn and by weight go round already
     kLabel.hidden = kWrap.hidden = routingNow() === "rotate" || routingNow() === "weight";
     // each key's weight shows beside it while the routing is by weight
     for (const l of document.querySelectorAll(".accts.keys")) if (l.dataset.provider === p.id) l.classList.toggle("weighted", routingNow() === "weight");
   };
-  const rPick = routingSegs(routingsOf(p).map(([id, name]) => [id, t(name)]), routingNow(), (routing) => { draft.routing = routing; drawRouting(); });
+  const rPick = routingSegs(routingsOf(p).map(([id, name, , js]) => [id, ROUTINGS.some((r) => r[0] === id) ? t(name) : name, , js]), routingNow(), (routing) => { draft.routing = routing; drawRouting(); });
   const rRow = el("div", "route-pick");
   rRow.append(rPick, rUnsaved);
   const rWrap = el("div");
@@ -11597,15 +11677,16 @@ function renderPluginAsk(sub) {
 }
 
 // renderStepPlan: a StepFun provider's platform sign-in, which the user
-// makes in their own browser and brings here with magpie's bookmarklet
-function renderStepPlan(sp) {
+// makes in their own browser and brings here with magpie's bookmarklet,
+// kept for the provider id alone: two on one site can be two accounts
+function renderStepPlan(sp, id) {
   const box = el("div", "stepplan");
   if (sp.signedIn) {
     const row = el("div", "pair");
     const side = el("div", "side");
     const out = el("button", "text", t("Sign out"));
     out.onclick = async () => {
-      try { providers = await api("stepfun/" + sp.site + "/signout", {}); renderProviders(); } catch (e) { status(e.message, "err"); }
+      try { providers = await api("stepfun/" + encodeURIComponent(id) + "/signout", {}); renderProviders(); } catch (e) { status(e.message, "err"); }
     };
     side.append(out);
     row.append(el("span", "state", t("Signed in · the Usage page shows the Step Plan")), side);
@@ -11633,7 +11714,7 @@ function renderStepPlan(sp) {
     if (!paste.value.trim()) return;
     go.disabled = paste.disabled = true;
     try {
-      providers = await api("stepfun/" + sp.site + "/session", { text: paste.value });
+      providers = await api("stepfun/" + encodeURIComponent(id) + "/session", { text: paste.value });
       renderProviders();
       status(t("Signed in to StepFun"), "ok");
     } catch (e) {
@@ -12589,7 +12670,7 @@ function loginUsageOf(agent) {
 // as the gateway reads a plugin's (signInGone, plugin_usage.go)
 const SIGN_IN_GONE = /sign-in has (expired|lapsed)|sign in again/i;
 
-function quotaError(err) {
+function quotaError(err, q) {
   if (/sign-in has expired/.test(err)) return t("Signed out — add this account again to use it");
   // a Copilot account GitHub refused the token of (copilot_lapsed.go), as
   // its row says it, in English or already in the user's language
@@ -12625,6 +12706,10 @@ function quotaError(err) {
   // reads none — said with the way out, as a phone can't hover for it
   if (/^this key has no OpenCode Go subscription/.test(err)) return t("No OpenCode Go on this key — use a key made by the member who subscribed, in that workspace");
   if (/^OpenCode didn't take this key/.test(err)) return t("OpenCode didn't take this key — paste a current one in the provider's settings");
+  // a GLM key Zhipu or Z.ai refused (zhipuRefused, planquota.go): the key
+  // is what to change, not a reading that failed (@xanahopper on X)
+  const glm = /^(Zhipu|Z\.ai) didn't take this key/.exec(err);
+  if (glm) return t("{vendor} didn't take this key — it expired, was deleted or is mistyped; paste a current one in the provider's settings", { vendor: glm[1] });
   if (/^OpenCode Go's reply has no rolling/.test(err)) return t("OpenCode Go answered in a form magpie doesn't read — hover for what it sent");
   // a remote magpie's card (remote_quotas.go)
   if (/^nothing read on that magpie yet/.test(err)) return t("Nothing read on that computer yet — refresh this card to have it read");
@@ -12639,7 +12724,17 @@ function quotaError(err) {
   // built-in key card (clineLimitsUnread, cline_usage.go) and the Cline
   // plugin both begin their error with these words
   if (/^ClinePass limits couldn't be read/.test(err)) return t("ClinePass limits couldn't be read — hover for why");
-  return balanceError(err) || t("Allowance unavailable");
+  const bal = balanceError(err);
+  if (bal) return bal;
+  // a plugin's own usage read failed (pluginError, plugin_usage.go): magpie
+  // has no better words for it than the plugin's, and hiding them in a
+  // tooltip left the card saying only that nothing could be read
+  // (aqiu817/magpie-sensenova#1), so its first line is said on the card
+  if (q?.pluginError) {
+    const why = String(err).split("\n")[0].trim();
+    if (why) return t("Allowance unavailable: {why}", { why: why.length > 160 ? why.slice(0, 159) + "…" : why });
+  }
+  return t("Allowance unavailable");
 }
 
 // the Balance field magpie reads, left empty, from a query whose reply it
@@ -12744,7 +12839,7 @@ function accountQuota(data, user, capFor = () => 0, settable = null) {
     return line;
   }
   if (!q || q.error || !q.windows?.length) {
-    line.append(el("span", "aq-none", [...noPlan, q?.error ? quotaError(q.error) : t("No allowance reported")].join(" · ")));
+    line.append(el("span", "aq-none", [...noPlan, q?.error ? quotaError(q.error, q) : t("No allowance reported")].join(" · ")));
     if (q?.error) line.title = q.error;
     return line;
   }
@@ -14239,6 +14334,23 @@ function localAddress(s) {
     return u.protocol + "//" + u.host;
   } catch { return null; }
 }
+// hostSite is the page the editor's head links to for a provider with no
+// website: the origin of the base its host is shown from, under that base's
+// own scheme, so a local server at http://127.0.0.1:7863/v1 opens over http
+// (#2377). https only when no base of its own spells the host (a moved
+// subscription shows the host it had). A plugin's provider has
+// plugin://<id> for its base, and its id is no address to open: only a host
+// with a dot or a port makes a link.
+function hostSite(p) {
+  const h = (p?.host || "").toLowerCase();
+  if (!/[.:]/.test(h)) return "";
+  for (const u of [p.chat, p.responses, p.anthropic, p.gemini, p.decide]) {
+    // the host as provider.HostOf reads it: past the scheme, up to the path
+    const m = /^(https?):\/\/([^/?#]*)/i.exec((u || "").trim());
+    if (m && m[2].toLowerCase() === h) return m[1].toLowerCase() + "://" + m[2];
+  }
+  return "https://" + p.host;
+}
 // originOf is the origin of the first of a provider's URLs that is set.
 function originOf(x) {
   for (const u of [x?.chat, x?.responses, x?.anthropic]) {
@@ -14444,7 +14556,7 @@ let quotaRefreshVersion = 0;
 const quotaRefreshVersions = new Map();
 function loadQuotas(asked, again) {
   if (quotasLoading && (!asked || quotasLoading.asked)) return quotasLoading;
-  if (asked) quotasAskedAt = performance.now();
+  if (asked) { quotasAskedAt = performance.now(); quotaCycleHolds.clear(); }
   if (!again) quotasTries = 0;
   let reading = false, same = false, began;
   const p = Promise.resolve(quotasLoading).catch(() => {})
@@ -15193,6 +15305,26 @@ function quotaPastCycles(lines, now) {
   return { line: longest, cycles: quotaRecordedCycles(longest).filter((c, i, all) => i < all.length - 1 || c.end <= now).reverse() };
 }
 const quotaCyclePicks = new Map(); // account -> recorded cycle's first reading
+const quotaCycleHolds = new Map(); // account and completed cycle -> its own estimates
+function quotaCycleHoldsOf(sub, picked) {
+  if (!sub.user || sub.from) return { windows: [], pending: false };
+  const key = usageAcctKey(sub) + "\0" + picked.id + "\0" + picked.end;
+  if (!quotaCycleHolds.has(key)) {
+    const entry = { windows: [], pending: true };
+    quotaCycleHolds.set(key, entry);
+    const args = new URLSearchParams({ provider: sub.provider, user: sub.user || "", from: new Date(picked.start).toISOString(), to: new Date(picked.end).toISOString() });
+    api("usage/quotas/history/holds?" + args).then((cards) => {
+      if (quotaCycleHolds.get(key) !== entry || !Array.isArray(cards)) return;
+      entry.windows = cards.flatMap((q) => q.windows || []);
+    }).catch(() => {}).finally(() => {
+      if (quotaCycleHolds.get(key) !== entry) return;
+      entry.pending = false;
+      if (quotaCyclePicks.get(usageAcctKey(sub)) === picked.id && quotaRange === "cycle") renderQuotas();
+    });
+  }
+  return quotaCycleHolds.get(key);
+}
+
 // One selection drives both the meters and the curve. A snapshot contains
 // only the fields history actually kept, never today's counts or holds.
 function quotaHistoryView(sub, lines = quotaLines(sub), now = Date.now()) {
@@ -15208,12 +15340,16 @@ function quotaHistoryView(sub, lines = quotaLines(sub), now = Date.now()) {
   return { picked, shown };
 }
 function quotaHistoryCard(sub, { picked, shown }) {
+  const estimates = quotaCycleHoldsOf(sub, picked);
   const windows = familyWindows(sub.windows).map((w) => {
     const name = w.pool ? w.pool + " · " + w.name : w.name;
     const last = shown.find((l) => l.name === name)?.points.at(-1);
     const base = { name: w.name, pool: w.pool, historyMissing: !last };
     if (!last) return base;
+    // the server reckons a past whole for an account's own windows only
+    const est = w.pool || w.family ? null : estimates.windows.find((x) => x.name === w.name);
     return { ...base, used: 100 - last.left, recordedAt: last.at,
+      holds: est?.holds, holdsWhy: est?.holdsWhy, holdsPending: estimates.pending,
       resetsAt: new Date(Math.min(last.reset ?? picked.end, picked.end)).toISOString() };
   });
   const at = Math.max(...windows.filter((w) => !w.historyMissing).map((w) => w.recordedAt));
@@ -16016,6 +16152,9 @@ function renderPanelQuota() {
   // a row held in the arranging: drawn when it's let go
   if (usageArranging && box.querySelector(".pq-arow")) { usageRenderPending = true; return; }
   const view = box.closest(".view"), keep = view?.scrollTop;
+  // a card's own refresh keeps the keyboard's focus through the redraw
+  const focused = document.activeElement?.matches?.("#panelQuota .quota-refresh")
+    ? document.activeElement.closest(".pq-card")?.dataset.card : "";
   const restoreFlash = keepQuotaFlash(box);
   box.replaceChildren();
   if (none) { quotaFocus = ""; panelArranging = false; fit(); return; }
@@ -16095,6 +16234,7 @@ function renderPanelQuota() {
   if (away.size) foot.append(el("span", "pq-hidden", t("{n} hidden", { n: away.size })));
   box.append(foot);
   restoreFlash();
+  if (focused) box.querySelector(`.pq-card[data-card="${CSS.escape(focused)}"] .quota-refresh`)?.focus({ preventScroll: true });
   if (view && view.scrollTop !== keep && !box.querySelector(".pq-card.flash")) view.scrollTop = keep;
   panelAge();
   fit();
@@ -16115,7 +16255,7 @@ function panelBalances(bals) {
     card.title = [q.name, q.user].filter(Boolean).join(" · ");
     // whose balance, at a glance: the provider's logo before its name
     const who = el("span", "pq-sub pq-bn");
-    who.append(icon(q.icon || "generic"), el("span", "", q.name));
+    who.append(quotaRefresh(q), icon(q.icon || "generic"), el("span", "", q.name));
     card.append(who);
     // a balance field with several amounts: the first as the figure,
     // the others each a quiet line, a percent a meter (#420)
@@ -16248,7 +16388,9 @@ function panelQuotaCard(q) {
   card.title = [q.name, q.alias, q.user, q.seat && q.seat !== q.alias && "≡ " + q.seat, q.plan, q.until ? planTerm(q) : "", q.balance && t("Balance") + " " + q.balance].filter(Boolean).join(" · ");
   if (q.error) {
     card.classList.add("err");
-    card.append(el("span", "pq-sub err", quotaError(q.error)));
+    const why = el("span", "pq-sub err", quotaError(q.error, q));
+    why.prepend(quotaRefresh(q));
+    card.append(why);
     card.title += "\n" + q.error;
     return card;
   }
@@ -16260,7 +16402,9 @@ function panelQuotaCard(q) {
   // a pool's 5-hour and weekly rings, two pools of them, else three
   const fam = familyWindows(q.windows.filter((w) => !w.unlimited));
   if (!fam.length && q.windows.some((w) => w.unlimited)) {
-    card.append(el("span", "pq-sub", t("Unlimited")));
+    const sub = el("span", "pq-sub", t("Unlimited"));
+    sub.prepend(quotaRefresh(q));
+    card.append(sub);
     if (balance) card.append(balance);
     return card;
   }
@@ -16270,19 +16414,23 @@ function panelQuotaCard(q) {
   const sub = el("span", "pq-sub", begun.length
     ? begun.map((w, i) => {
       const at = new Date(w.resetsAt);
+      // the first deadline named as one: a bare "↻ 14:26" read as a
+      // refresh to click (#840, hhh2210)
       return at <= Date.now() ? (i || w.members ? ringName(w) + " " : "") + resetText(at)
-        : (i || w.members ? ringName(w) + " " : "↻ ") + resetClock(at);
+        : i || w.members ? ringName(w) + " " + resetClock(at) : resetText(at);
     }).join(" · ")
     : t("Not used yet"));
   // The first window's own pace as well, in the line already about its
   // deadline: the thin line under it has no room for what it only hints at,
   // and a card with no readings of that window has nothing to say (#2079).
   // Only while that line is drawn (curves on), and only when the deadline
-  // the line names is that window's alone: after "↻ 14:26 · Weekly Oct 31"
+  // the line names is that window's alone: after "Resets 14:26 · Weekly Oct 31"
   // it would read as the week's.
   const line = quotaRange !== "off" && begun.length === 1 && begun[0] === ws[0] && !ws[0].tiers ? quotaWindowLine(q, ws[0]) : null;
   const pace = line ? quotaEtaText(line, Date.now()) : "";
   if (pace) sub.append(el("span", "pq-pace", " · " + pace));
+  // the card's own refresh, as on the Usage page: shown as it's hovered
+  sub.prepend(quotaRefresh(q));
   card.append(sub);
   const rings = el("span", "pq-rings");
   for (const w of ws) {
@@ -16324,11 +16472,50 @@ function panelQuotaCard(q) {
     card.append(r);
   }
   const policy = autoResetRow(q, "pq-autoreset");
-  if (policy) card.append(policy);
   const credits = creditsRow(q, "pq-credits");
-  if (credits) card.append(credits);
+  if (policy || credits) {
+    // the options fold to one line saying how each is set (#2356,
+    // detail47: Codex占用过多界面空间，导致其他供应商被遮挡); open until
+    // the user folds them
+    const id = trayCardID(q);
+    const folded = panelOptsFolded.has(id);
+    const fold = el("button", "pq-opts-fold");
+    fold.type = "button";
+    fold.append(svg(CHEV, 11, 1.6));
+    fold.setAttribute("aria-expanded", String(!folded));
+    fold.title = t(folded ? "Unfold" : "Fold");
+    fold.onclick = (e) => {
+      e.stopPropagation();
+      if (folded) panelOptsFolded.delete(id); else panelOptsFolded.add(id);
+      try { localStorage.setItem("magpie.panelOptsFolded", JSON.stringify([...panelOptsFolded])); } catch {}
+      renderPanelQuota();
+      $(`#panelQuota .pq-card[data-card="${CSS.escape(id)}"] .pq-opts-fold`)?.focus({ preventScroll: true });
+    };
+    if (folded) {
+      const row = el("div", "pq-autoreset pq-opts-brief");
+      const say = el("span", "ar-say");
+      say.append(fold);
+      if (policy) {
+        const w = autoResetWhen(q);
+        const on = AUTO_RESET_CASES.filter((c) => w[c.id]);
+        say.append(el("b", "", t("Auto-use resets:")), document.createTextNode(" " + (on.length === 1 ? t(on[0].say) : t(on.length ? "On" : "Off"))));
+      }
+      if (credits) {
+        if (policy) say.append(document.createTextNode(" · "));
+        say.append(el("b", "", t("Use credits:")), document.createTextNode(" " + t(creditsOn(q) ? "On" : "Off")));
+      }
+      row.append(say);
+      card.append(row);
+    } else {
+      (policy || credits).querySelector(".ar-say").prepend(fold);
+      card.append(...[policy, credits].filter(Boolean));
+    }
+  }
   return card;
 }
+// panelOptsFolded: the panel cards, by id, whose options are folded.
+let panelOptsFolded = new Set();
+try { panelOptsFolded = new Set(JSON.parse(localStorage.getItem("magpie.panelOptsFolded") || "[]")); } catch {}
 
 // resetsWords: a Codex account's rate-limit resets, "↺ 2 resets · until
 // Sat 22:30", the date only when one of them runs out. A GLM Coding team
@@ -16681,9 +16868,12 @@ function checkinRow(q, first, subs) {
         text = t("Asks for a captcha; check in in its own app") + (r.msg ? " · " + r.msg : "");
         break;
       case "own-app":
-        // the vendor pays only its own app (Trae CN's 9074, #808): not
-        // tried again today
-        text = t("{name} only gives check-in credits to its own app; check in in the {name} app", { name: checkinVendorName(r, q.name) });
+        // to be done in the vendor's own app, not tried again today;
+        // Trae CN's 9074 (#808) says Trae refused it, which is what is
+        // known, not that only its app is paid (#1920)
+        text = r.by === "trae"
+          ? t("Trae CN refused this check-in (9074: too many taking part); check in in the Trae CN app")
+          : t("{name} only gives check-in credits to its own app; check in in the {name} app", { name: checkinVendorName(r, q.name) });
         break;
       default:
         kind = "bad";
@@ -16953,6 +17143,7 @@ function quotaRefresh(q) {
     e.stopPropagation();
     if (quotaRefreshing.has(key)) return;
     quotaRefreshing.add(key);
+    for (const k of quotaCycleHolds.keys()) if (k.startsWith(key + "\0")) quotaCycleHolds.delete(k);
     b.classList.add("busy");
     const began = quotaRefreshVersion;
     try {
@@ -17087,7 +17278,7 @@ function keyLimitLine(sub) {
 // quotaWindows: one account's allowance as meters, or why there are none.
 function quotaWindows(sub) {
   const failed = () => {
-    const e = el("div", "subscription-error", quotaError(sub.error));
+    const e = el("div", "subscription-error", quotaError(sub.error, sub));
     e.title = sub.error;
     // read again from here too: a failed reading is the one most wanted
     e.prepend(quotaRefresh(sub));
@@ -17162,11 +17353,17 @@ function quotaWindows(sub) {
     // the reset's line, so the window keeps its three rows
     if (w.holds) {
       if (!r) quota.append(r = el("div", "quota-reset"));
-      r.append(holdsLine(w.holds));
-    } else if (w.holdsWhy && holdsWhy[w.holdsWhy] && !sub.history) {
+      const line = holdsLine(w.holds);
+      // a past cycle's whole is reckoned at its own last reading (#2009)
+      if (sub.history) line.title = t("Estimated from the window that began {start}, read {at}", { start: quotaCycleDate(Date.parse(w.holds.since)), at: quotaCycleDate(w.recordedAt) }) + "\n" + line.title;
+      r.append(line);
+    } else if (w.holdsWhy && holdsWhy[w.holdsWhy]) {
       // and where it can't be told, so, and why in its tooltip (#2045)
       if (!r) quota.append(r = el("div", "quota-reset"));
       r.append(holdsUnknownLine(w.holdsWhy));
+    } else if (sub.history && w.holdsPending) {
+      if (!r) quota.append(r = el("div", "quota-reset"));
+      r.append(el("span", "quota-holds-why", t("Loading…")));
     }
     // a model family's figure: its models, level by level, in its tooltip
     if (w.tiers) quota.title = t("{family}: the most used of its models", { family: w.name }) + "\n" + tiersText(w);
@@ -17453,6 +17650,9 @@ function drawLedColumns(box, l, split, metric, compact, chooseDay, focusDay) {
     hot.setAttribute("x", M.l + slot * i);
     hot.style.display = "";
     tip.replaceChildren(el("b", "", ledWhen(p, l.bucket)));
+    // speeds are read across: a model's name in full, its speed and its
+    // first token each in a column of their own (#2343)
+    tip.classList.toggle("speed", speed);
     const by = p.by?.[split] || {};
     const rows = top.map((c) => [name(c), c.color, ledPart(metric, by[c.id] || {}), by[c.id]]);
     if (!speed) rows.push([t("Other"), "var(--faint)", Math.max(0, totals[i] - rows.reduce((a, x) => a + x[2], 0))]);
@@ -17460,15 +17660,18 @@ function drawLedColumns(box, l, split, metric, compact, chooseDay, focusDay) {
       const row = el("div");
       const sw = el("i");
       sw.style.background = color;
-      const said = el("em", "", ledFormatLong(metric, v));
-      if (speed && ledTTFT(part)) said.append(" · " + t("TTFT {ms}", { ms: ledTook(ledTTFT(part)) }));
-      row.append(sw, el("span", "", nm), said);
+      row.append(sw, el("span", "", nm), el("em", "", ledFormatLong(metric, v)));
+      if (speed) row.append(el("em", "ttft", ledTTFT(part) ? t("TTFT {ms}", { ms: ledTook(ledTTFT(part)) }) : ""));
       tip.append(row);
     }
     const sum = el("div", "sum");
-    sum.append(el("span", "", t(speed ? "All" : "Total")), el("em", "", ledFormatLong(metric, totals[i])));
-    if (speed && ledTTFT(p)) sum.lastChild.append(" · " + t("TTFT {ms}", { ms: ledTook(ledTTFT(p)) }));
-    if (metric !== "calls" && p.calls) sum.lastChild.append(" · " + t(p.calls === 1 ? "{n} request" : "{n} requests", { n: ledNum(p.calls) }));
+    const calls = metric !== "calls" && p.calls ? t(p.calls === 1 ? "{n} request" : "{n} requests", { n: ledNum(p.calls) }) : "";
+    if (speed) {
+      sum.append(el("span", "", t("All") + (calls ? " · " + calls : "")), el("em", "", ledFormatLong(metric, totals[i])),
+        el("em", "ttft", ledTTFT(p) ? t("TTFT {ms}", { ms: ledTook(ledTTFT(p)) }) : ""));
+    } else {
+      sum.append(el("span", "", t("Total")), el("em", "", ledFormatLong(metric, totals[i]) + (calls ? " · " + calls : "")));
+    }
     tip.append(sum);
     tip.hidden = false;
     const x = M.l + slot * (i + 0.5), w = tip.offsetWidth;
@@ -17616,7 +17819,14 @@ function sessPick(btn, all, value, opts, head, choose) {
   btn.onclick = (e) => {
     e.stopPropagation();
     if (btn.classList.contains("open")) return closeProtoMenu();
-    openSessCombo(btn, all, opts, value, choose, head);
+    // the button says the pick at once, not when what it reads comes
+    // back: over a long history that is seconds (#1990)
+    openSessCombo(btn, all, opts, value, (v) => {
+      btn.classList.toggle("set", !!v);
+      btn.firstChild.textContent = v ? (opts.find((o) => o.v === v)?.name || v) : t(all);
+      btn.title = v || "";
+      choose(v);
+    }, head);
   };
 }
 
@@ -18103,6 +18313,10 @@ function setSetTab(tab, remember) {
     if (b) setSetTab(b.dataset.set, true);
   };
   tabKeys(tabs, "button[data-set]");
+  // the tabs held at the top (app.css, #2396): a hairline under them once
+  // the page has scrolled beneath, as the Library's
+  const sv = $("#view-settings");
+  sv.addEventListener("scroll", () => sv.querySelector(":scope > .set-head").classList.toggle("stuck", sv.scrollTop > 0), { passive: true });
   // opened on a part (a reload, a link): that part, and remembered
   if (mode === "window" && params.get("view") === "settings" && SET_TABS.includes(params.get("tab"))) {
     setTab = params.get("tab");
@@ -18497,6 +18711,13 @@ function renderSettings() {
   row(t("Check every"), s.noAutoUpdate ? t("While automatic updates are on") : t("How often magpie looks for a newer version"), "",
     segs(UPDATE_EVERY.map((m) => [m, m < 60 ? t("{n} min", { n: m }) : t("{n} h", { n: m / 60 })]), s.updateEvery || 360,
       (updateEvery) => savePrefs({ ...keep, updateEvery }))).classList.add("update-every-row", ...(s.noAutoUpdate ? ["off"] : []));
+  // whether a newer version found is downloaded at once, or only said to
+  // be out and downloaded on a click (#2296): a metered network or a
+  // proxy billed by traffic. It holds for the version row's Check too.
+  row(t("Download updates automatically"), s.noAutoDownload
+    ? t("Off: a newer version is only shown, with its size; it downloads when you click Download update. For metered networks and proxies billed by traffic")
+    : t("Downloads a newer version as soon as it is found. Turn off on a metered network or a proxy billed by traffic"), "",
+    segs([["off", t("Off")], ["on", t("On")]], s.noAutoDownload ? "off" : "on", (v) => savePrefs({ ...keep, noAutoDownload: v === "off" }))).classList.add("update-download-row");
   // whether a downloaded update is restarted into by itself, once no agent
   // request is in flight (#2096); off, it waits for Restart or for quitting
   row(t("Restart automatically"), s.noAutoUpdate ? t("While automatic updates are on") : t("Once an update is downloaded, restarts into it when no agent request is in flight"), "",
@@ -19281,6 +19502,10 @@ function renderTrayUsage(s, keep) {
   $("#trayPaceRow").hidden = !ids.length || document.documentElement.classList.contains("win");
   $("#trayPaceSegs").replaceChildren(segs([["off", t("Off")], ["on", t("On")]], s.trayPace ? "on" : "off",
     (v) => savePrefs({ ...keep, trayPace: v === "on" })));
+  // and the cost beside magpie's own totals, in their cards and the
+  // tooltip, which every OS shows with or without cards (BussanQ)
+  $("#trayCostSegs").replaceChildren(segs([["off", t("Off")], ["on", t("On")]], s.trayNoCost ? "off" : "on",
+    (v) => savePrefs({ ...keep, trayNoCost: v === "off" })));
 }
 const TRAY_EVERY = [1, 3, 5, 10, 30];
 // the totals the menu bar can show beside the allowances (gui.trayTotal)
@@ -19408,7 +19633,9 @@ function renderProxy(s, keep) {
 // way magpie's requests leave. POST /api/proxy/check asks Cloudflare's
 // trace page through it, as a vendor request goes, and direct; the line
 // under the row's text says the address each left from. The same address
-// both ways says the proxy isn't taking them. A result is kept until the
+// both ways is a failure only when the request through the proxy didn't
+// connect to it; when it did, a TUN or system VPN can give both one exit
+// (#2369). A result is kept until the
 // proxy changes, so a redraw doesn't drop it.
 let proxyCheck = null; // { key, busy, out, err }
 function renderProxyCheck(s, row) {
@@ -19458,7 +19685,13 @@ function proxyCheckText(c) {
       : [t("No proxy in force, and a direct request failed: {error}", { error: d.error || "" }), true];
   }
   if (!via.ip) return [t("The proxy failed: {error}. Direct requests leave from {direct}", { error: via.error || "", direct }), true];
-  if (d.ip && via.ip === d.ip) return [t("Through the proxy requests leave from {where}, the same address as direct ones: they leave as if there were no proxy", { where: where(via) }), true];
+  // One address both ways: the connection tells whether the proxy took the
+  // request. A TUN or system VPN sends the direct one out its exit too (#2369).
+  if (d.ip && via.ip === d.ip) {
+    return via.proxied
+      ? [t("The proxy took the requests, but they leave from {where} as direct ones do: a TUN or system VPN may send every request out one exit, so the address can't tell the two paths apart", { where: where(via) }), false]
+      : [t("The request through the proxy didn't connect to it and leaves from {where}, the same address as direct ones: the proxy is passed by", { where: where(via) }), true];
+  }
   return [t("Works: through the proxy requests leave from {where}, {ms} ms; direct ones from {direct}", { where: where(via), ms: via.ms || 0, direct }), false];
 }
 
@@ -20020,6 +20253,9 @@ function renderSearch(s, keep) {
   const box = $("#searchList");
   box.replaceChildren();
   renderSearcher(s, keep, box);
+  // rows go into the box, or into a search API's own unit (its row and its
+  // keys' row), which is dragged as one (#2286)
+  let into = box;
   const row = (name, sub, ...tools) => {
     const r = el("div", "row pref");
     const who = el("div", "who");
@@ -20027,7 +20263,7 @@ function renderSearch(s, keep) {
     const val = el("div", "val");
     val.append(...tools);
     r.append(who, val);
-    box.append(r);
+    into.append(r);
     return r;
   };
   const set = (body, done) => writingPrefs(api("settings/search-api", body))
@@ -20087,7 +20323,9 @@ function renderSearch(s, keep) {
     i.onkeydown = (e) => { e.stopPropagation(); if (e.key === "Enter") add.onclick(); };
   }
   draw();
-  const apiFirst = s.searchFirst === "api" && (s.searchAPIs || []).length > 0;
+  // the ones a search asks: one switched off is kept, never asked (#2286)
+  const asked = (s.searchAPIs || []).filter((a) => !a.off);
+  const apiFirst = s.searchFirst === "api" && asked.length > 0;
   const by = s.searcher === "off" ? t("Provider search is off; only these APIs are used")
     : !s.searchProvider ? t("No provider can search, so these are asked")
     : apiFirst ? t("Asked before {who}, which searches when these fail", { who: s.searchProvider })
@@ -20097,7 +20335,13 @@ function renderSearch(s, keep) {
   head.classList.add("rule-row", "search-add");
   head.querySelector(".val").classList.add("rule-add");
   if (d.err) head.querySelector(".sub").classList.add("err");
+  const units = [];
   (s.searchAPIs || []).forEach((a, n) => {
+    const unit = el("div", "search-unit" + (a.off ? " off" : ""));
+    unit.dataset.vendor = a.vendor;
+    box.append(unit);
+    into = unit;
+    units.push(unit);
     const x = el("button", "text", t("Remove"));
     x.onclick = () => set({ vendor: a.vendor, remove: true });
     const what = [a.key || (a.ready ? "" : t("needs its key")), a.url].filter(Boolean).join(" · ");
@@ -20124,24 +20368,96 @@ function renderSearch(s, keep) {
       };
       tools.unshift(eye, cp);
     }
-    const r = row(`${n + 1}. ${a.name}`, what, ...tools);
+    // switched off it stays, key and all, and no search asks it (#2286)
+    const sw = el("button", "lib-switch use-credits search-on" + (a.off ? "" : " on"));
+    sw.type = "button";
+    sw.setAttribute("role", "switch");
+    sw.setAttribute("aria-checked", String(!a.off));
+    sw.setAttribute("aria-label", t("Ask {name}", { name: a.name }));
+    sw.title = a.off ? t("Off: kept with its key, and never asked") : t("On: asked in its turn");
+    sw.append(el("i"));
+    sw.onclick = () => {
+      if (sw.disabled) return;
+      sw.disabled = true;
+      set({ vendor: a.vendor, on: !!a.off });
+    };
+    tools.push(sw);
+    const r = row(`${n + 1}. ${a.name}`, a.off ? [t("Off"), what].filter(Boolean).join(" · ") : what, ...tools);
     r.classList.add("search-api");
-    if (a.keys > 1 || a.quota) searchKeysRow(s, a, row, set);
+    // with-keys, not :has(), which Safari before 15.4 can't parse
+    if (a.keys > 1 || a.quota) { unit.classList.add("with-keys"); searchKeysRow(s, a, row, set); }
+    into = box;
   });
+  searchArrange(box, units, set);
   // which goes first when both a provider and a search API can search
   // (#928); with only one of them there is nothing to choose
-  if (s.searchProvider && (s.searchAPIs || []).length) {
+  if (s.searchProvider && asked.length) {
     const r = row(t("Search first with"), t("The other is asked when it fails"),
       segs([["model", t("Model search")], ["api", t("Search APIs")]], apiFirst ? "api" : "model",
         (v) => savePrefs({ ...keep, searchFirst: v === "api" ? "api" : "" })));
     r.id = "searchFirstRow";
   }
   // the same search as an MCP server of the gateway's (Kayphoon on
-  // Discord), for an agent to mount as its web_search tool
+  // Discord), for an agent to mount as its web_search and web_fetch tools
   const mcpURL = mcpAddress(s, "/mcp/magpie/web-search");
-  const mcp = row(t("MCP server"), t("Cursor, Claude Desktop and other agents can add this search as an MCP server (Streamable HTTP) with one web_search tool. From another computer, send a gateway key as Authorization: Bearer <key>."),
+  const mcp = row(t("MCP server"), t("Cursor, Claude Desktop and other agents can add this search as an MCP server (Streamable HTTP), with a web_search tool and a web_fetch tool that reads a page by its URL. From another computer, send a gateway key as Authorization: Bearer <key>."),
     el("code", "", mcpURL), copyBtn(mcpURL, t("Address")));
   mcp.id = "searchMcpRow";
+}
+
+// searchArrange: the search APIs are asked in the order they are listed,
+// and put in another by dragging one anywhere off its buttons, or with
+// Alt+↑/↓ on it (#2286, as routing's groups are, #779). The new order
+// shows at once and is put back when it can't be saved.
+let searchArranging = false;
+function searchArrange(box, units, set) {
+  if (units.length < 2) return;
+  const move = (unit, to) => {
+    const from = units.indexOf(unit);
+    to = Math.max(0, Math.min(units.length - 1, to));
+    for (const u of units) u.style.transform = "";
+    if (to === from) return;
+    // moving a node in the page takes the keyboard off it
+    const focus = document.activeElement === unit;
+    const order = units.map((u) => u.dataset.vendor);
+    order.splice(to, 0, ...order.splice(from, 1));
+    const anchor = units.at(-1).nextSibling;
+    const next = order.map((v) => units.find((u) => u.dataset.vendor === v));
+    for (const u of next) box.insertBefore(u, anchor);
+    // a second move before the page is drawn again goes from this order
+    units.splice(0, units.length, ...next);
+    next.forEach((u, i) => {
+      const name = u.querySelector(".search-api .name");
+      if (name) name.textContent = name.textContent.replace(/^\d+\./, `${i + 1}.`);
+    });
+    if (focus) unit.focus({ preventScroll: true });
+    set({ arrange: order }, () => {
+      if (focus) requestAnimationFrame(() => document.querySelector(`#searchList .search-unit[data-vendor="${CSS.escape(unit.dataset.vendor)}"]`)?.focus({ preventScroll: true }));
+    });
+    // a refused order: set draws the page again from what is saved, the
+    // order as it was
+  };
+  for (const unit of units) {
+    const name = unit.querySelector(".search-api .name")?.textContent || "";
+    unit.tabIndex = 0;
+    unit.setAttribute("role", "group");
+    unit.setAttribute("aria-label", name + " · " + t("Drag to reorder · Alt+↑/↓ to move"));
+    unit.title = t("Drag to reorder · Alt+↑/↓ to move");
+    unit.prepend(el("span", "grip"));
+    unit.addEventListener("click", (e) => {
+      if (unit.dataset.dragged) { e.preventDefault(); e.stopImmediatePropagation(); }
+    }, true);
+    unit.onkeydown = (e) => {
+      if (e.target !== unit || !e.altKey || !["ArrowUp", "ArrowDown"].includes(e.key) || searchArranging) return;
+      e.preventDefault(); e.stopPropagation();
+      move(unit, units.indexOf(unit) + (e.key === "ArrowUp" ? -1 : 1));
+    };
+    unit.onpointerdown = (e) => {
+      if (searchArranging || e.target.closest("input, textarea, select, a, button, code, .segs, .sub.revealed")) return;
+      searchArranging = dragRows(e, unit, unit, box, units, (to) => move(unit, to), () => {},
+        () => { searchArranging = false; });
+    };
+  }
 }
 
 // searchKeysRow: under a search API with several keys, or one whose keys
@@ -21110,6 +21426,21 @@ async function renderUpdate(r, u) {
       if (u.error && u.url) btn(t("Download"), () => (web ? window.open(u.url, "_blank", "noopener") : api("open", { url: u.url })));
       break;
     }
+    case "found": {
+      // downloads wait for a click (Settings' Download updates
+      // automatically off, #2296): what is out, and how big it is
+      sub.textContent = t("{v} is out", { v: u.latest }) + (u.size ? " · " + t("{done} MB", { done: (u.size / 1e6).toFixed(1) }) : "");
+      const get = btn(t("Download update"), async () => {
+        if (updateBusy) return;
+        get.disabled = true;
+        get.classList.add("busy");
+        const a = await api(updatePath("update/install"), {}).catch((e) => ({ state: "error", error: e.message, current: u.current }));
+        if (r.isConnected) renderUpdate(r, a);
+      });
+      btn(t("Check"), check);
+      page();
+      break;
+    }
     case "available":
       sub.textContent = t("{v} is out", { v: u.latest });
       if (u.stuck) sub.textContent += " · " + updateStuck(u);
@@ -21256,7 +21587,9 @@ function wbCheckinLine(r) {
     case "captcha":
       return t("{user} is asked for a captcha; check in in the app", { user: r.user });
     case "own-app":
-      return t("{user}: {name} only gives check-in credits to its own app; check in in the {name} app", { user: r.user, name: checkinVendorName(r) });
+      return r.by === "trae"
+        ? t("{user}: Trae CN refused this check-in (9074: too many taking part); check in in the Trae CN app", { user: r.user })
+        : t("{user}: {name} only gives check-in credits to its own app; check in in the {name} app", { user: r.user, name: checkinVendorName(r) });
     default:
       return t("{user} couldn't check in, tried again later", { user: r.user });
   }
@@ -21273,8 +21606,8 @@ function prefsKeep(s) {
     claudeWarmup: s.claudeWarmup || "", codexWarmAt: s.codexWarmAt || "", claudeWarmAt: s.claudeWarmAt || "",
     codexWarmAts: warmTimes(s.codexWarmAts, s.codexWarmAt), claudeWarmAts: warmTimes(s.claudeWarmAts, s.claudeWarmAt), workbuddyCheckin: !!s.workbuddyCheckin, traeCheckin: !!s.traeCheckin, minimaxCheckin: !!s.minimaxCheckin, qoderCheckin: !!s.qoderCheckin, noStats: !!s.noStats, noUsageStats: !!s.noUsageStats,
     memberModel: !!s.memberModel, noLoopGuard: !!s.noLoopGuard, refusalRetries: s.refusalRetries ?? null,
-    noUpdatePill: !!s.noUpdatePill, noAutoUpdate: !!s.noAutoUpdate, updateEvery: s.updateEvery || 360, autoRestart: !!s.autoRestart,
-    trayUsage: s.trayUsage || "", trayUsageEvery: s.trayUsageEvery || 3, trayNoLogos: !!s.trayNoLogos, trayNoBird: !!s.trayNoBird, trayPace: !!s.trayPace, vision: s.vision || "", visionEffort: s.visionEffort || "", searcherEffort: s.searcherEffort || "", imageGen: s.imageGen || "", searcher: s.searcher || "", searchFirst: s.searchFirst || "", currency: s.currency || "usd",
+    noUpdatePill: !!s.noUpdatePill, noAutoUpdate: !!s.noAutoUpdate, updateEvery: s.updateEvery || 360, autoRestart: !!s.autoRestart, noAutoDownload: !!s.noAutoDownload,
+    trayUsage: s.trayUsage || "", trayUsageEvery: s.trayUsageEvery || 3, trayNoLogos: !!s.trayNoLogos, trayNoBird: !!s.trayNoBird, trayPace: !!s.trayPace, trayNoCost: !!s.trayNoCost, vision: s.vision || "", visionEffort: s.visionEffort || "", searcherEffort: s.searcherEffort || "", imageGen: s.imageGen || "", searcher: s.searcher || "", searchFirst: s.searchFirst || "", currency: s.currency || "usd",
     chineseUnits: !!s.chineseUnits, usageAlert: s.usageAlert || 0, balanceAlert: s.balanceAlert || 0, resetReminder: s.resetReminder || 0,
     turnDoneAlert: s.turnDoneAlert || 0 };
 }
@@ -21562,7 +21895,11 @@ function standIn(h) {
   }
 }
 function hold(h) {
-  const a = h.chain.find(([n]) => atRest(n)) || (h.chain.some(([n]) => n.isConnected) ? null : standIn(h));
+  // held by what can be seen: an empty part (a row's value with nothing in it
+  // yet) has no height, so "moved by less than half its height" below never
+  // held, and Add to PATH on Settings' About slid the view 11px off its top
+  // once the page was a little taller than the window (#2296)
+  const a = h.chain.find(([n]) => atRest(n) && n.offsetHeight) || h.chain.find(([n]) => atRest(n)) || (h.chain.some(([n]) => n.isConnected) ? null : standIn(h));
   if (!a) return;
   const v = h.v, d = onScreen(a[0], v) - a[1];
   if (Math.abs(d) >= 1) {
@@ -22273,7 +22610,7 @@ function navSubs() {
       };
       at.after(box);
     }
-    box.setAttribute("aria-label", at.querySelector("span[data-t]")?.textContent || "");
+    box.setAttribute("aria-label", (at.querySelector("span[data-t]") || at.querySelector("span"))?.textContent || "");
     for (const s of box.querySelectorAll(".nav-s")) s.remove();
     items.forEach((b, i) => {
       const [name, n] = b.textContent.trim().split(" · ");
@@ -22372,7 +22709,8 @@ function renderCrumb(items) {
     let gl = b?.previousElementSibling;
     while (gl && !gl.matches(".nav-gl")) gl = gl.previousElementSibling;
     if (gl) parts.push(gl.textContent);
-    if (b) parts.push(b.querySelector("span[data-t]").textContent);
+    // a plugin's page's tab has its own title, not one translated here
+    if (b) parts.push((b.querySelector("span[data-t]") || b.querySelector("span"))?.textContent || "");
   }
   const on = items.find((b) => b.classList.contains("on"));
   if (on) parts.push(on.textContent.trim().split(" · ")[0]);

@@ -266,10 +266,13 @@ body.panel .seg { display: none; }
 .update:active { transform: scale(.96); }
 .update.busy { pointer-events: none; opacity: .6; }
 /* its × on the pill's corner, shown while the pointer is over it: hides
-   the pill until a newer version is out */
+   the pill until a newer version is out. Off the pill, just touching its
+   rounded corner: over it, the × took the top right of the pill, a fifth of
+   the round arrow in a narrow header, and a click meant for Update hid it
+   (#2291, MuiseDestiny). The pill's margin is the gap to its right. */
 .update-wrap { position: relative; align-self: center; display: inline-flex; }
 .update-hide {
-  position: absolute; top: -5px; right: 3px; width: 14px; height: 14px; border-radius: 50%;
+  position: absolute; top: -9px; right: -3px; width: 14px; height: 14px; border-radius: 50%;
   display: inline-flex; align-items: center; justify-content: center;
   color: var(--muted); background: var(--card); box-shadow: 0 0 0 1px var(--line), 0 1px 2px rgba(0,0,0,.12);
   opacity: 0; pointer-events: none; transition: opacity .12s, color .12s;
@@ -285,6 +288,7 @@ body.panel .seg { display: none; }
    their right (#442) */
 .top.tight .brand > span:not(.logo), .top.tight .update span { display: none; }
 .top.tight .update { width: 22px; padding: 0; justify-content: center; margin-right: 4px; }
+.top.tight .update-hide { right: -5px; }
 body.window .top.inrow .seg { position: relative; left: auto; top: auto; transform: none; margin: 0 auto; } /* relative still: its thumb sits in it, not over the whole header */
 body.window .top.inrow .actions { margin-left: 0; }
 .top.cramped .seg button { padding: 0 8px; }
@@ -979,7 +983,7 @@ body.window .field.solo { grid-column: auto; }
    card's other lines do (#840) */
 .quota-refresh { display: inline-flex; align-items: center; justify-content: center; width: 0; height: 14px; margin: 0; padding: 0; border: 0; border-radius: 4px; background: none; color: var(--faint); vertical-align: -3px; opacity: 0; overflow: hidden; cursor: pointer; transition: width .12s, margin .12s, opacity .12s; }
 .quota-refresh svg { flex: none; }
-.subscription-card:hover .quota-refresh, .quota-refresh.busy { width: 14px; margin: 0 3px 0 -2px; opacity: 1; }
+.subscription-card:hover .quota-refresh, .pq-card:hover .quota-refresh, .quota-refresh.busy { width: 14px; margin: 0 3px 0 -2px; opacity: 1; }
 /* apart: Safari before 15.4 drops a whole selector list with :focus-visible in it */
 .quota-refresh:focus-visible { width: 14px; margin: 0 3px 0 -2px; opacity: 1; }
 .quota-refresh:hover { color: var(--fg); background: var(--pill-hover); }
@@ -1042,6 +1046,13 @@ body.window .field.solo { grid-column: auto; }
 .kpi b .u:last-child { margin-right: 0; }
 .kpi span { font-size: 11px; font-weight: 600; letter-spacing: .05em; text-transform: uppercase; color: var(--muted); margin-top: 3px; }
 .kpi small { font-size: 11px; color: var(--muted); margin-top: 3px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+/* the Overview's tokens tile names how they are counted, a pop-up of the two
+   ways (#2378): the label's own look, a small chevron after it */
+.kpi .kpi-pick { align-self: flex-start; display: inline-flex; align-items: center; gap: 3px; max-width: 100%; margin: 2px 0 -1px -4px; padding: 1px 4px; border-radius: 5px; color: var(--muted); transition: background .12s, color .12s; }
+.kpi .kpi-pick > span { margin-top: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.kpi .kpi-pick svg { flex: none; }
+.kpi .kpi-pick:hover, .kpi .kpi-pick.open { background: var(--pill); color: var(--fg-2); }
+.kpi .kpi-pick:hover > span, .kpi .kpi-pick.open > span { color: inherit; }
 .chart { position: relative; margin-top: 8px; padding: 12px 14px 8px; background: var(--card); border: 1px solid var(--line); border-radius: 12px; flex: none; }
 .chart .peak { font-size: 10.5px; color: var(--faint); font-variant-numeric: tabular-nums; text-align: right; margin: 0 0 5px; }
 .chart .bars { display: flex; align-items: flex-end; gap: 3px; height: 72px; border-bottom: 1px solid var(--line-2); }
@@ -1081,6 +1092,8 @@ body.window .field.solo { grid-column: auto; }
 /* the hidden ones: a quiet line under the list, opening them dimmed */
 .us-hid { display: flex; flex-direction: column; flex: none; }
 .us-hid[hidden] { display: none; }
+/* a list folded under its heading (#2378) */
+#usagePane .list.folded, #usagePane .us-hid.folded { display: none; }
 .us-hid .us-hidline { align-self: flex-start; display: inline-flex; align-items: center; gap: 4px; margin: 4px 0 0 2px; font-size: 11.5px; color: var(--faint); }
 .us-hid .us-hidline:hover { color: var(--fg-2); }
 .us-hid .us-hidline svg { transition: transform .15s; }
@@ -1124,6 +1137,14 @@ body.window .field.solo { grid-column: auto; }
 .led-strip .sub.jumps { white-space: normal; overflow: visible; }
 /* the wait for the first token and its count wrap rather than cut the count off */
 .led-strip .sub.ttft { white-space: normal; }
+/* a line of counts, as the Tokens card's in, out and cache: each kept whole,
+   wrapping between them rather than cutting the last off (#2378) */
+/* a line in parts wraps between them, each kept whole; only a part wider
+   than its card on its own is cut (#2378: "缓存 879…") */
+.led-strip .sub.parts, .kpi small.parts { white-space: normal; }
+.led-strip .sub.parts > span, .kpi small.parts > span { display: inline-block; max-width: 100%; vertical-align: bottom; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+/* not the tile's label: .kpi span is its small capitals */
+.kpi small.parts > span { margin-top: 0; font: inherit; letter-spacing: normal; text-transform: none; color: inherit; }
 .led-strip .led-jump { text-align: start; font: inherit; color: inherit; background: none; border: 0; padding: 0; cursor: pointer; text-decoration: underline dotted; text-underline-offset: 2px; }
 .led-strip .led-jump.bad { color: var(--red); }
 .led-strip .led-jump:hover, .led-strip .led-jump.on { text-decoration-style: solid; }
@@ -1160,6 +1181,15 @@ body.window .field.solo { grid-column: auto; }
 .led-chart .tip i { width: 7px; height: 7px; border-radius: 2px; flex: none; }
 .led-chart .tip em { margin-left: auto; padding-left: 12px; font-style: normal; font-variant-numeric: tabular-nums; }
 .led-chart .tip .sum { margin-top: 3px; padding-top: 3px; border-top: 1px solid var(--line-2); color: var(--muted); }
+/* speed: name, speed and first token in columns, the name whole (#2343) */
+.led-chart .tip.speed { display: grid; grid-template-columns: 7px minmax(0, 1fr) auto auto; column-gap: 6px; align-items: center; max-width: min(400px, 100%); }
+.led-chart .tip.speed b { grid-column: 1 / -1; }
+.led-chart .tip.speed > div { display: contents; }
+.led-chart .tip.speed div span { white-space: normal; overflow-wrap: anywhere; text-overflow: clip; }
+.led-chart .tip.speed em { margin-left: 0; padding-left: 6px; text-align: right; white-space: nowrap; }
+.led-chart .tip.speed .ttft { color: var(--muted); }
+.led-chart .tip.speed .sum > * { align-self: stretch; margin-top: 3px; padding-top: 3px; border-top: 1px solid var(--line-2); }
+.led-chart .tip.speed .sum > span { grid-column: 1 / 3; }
 .led-chart .none { display: flex; align-items: center; justify-content: center; height: 100%; color: var(--muted); text-align: center; padding: 0 20px; }
 .led-rank { min-width: 0; display: flex; flex-direction: column; gap: 1px; align-content: start; }
 .led-rank .rk { display: block; width: 100%; padding: 6px 8px 7px; border: 0; border-radius: 8px; background: transparent; color: inherit; font: inherit; text-align: left; cursor: pointer; }
@@ -1237,10 +1267,12 @@ body.window .field.solo { grid-column: auto; }
 .led-vias .blk { cursor: pointer; text-align: left; border: 0; font: inherit; color: inherit; background: none; }
 .led-vias .blk:hover { background: var(--pill-hover); }
 .led-vias .blk:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
-/* the one being filtered by: its own colour under the count, no blue text */
-.led-vias .blk.on { box-shadow: inset 0 -2px 0 var(--accent); }
-/* the end cells round as the strip does, inside its 1px border, so a hover,
-   the focus ring or the bar under the one filtered by doesn't square its corner */
+/* the one being filtered by: its own colour under the count, no blue text;
+   a straight bar as wide as the text, so it never bends up a rounded corner */
+.led-vias .blk { position: relative; }
+.led-vias .blk.on::after { content: ""; position: absolute; left: 15px; right: 15px; bottom: 0; height: 2px; border-radius: 1px; background: var(--accent); }
+/* the end cells round as the strip does, inside its 1px border, so a hover
+   or the focus ring doesn't square its corner */
 .led-vias .blk:first-child { border-radius: 11px 0 0 11px; }
 .led-vias .blk:last-child { border-radius: 0 11px 11px 0; }
 /* the count's unit sits after the number, small, as its label is under it */
@@ -1263,6 +1295,8 @@ body.window .field.solo { grid-column: auto; }
 /* the table scrolls sideways in its own box, never the page */
 .led-wrap { max-width: 100%; overflow-x: auto; overscroll-behavior-x: contain; background: var(--card); border: 1px solid var(--line); border-radius: 12px; }
 .led-wrap.none { overflow: visible; }
+.led-wrap.led-pending > * { opacity: .55; transition: opacity .15s; }
+@media (prefers-reduced-motion: reduce) { .led-wrap.led-pending > * { transition: none; } }
 /* its own scrollbar is at the table's foot, fifty rows down and out of
    sight (#799): this one stands in for it, held at the bottom of the window
    while the table is in it, and drawn always, the Mac's overlay one too */
@@ -1546,6 +1580,8 @@ details.cx-part[open] > summary .cx-h { margin-bottom: 2px; }
 .row.sess.sess-link { cursor: pointer; }
 .row.sess .sess-go { flex: none; display: inline-flex; color: var(--faint); }
 .row.sess.sess-link:hover .sess-go { color: var(--fg-2); }
+/* with the Sessions page off it unfolds in place instead (#2311) */
+.row.sess .sess-go.up svg { transform: rotate(180deg); }
 /* apart: Safari before 15.4 drops a whole selector list with :focus-visible in it */
 .row.sess.sess-link:focus-visible .sess-go { color: var(--fg-2); }
 .sess-all { flex: none; white-space: nowrap; }
@@ -1781,6 +1817,11 @@ body.panel .profiles #save { height: 25px; } /* the field's: the line keeps its 
 .ar-say { flex: 1; min-width: 0; line-height: 1.35; }
 .ar-say b { font-weight: 500; color: var(--fg-2); }
 .ar-used { display: block; margin-top: 2px; color: var(--faint); }
+.pq-opts-fold { float: right; display: inline-grid; place-items: center; width: 18px; height: 16px; margin: 0 0 0 4px; padding: 0; border-radius: 4px; color: var(--faint); transition: background .12s, color .12s; }
+.pq-opts-fold:hover { background: var(--pill); color: var(--fg-2); }
+.pq-opts-fold svg { transform: rotate(180deg); transition: transform .15s ease-out; }
+.pq-opts-fold[aria-expanded="false"] svg { transform: none; }
+@media (prefers-reduced-motion: reduce) { .pq-opts-fold svg { transition: none; } }
 /* its two times, each a line of its own with its switch (#2078): the
    say on top, the lines under it, each switch at the line's end */
 .quota-autoreset.ar-split, .pq-autoreset.ar-split { flex-direction: column; align-items: stretch; gap: 3px; }
@@ -1811,6 +1852,12 @@ body.panel .profiles #save { height: 25px; } /* the field's: the line keeps its 
 .pq-bn { display: flex; align-items: center; gap: 6px; }
 .pq-bn > span:last-child { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
 .pq-bn .ic { width: 14px; height: 14px; flex: none; }
+/* the card's own refresh before the logo: closed, the row's gap closed with
+   it; open, as wide as on the Usage page (#840) */
+.pq-bn > .quota-refresh { margin-right: -6px; }
+.pq-card:hover .pq-bn > .quota-refresh, .pq-bn > .quota-refresh.busy { margin: 0 -3px 0 -2px; }
+.pq-bn > .quota-refresh:focus-visible { margin: 0 -3px 0 -2px; }
+@media (hover: none) { .pq-bn > .quota-refresh { margin: 0 -3px 0 -2px; } }
 .pq-amt { font-size: 15px; font-weight: 600; letter-spacing: -.01em; color: var(--fg); font-variant-numeric: tabular-nums; }
 /* a balance field's several amounts on a balance's card (#420) */
 .pq-lead { display: flex; align-items: baseline; gap: 6px; min-width: 0; }
@@ -2635,6 +2682,9 @@ body.window .ag-sk-icon { width: 22px; height: 22px; border-radius: 6px; }
 .signing .mark { width: 16px; height: 16px; flex: none; margin-top: 1px; border-radius: 50%; display: grid; place-items: center; background: var(--fg); color: var(--card); font-size: 11px; font-weight: 700; }
 .fallback { display: grid; gap: 6px; }
 .fallback .fbl { display: grid; gap: 2px; }
+/* an empty list takes no row, so the control under it starts level with its
+   label rather than a gap lower */
+.fallback .fbl:empty { display: none; }
 .fbrow { display: flex; align-items: center; gap: 8px; min-height: 28px; font-size: 12.5px; }
 .fbrow .i { width: 14px; color: var(--muted); font-variant-numeric: tabular-nums; }
 .fbrow .grow { flex: 1; }
@@ -2782,6 +2832,8 @@ body.window .ag-sk-icon { width: 22px; height: 22px; border-radius: 6px; }
 .editor input::placeholder, .acc input::placeholder { color: var(--faint); }
 .editor .pair { display: flex; gap: 8px; align-items: center; }
 .editor .pair input:first-child { flex: 1; }
+.editor .pair.bal-ask input { flex: 1; min-width: 0; }
+.editor .pair.bal-ask .segs { flex: none; align-self: center; }
 .editor .side { display: flex; gap: 4px; align-items: center; flex: none; min-width: 52px; justify-content: flex-end; }
 .editor .side .text { padding: 3px 6px; }
 .editor .headers .pair .side .text { display: inline-flex; align-items: center; justify-content: center; width: 24px; height: 24px; padding: 0; border-radius: 6px; }
@@ -2836,20 +2888,21 @@ body.window .ag-sk-icon { width: 22px; height: 22px; border-radius: 6px; }
 /* a strip too wide for the window scrolls in itself: the regions,
    Connect's five APIs on a narrow one, and Usage → Sessions' agents,
    which #929 left widening the whole page until its last agent's
-   filter was only reachable by dragging the page sideways */
-.segs.regions, .connect .segs, #sessAgent { max-width: 100%; overflow-x: auto; }
+   filter was only reachable by dragging the page sideways, and Plugins'
+   kinds on GitHub, wider than a 420px window in Japanese */
+.segs.regions, .connect .segs, #sessAgent, .pm-ghbar .segs { max-width: 100%; overflow-x: auto; }
 /* no scrollbar-width here: Chromium (WebView2) then drops every
    ::-webkit-scrollbar rule and draws Windows' classic bar, arrows and all,
    under the strip; the app's thin thumb instead, slimmer still */
-:where(body:not(.mac)) :is(.segs.regions, .connect .segs, #sessAgent)::-webkit-scrollbar { height: 6px; }
-:where(body:not(.mac)) :is(.segs.regions, .connect .segs, #sessAgent)::-webkit-scrollbar-thumb { border-width: 1px; }
+:where(body:not(.mac)) :is(.segs.regions, .connect .segs, #sessAgent, .pm-ghbar .segs)::-webkit-scrollbar { height: 6px; }
+:where(body:not(.mac)) :is(.segs.regions, .connect .segs, #sessAgent, .pm-ghbar .segs)::-webkit-scrollbar-thumb { border-width: 1px; }
 /* on a Mac they scroll with no bar, as a Mac's own tab strips do: the
    system's overlay bar showed over the options' lower half for a moment
    after each scroll, and a click there went to the bar, which paged the
    strip sideways and picked nothing (#1620) */
-:where(body.mac) :is(.segs.regions, .connect .segs, #sessAgent) { scrollbar-width: none; }
-:where(body.mac) :is(.segs.regions, .connect .segs, #sessAgent)::-webkit-scrollbar { display: none; }
-.segs.regions .opt, .connect .segs .opt, #sessAgent .opt { flex: none; }
+:where(body.mac) :is(.segs.regions, .connect .segs, #sessAgent, .pm-ghbar .segs) { scrollbar-width: none; }
+:where(body.mac) :is(.segs.regions, .connect .segs, #sessAgent, .pm-ghbar .segs)::-webkit-scrollbar { display: none; }
+.segs.regions .opt, .connect .segs .opt, #sessAgent .opt, .pm-ghbar .segs .opt { flex: none; }
 /* a custom provider's five Base URL APIs wrap to a second row where the
    editor is too narrow for them (#1346); the thumb follows the row */
 .segs.base-apis { max-width: 100%; flex-wrap: wrap; }
@@ -3055,6 +3108,25 @@ body.window .ag-sk-icon { width: 22px; height: 22px; border-radius: 6px; }
    when they fill it; while it holds words, each part's rows that say them
    under the part's name, and the tabs set aside */
 #view-settings .set-head { flex-wrap: wrap; gap: 6px; }
+/* with the tabs across the top (the sidebar has them in the title bar) the
+   parts' tabs and the search stay at the top of the page while a long part
+   (About) scrolls under them, on the frosted strip the Library's and the
+   Plugins' tabs have (.lib-head), a hairline once something is beneath
+   (#2396). The strip is the head's ::before, reaching over the view's
+   padding and the head's margins so no row shows through above or below
+   it; at the page's top it is the page's own colour, nothing moved. The
+   window's view is padded 2px at the top: the head stops over it */
+body:not(.side-nav) #view-settings .set-head { position: sticky; top: 0; z-index: 5; --bleed-l: 12px; --bleed-r: 12px; }
+body.window:not(.side-nav) #view-settings .set-head { top: -2px; --bleed-l: 16px; --bleed-r: 16px; }
+body:not(.side-nav) #view-settings .set-head::before {
+  content: ""; position: absolute; z-index: -1; pointer-events: none;
+  top: -6px; bottom: -6px; left: calc(-1 * var(--bleed-l)); right: calc(-1 * var(--bleed-r));
+  background: color-mix(in srgb, var(--bg) 92%, transparent);
+  -webkit-backdrop-filter: saturate(1.6) blur(16px); backdrop-filter: saturate(1.6) blur(16px);
+  box-shadow: 0 1px 0 transparent; transition: box-shadow .18s var(--ease);
+}
+body:not(.side-nav) #view-settings .set-head.stuck::before { box-shadow: 0 1px 0 var(--line-2); }
+@supports not (color: color-mix(in srgb, red 50%, blue)) { body:not(.side-nav) #view-settings .set-head::before { background: var(--bg); } }
 .set-q { flex: 0 1 180px; margin-left: auto; min-width: 120px; }
 .set-searching .set-tabs { display: none; }
 .set-searching .set-q { flex: 1 1 100%; width: 100%; margin-left: 0; }
@@ -3080,6 +3152,11 @@ body.window .ag-sk-icon { width: 22px; height: 22px; border-radius: 6px; }
 /* a plugin's page that broke (kernel.js): what broke, and Try again */
 .slot-error .row { gap: 14px; padding: 12px 14px; }
 .slot-error .sub { margin-top: 2px; color: var(--fg-2); overflow-wrap: anywhere; }
+/* a community plugin's page (pluginpages.js): its frame fills the page */
+.view.plugin-page { padding: 0; }
+.plugin-frame { flex: 1; display: block; width: 100%; min-height: 240px; border: 0; background: transparent; }
+.view.plugin-page > .slot-error { margin: 0 12px; }
+img.nav-ic { border-radius: 3px; object-fit: contain; }
 .row.pref { min-height: 50px; padding: 8px 12px 8px 14px; gap: 14px; }
 .row.pref .who { flex: 1 1 auto; }
 .row.pref .sub { margin-top: 2px; color: var(--fg-2); }
@@ -3158,6 +3235,26 @@ input.words.search-key, input.words.search-url { flex: 1 1 120px; width: auto; m
 .search-quota .err { color: var(--red); overflow-wrap: anywhere; }
 .search-quota .warn { color: var(--amber); }
 .prefs .val.rule-add .segs { margin-left: 0; }
+/* a search API and its keys' row, dragged as one into the order they are
+   asked in (#2286); its grip shows only under the pointer, and one
+   switched off is dimmed but for its switch */
+.row + .search-unit, .search-unit + .search-unit, .search-unit + .row { border-top: 1px solid var(--line-2); }
+.search-unit { position: relative; background: var(--card); cursor: grab; }
+.search-unit:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+.search-unit > .grip { position: absolute; left: 4px; top: 50%; translate: 0 -50%; width: 6px; height: 11px; background: radial-gradient(circle, var(--muted) .9px, transparent 1.2px) 0 0 / 3px 3.75px; opacity: 0; transition: opacity .15s; pointer-events: none; }
+.search-unit.with-keys > .grip { top: 24px; translate: none; }
+.search-unit:is(:hover, .dragging) > .grip { opacity: 1; }
+.search-unit:focus-visible > .grip { opacity: 1; }
+@media (hover: none) { .search-unit > .grip { opacity: 1; } }
+.search-unit .row .sub.revealed, .search-unit code { cursor: text; }
+.search-unit .row .val button { cursor: pointer; }
+#searchList.sorting .search-unit { transition: transform .22s cubic-bezier(.22, 1, .36, 1); cursor: grabbing; }
+#searchList .search-unit.dragging { z-index: 2; transition: none; box-shadow: 0 6px 18px rgba(20, 22, 30, .12), 0 0 0 1px var(--line); }
+.search-unit.off .row .who, .search-unit.off .search-keys .val { opacity: .5; }
+/* its buttons and switch: the whole row's width when it needs it, and
+   wrapped under each other rather than past the window's edge */
+.prefs .row.pref.search-api .val { max-width: 100%; flex-wrap: wrap; justify-content: flex-end; }
+.row.pref.search-api .search-on { margin-left: 6px; }
 /* a rule open to edit (nf1qaz2w on Discord): laid out as the add row; a
    narrow window puts the match, Save and Cancel on a line of their own under
    the name and Prefix or Regex, the match keeping room to type in */

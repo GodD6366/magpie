@@ -339,7 +339,11 @@ type loggedAnswer struct {
 // remembered (#1367). A call refused or failed answered nothing, a title
 // isn't the conversation's own turn, and Codex's own sign-in (the ChatGPT
 // backend, relayed as it came) is no provider here: a lead it answered is
-// told of as one sealed by the ChatGPT backend.
+// told of as one sealed by the ChatGPT backend. That relay is a row whose
+// provider is openai (one written before it named the account, or a call
+// sent with an API key) or codex with the API host alone. A row an account
+// answered names that account in Host ("host as email", provider.Where)
+// and still counts.
 func loggedAnswers(convs ...string) []loggedAnswer {
 	convs = slices.DeleteFunc(slices.Clone(convs), func(c string) bool { return strings.TrimSpace(c) == "" })
 	if len(convs) == 0 {
@@ -350,7 +354,10 @@ func loggedAnswers(convs ...string) []loggedAnswer {
 		if r.Provider == "" || r.Provider == "magpie" || r.IsRejected() || r.IsReported() || r.Status <= 0 || r.Status >= 400 || r.Computer != "" || isTitleKind(r.Kind) {
 			return
 		}
-		if r.Provider == "openai" && strings.HasPrefix(r.Endpoint, CodexPath) {
+		// ponytail: host " as " is provider.Where. A relay that starts
+		// writing Host that way would be counted as a lead's answerer.
+		ownRelay := r.Provider == "openai" || (r.Provider == "codex" && !strings.Contains(r.Host, " as "))
+		if ownRelay && strings.HasPrefix(r.Endpoint, CodexPath) {
 			return // Codex's own sign-in
 		}
 		if !slices.Contains(convs, r.NativeSession) && !slices.Contains(convs, r.Session) {
@@ -977,7 +984,9 @@ func (s *Server) codexUpstreamOn(w http.ResponseWriter, r *http.Request, rest st
 	}
 	end(call.Status, call.Error, uu.Input+uu.Output+uu.CacheRead+uu.CacheWrite, uu.Output)
 	s.record(call)
-	rec := usage.Record{RouteID: tr.ID, Time: start, Agent: call.Agent, Provider: call.Provider, Host: provider.HostOf(base), Model: call.Model,
+	servedProvider, servedAccount := codexServed(base, r.Header, on)
+	rec := usage.Record{RouteID: tr.ID, Time: start, Agent: call.Agent,
+		Provider: servedProvider, Host: provider.HostOf(base), ProviderAccount: servedAccount, Model: call.Model,
 		Requested: call.Model, Served: served,
 		Input: uu.Input, Output: uu.Output, CacheRead: uu.CacheRead, CacheWrite: uu.CacheWrite,
 		Reasoning: uu.Reasoning, Effort: effort, Millis: call.Millis,
@@ -986,6 +995,34 @@ func (s *Server) codexUpstreamOn(w http.ResponseWriter, r *http.Request, rest st
 		RequestID: requestID(res.Header), ResponseID: uu.ResponseID, Endpoint: r.URL.Path}
 	failedWith(&rec, call.Status, call.Error, errType)
 	appendUsage(r, rec)
+}
+
+// codexServed is who a relay through codexUpstreamOn is recorded as.
+// Codex's own ChatGPT sign-in is the codex account, and a compaction
+// signed by another of its accounts (compactOn) is that account, so the
+// account card's window counts the call. A call sent to OpenAI's API
+// with Codex's key stays openai with no account. With no sign-in to
+// name, or a request whose chatgpt-account-id isn't the sign-in's, it
+// stays openai too, rather than a codex row that names the wrong account.
+// Rows already written are not rewritten.
+func codexServed(base string, h http.Header, on *provider.Provider) (id, account string) {
+	if base != provider.CodexBase || apiKey(h) {
+		return "openai", ""
+	}
+	if on != nil && on.Account != nil && on.Account.User != "" {
+		return on.ID, on.Account.User
+	}
+	// the token went out as Codex sent it: it is the sign-in magpie reads
+	// only when it names the same ChatGPT account. A Codex in WSL, or
+	// under another CODEX_HOME, signs with its own, which isn't named here
+	if acct := h.Get("chatgpt-account-id"); acct != "" && acct != provider.CodexSignedInAccount() {
+		return "openai", ""
+	}
+	p, err := provider.Find("codex")
+	if err != nil || p.Account == nil || p.Account.User == "" {
+		return "openai", ""
+	}
+	return p.ID, p.Account.User
 }
 
 // unreadableItem is the item OpenAI's refusal names: sealed content it
@@ -1445,12 +1482,73 @@ func codexInputAs(body []byte, magpieModel, native bool) (_ []byte, compact bool
 		q["tools"] = json.RawMessage("[]")
 		q["tool_choice"] = json.RawMessage(`"auto"`)
 		q["parallel_tool_calls"] = json.RawMessage("false")
+		if cm, ok := localCompactionMeta(q["client_metadata"]); ok {
+			q["client_metadata"] = cm
+		}
 	}
 	nb, err := json.Marshal(q)
 	if err != nil {
 		return body, false
 	}
 	return nb, compact
+}
+
+// turnMetadataHeader is where Codex says what a request is for, as it does
+// in client_metadata's x-codex-turn-metadata too.
+const turnMetadataHeader = "X-Codex-Turn-Metadata"
+
+// localCompactionTurn is Codex's turn metadata for a compaction magpie
+// summarises itself, as Codex says it of the summary it asks a provider
+// for: compaction.implementation "responses", not the remote
+// "responses_compaction_v2" Codex named when it sent a compaction_trigger
+// (Codex 0.162.1 under a provider named "OpenAI" and under another, both
+// captured). The trigger is gone from what magpie sends, so the request
+// said remote compaction and carried none, a shape Codex itself never
+// sends. A relay that only takes Codex's own requests refused magpie's
+// compaction with "invalid codex request" (#2352, #1171). Everything
+// else stays byte for byte; false when there's nothing to change.
+func localCompactionTurn(meta string) (string, bool) {
+	if !strings.Contains(meta, `"compaction"`) {
+		return meta, false
+	}
+	var m struct {
+		Compaction *struct {
+			Implementation *string `json:"implementation"`
+		} `json:"compaction"`
+	}
+	if json.Unmarshal([]byte(meta), &m) != nil || m.Compaction == nil || m.Compaction.Implementation == nil {
+		return meta, false
+	}
+	impl := *m.Compaction.Implementation
+	if impl == "responses" {
+		return meta, false
+	}
+	was, _ := json.Marshal(impl)
+	old := `"implementation":` + string(was)
+	if strings.Count(meta, old) != 1 {
+		return meta, false
+	}
+	return strings.Replace(meta, old, `"implementation":"responses"`, 1), true
+}
+
+// localCompactionMeta is a request's client_metadata with its
+// x-codex-turn-metadata made localCompactionTurn's.
+func localCompactionMeta(raw json.RawMessage) (json.RawMessage, bool) {
+	var cm map[string]json.RawMessage
+	var meta string
+	if json.Unmarshal(raw, &cm) != nil || json.Unmarshal(cm["x-codex-turn-metadata"], &meta) != nil {
+		return raw, false
+	}
+	turn, ok := localCompactionTurn(meta)
+	if !ok {
+		return raw, false
+	}
+	cm["x-codex-turn-metadata"], _ = marshalPlain(turn)
+	out, err := marshalPlain(cm)
+	if err != nil {
+		return raw, false
+	}
+	return out, true
 }
 
 // bareReasoningRefused is how unfit remembers a provider turning away, for
@@ -1871,7 +1969,24 @@ func userMessage(text string) map[string]any {
 // and as plain text was summarised — and one it breaks off with that
 // refusal after the reply began, HTTP 200 and an error event (#1270). Any
 // other failure (401, 429, 500) goes back to Codex as it came.
+//
+// The summary is asked for whole (askWhole): a reply that breaks off, or
+// ends incomplete, is a failure the next account or member answers, as
+// one that fails before it begins, and is never taken for the summary;
+// when none is left Codex is told so. One conversation's compaction that
+// keeps failing stops being asked for a while (compactFails, #2274).
 func (s *Server) codexCompact(w http.ResponseWriter, r *http.Request, body []byte) {
+	key, model := compactKey(body), modelOf(body)
+	if msg, held := s.compactFails.held(key, model); held {
+		log.Printf("codex compaction: %s", msg)
+		writeError(w, provider.Responses, http.StatusBadRequest, msg)
+		return
+	}
+	if turn, ok := localCompactionTurn(r.Header.Get(turnMetadataHeader)); ok {
+		r = r.Clone(r.Context())
+		r.Header.Set(turnMetadataHeader, turn)
+	}
+	r = askWhole(r)
 	ask := func(b []byte) (*recorder, compactResult, error) {
 		rec := &recorder{header: http.Header{}, status: 200}
 		s.serve(rec, r, provider.Responses, b)
@@ -1879,6 +1994,11 @@ func (s *Server) codexCompact(w http.ResponseWriter, r *http.Request, body []byt
 			return rec, compactResult{}, nil
 		}
 		res, err := compactReply(rec.body.Bytes())
+		if t := bytes.TrimSpace(rec.body.Bytes()); err == nil && res.Status == "" && (len(t) == 0 || t[0] != '{') {
+			// a stream with no response.completed stopped before its end:
+			// what it had said is no summary (#2274)
+			err = errEndedShort
+		}
 		return rec, res, err
 	}
 	rec, res, err := ask(body)
@@ -1904,6 +2024,8 @@ func (s *Server) codexCompact(w http.ResponseWriter, r *http.Request, body []byt
 		}
 	}
 	if rec.status >= 400 {
+		_, msg := compactFailure(body, rec)
+		s.compactFails.failed(key, rec.status, msg)
 		for k, vs := range rec.header {
 			w.Header()[k] = vs
 		}
@@ -1911,8 +2033,22 @@ func (s *Server) codexCompact(w http.ResponseWriter, r *http.Request, body []byt
 		w.Write(rec.body.Bytes())
 		return
 	}
+	if err == nil && local == "" && res.Status == "incomplete" {
+		// cut short — its output limit — it's no summary (#2274)
+		why := "unknown"
+		var d struct {
+			Reason string `json:"reason"`
+		}
+		if json.Unmarshal(res.IncompleteDetails, &d) == nil && d.Reason != "" {
+			why = d.Reason
+		}
+		err = fmt.Errorf("%s (%s)", incompleteReply, why)
+	}
 	if err != nil {
-		writeError(w, provider.Responses, 502, "compaction: "+err.Error())
+		who, _ := compactFailure(body, rec)
+		msg := "compaction: " + who + ": " + err.Error() + ", so there is no summary"
+		s.compactFails.failed(key, http.StatusBadGateway, err.Error())
+		writeError(w, provider.Responses, 502, msg)
 		return
 	}
 	var sum strings.Builder
@@ -1929,9 +2065,11 @@ func (s *Server) codexCompact(w http.ResponseWriter, r *http.Request, body []byt
 		}
 	}
 	if strings.TrimSpace(sum.String()) == "" {
+		s.compactFails.failed(key, http.StatusBadGateway, "the model wrote no summary")
 		writeError(w, provider.Responses, 502, "compaction: the model wrote no summary")
 		return
 	}
+	s.compactFails.done(key)
 	id := res.ID
 	if id == "" {
 		id = fmt.Sprintf("resp_magpie_%d", time.Now().UnixNano())

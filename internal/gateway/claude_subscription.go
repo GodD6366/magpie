@@ -2988,6 +2988,28 @@ func (r *subscriptionRun) offers(tools []Tool) bool {
 	return true
 }
 
+// untold is how many of tools the run's agent was never told of, and
+// their names, the first five and a count of the rest, for the log
+// (whyNoRun).
+func (r *subscriptionRun) untold(tools []Tool) (int, string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.tools == nil {
+		return 0, ""
+	}
+	var names []string
+	for _, t := range tools {
+		if !r.tools[t.Name] {
+			names = append(names, t.Name)
+		}
+	}
+	n := len(names)
+	if n > 5 {
+		names = append(names[:5], fmt.Sprintf("%d more", n-5))
+	}
+	return n, strings.Join(names, ", ")
+}
+
 // saidWithResults is the user's words after tool results in the messages
 // since the last reply: a message the user sent while a tool ran (#872),
 // or what a request forked from the conversation asks (Claude Code's
@@ -3664,6 +3686,12 @@ func ownerAccount(owner string) (user string, own bool) {
 // is told the whole conversation (#1638): a run of the conversation waits
 // under another key or at an earlier turn, or is busy, or it ended and
 // why, or none had it.
+//
+// A run whose conversation the client sent back rewritten (Alma, #912)
+// and whose Claude Code wasn't told a tool the client offers now is named
+// by those tools (#2375): its conversation is no longer the one the run
+// had, so none of the conversation's keys is the run's, and the line said
+// no run had ever had it.
 func (b *subscriptionBridge) whyNoRun(req *Request, owner string) string {
 	key, _ := nextTurn(req, owner)
 	if key == "" {
@@ -3672,6 +3700,11 @@ func (b *subscriptionBridge) whyNoRun(req *Request, owner string) string {
 	keys := conversationKeys(owner, req.Messages)
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	if r, _ := b.rewritten(req, owner); r != nil {
+		if n, names := r.untold(req.Tools); n > 0 {
+			return fmt.Sprintf("its run waits under another key: the client offers %d tool(s) its Claude Code wasn't told of (%s), and a run is told its tools when it starts", n, names)
+		}
+	}
 	for _, r := range b.idle {
 		if r.behindKey == key {
 			return "its run went on with a turn this one doesn't follow, and wasn't taken back"
@@ -3989,14 +4022,24 @@ func relay(w http.ResponseWriter, r *http.Request, from provider.Protocol, name 
 	if stream {
 		// an error before any of the answer — out of quota, rate limited —
 		// is a status, not a stream, so another account can take over
+		// — unless the provider is heard from first with nothing of the
+		// answer yet, queued or thinking (KAlive): the client is then
+		// sent the reply's start and kept alive while it waits, as a
+		// translated stream's is, or Codex hangs up at its idle timeout
+		// with only comments heard (#2316)
 		var head []Event
+		alive := false
 		for ev := range events {
+			if ev.Kind == KAlive {
+				alive = true
+				break
+			}
 			head = append(head, ev)
 			if ev.Kind != KStart && ev.Kind != KUsage {
 				break
 			}
 		}
-		if n := len(head); n == 0 || head[n-1].Kind == KError {
+		if n := len(head); !alive && (n == 0 || head[n-1].Kind == KError) {
 			msg := name + " ended without an answer"
 			if n > 0 {
 				msg = head[n-1].Text
@@ -4017,6 +4060,11 @@ func relay(w http.ResponseWriter, r *http.Request, from provider.Protocol, name 
 		var failed, said, stop string
 		see := func(ev Event) {
 			switch ev.Kind {
+			case KAlive:
+				if sw.quiet() >= keepaliveGap {
+					enc.keepalive()
+				}
+				return
 			case KError:
 				failed = ev.Text
 			case KStart, KUsage:
@@ -4031,6 +4079,9 @@ func relay(w http.ResponseWriter, r *http.Request, from provider.Protocol, name 
 		}
 		for _, ev := range head {
 			see(ev)
+		}
+		if alive {
+			see(Event{Kind: KAlive})
 		}
 		// a client waiting on a reply that goes on is kept from its idle
 		// timeout while none of it comes (#436)

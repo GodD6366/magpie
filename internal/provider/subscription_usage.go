@@ -77,8 +77,9 @@ type QuotaWindow struct {
 	// own (WindowCapID), for the GUI to set and show one.
 	CapID string `json:"capId,omitempty"`
 	// Holds is what the whole window holds, reckoned from magpie's own
-	// calls through the account (usage.WithWindowHolds), for the GUI only;
-	// nil where that can't be told honestly.
+	// calls through the account (usage.WithWindowHolds), for the GUI and,
+	// through ReckonHolds, magpie quota --json and /v1/magpie/quotas
+	// (#2333); nil where that can't be told honestly.
 	Holds *WindowHolds `json:"holds,omitempty"`
 	// HoldsWhy is, where Holds is nil on a window of an account's own card
 	// that runs out and starts again, why its whole isn't told (#2045):
@@ -122,6 +123,10 @@ type SubscriptionQuota struct {
 	Until *time.Time `json:"until,omitempty"`
 	Renew string     `json:"renew,omitempty"`
 	Error string     `json:"error,omitempty"`
+	// PluginError is an Error a plugin's own usage read gave, in its own
+	// words: magpie has no reading of it to say better, so the GUI shows
+	// it on the card rather than only in a tooltip (aqiu817/magpie-sensenova#1).
+	PluginError bool `json:"pluginError,omitempty"`
 	// NeedsAccessKey is a plan read with the account's access key, which
 	// its provider hasn't (accessKeyCard, #1821): the Usage page offers
 	// the provider's settings to give it in.
@@ -212,6 +217,16 @@ func OnSubscriptionUsage(f func()) {
 
 var onSubscriptionUsage atomic.Pointer[func()]
 
+// toldUsage tells OnSubscriptionUsage's hook that what Quotas answers has
+// changed: a whole read landing, a card read again on its own, a Codex
+// reset spent. The menu bar reads again then, not at its next tick
+// minutes later, so it says what the panel does (#2357).
+func toldUsage() {
+	if f := onSubscriptionUsage.Load(); f != nil {
+		(*f)()
+	}
+}
+
 // subscriptionTimeout bounds one refresh; the vendors' endpoints can be
 // unreachable without a proxy, and then each fetch would hang to it.
 // A plugin's account waits as long as the plugin itself does (20s).
@@ -260,9 +275,7 @@ func SubscriptionUsage(ctx context.Context) []SubscriptionQuota {
 			c.Unlock()
 			// told before done is closed, so whoever waits for the refresh
 			// has it finished, hook and all
-			if f := onSubscriptionUsage.Load(); f != nil {
-				(*f)()
-			}
+			toldUsage()
 			close(done)
 		}()
 	}
@@ -445,8 +458,8 @@ func fetchSubscriptionUsage(ctx context.Context) []SubscriptionQuota {
 			if ls := accountsOf("codex"); len(ls) > 1 {
 				fetches = append(fetches, perLogin(via("codex"), ls, accountCard("codex"))...)
 			} else {
-				auth := filepath.Join(appdir.CodexHomeIn(home), "auth.json")
-				fetches = append(fetches, withUser(ctx, p.Account.User, func() SubscriptionQuota { return codexSubscriptionUsage(viaLogin("codex", p.Account.User), auth) }))
+				dir := appdir.CodexHomeIn(home)
+				fetches = append(fetches, withUser(ctx, p.Account.User, func() SubscriptionQuota { return codexSubscriptionUsage(viaLogin("codex", p.Account.User), dir) }))
 			}
 		}
 		// Every Copilot account magpie knows, the editors' or the CLI's own
@@ -903,19 +916,19 @@ func claudeScopeModel(name string) string {
 	return strings.NewReplacer(" ", "-", ".", "-").Replace(strings.ToLower(name))
 }
 
-func codexSubscriptionUsage(ctx context.Context, path string) SubscriptionQuota {
+func codexSubscriptionUsage(ctx context.Context, dir string) SubscriptionQuota {
 	q := SubscriptionQuota{Provider: "codex", Name: "Codex", Icon: "codex-color", Windows: []QuotaWindow{}}
 	if holding(ctx) {
 		q.Error = errNotAsked.Error()
 		return q
 	}
-	token, accountID, err := codexToken(ctx, path)
+	token, accountID, err := codexToken(ctx, dir)
 	if err != nil {
 		q.Error = err.Error()
 		return q
 	}
 	q.Plan, q.Windows, q.Resets, q.Balance, q.Held, err = codexWindows(ctx, token, accountID)
-	if b, rerr := readAccountFile(path); rerr == nil {
+	if b, _, rerr := readCodexLogin(dir, false); rerr == nil {
 		q.Until = codexUntil(b, time.Now())
 	}
 	if err != nil {

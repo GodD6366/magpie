@@ -295,9 +295,84 @@ function fitChartLabels() {
 }
 new ResizeObserver(fitChartLabels).observe($("#view-usage"));
 
+// The Overview's lists — Agents, Models, Accounts, Gateway keys — each fold
+// away under their heading (#2378: 日常看账号维度较多，都要拉到最底下), and
+// stay folded across a reload (magpie.usageFolded, the folded ones' names).
+let usageFolded = new Set();
+try { usageFolded = new Set(JSON.parse(localStorage.getItem("magpie.usageFolded") || "[]")); } catch {}
+const USAGE_FOLDS = { agents: ["usageAgents", "usageAgentsHid"], models: ["usageModels"], accounts: ["usageAccounts"], keys: ["usageKeys"] };
+const USAGE_FOLD_TITLES = {
+  agents: ["Show the agents", "Fold the agents away"],
+  models: ["Show the models", "Fold the models away"],
+  accounts: ["Show the accounts", "Fold the accounts away"],
+  keys: ["Show the gateway keys", "Fold the gateway keys away"],
+};
+function mountUsageFolds() {
+  for (const b of $$("#usagePane .row-head .fold[data-fold]")) {
+    b.prepend(svg(CHEV_R, 11, 1.6));
+    b.onclick = () => {
+      const id = b.dataset.fold;
+      if (usageFolded.has(id)) usageFolded.delete(id); else usageFolded.add(id);
+      try { localStorage.setItem("magpie.usageFolded", JSON.stringify([...usageFolded])); } catch {}
+      showUsageFolds();
+      backToReader($("#view-usage"));
+    };
+  }
+  showUsageFolds();
+}
+// a folded list is out of sight by its class, so the page's own hidden
+// (no calls, no accounts) is left as it is
+function showUsageFolds() {
+  for (const b of $$("#usagePane .row-head .fold[data-fold]")) {
+    const id = b.dataset.fold, folded = usageFolded.has(id);
+    b.setAttribute("aria-expanded", String(!folded));
+    b.title = t(USAGE_FOLD_TITLES[id][folded ? 0 : 1]);
+    for (const box of USAGE_FOLDS[id]) $("#" + box)?.classList.toggle("folded", folded);
+  }
+}
+
+// usageParts: a line of counts, each kept whole in a span of its own and
+// " · " between them, where the line may wrap ("{a} in · {b} out" is two)
+function usageParts(texts) {
+  const out = [];
+  for (const x of texts.flatMap((s) => s.split(" · "))) out.push(...(out.length ? [" · "] : []), el("span", "", x));
+  return out;
+}
+
+// The Overview's token totals count what went in and out; the cache's
+// tokens, read and written, can be counted in them too (#2378), as the
+// Requests tab's total always has them. Kept as the reader left it
+// (magpie.usageWithCache).
+let usageWithCache = false;
+try { usageWithCache = localStorage.getItem("magpie.usageWithCache") === "1"; } catch {}
+const cacheOf = (x) => (x.cache_read || 0) + (x.cache_write || 0);
+const usageTokens = (x) => tokensOf(x) + (usageWithCache ? cacheOf(x) : 0);
+// the tokens tile's label: a pop-up of the two ways to count
+function usageTokensPick() {
+  const b = el("button", "kpi-pick");
+  b.type = "button";
+  b.setAttribute("aria-haspopup", "menu");
+  b.append(el("span", "", t(usageWithCache ? "tokens with cache" : "tokens")), svg(CHEV, 10, 1.6));
+  b.title = t("Count the cache's tokens in the totals, or leave them out");
+  b.onclick = (e) => {
+    e.stopPropagation();
+    if (b.classList.contains("open")) return closeProtoMenu();
+    openProtoMenu(b, [
+      { v: "", name: "Without cache", note: "Input and output" },
+      { v: "1", name: "With cache", note: "Cache read and written counted too" },
+    ], usageWithCache ? "1" : "", (v) => {
+      usageWithCache = v === "1";
+      try { localStorage.setItem("magpie.usageWithCache", usageWithCache ? "1" : "0"); } catch {}
+      renderUsage();
+    }, "Token totals", "sess-menu");
+  };
+  return b;
+}
+
 function renderUsage() {
   const u = usage;
   const view = $("#view-usage");
+  showUsageFolds();
   view.classList.remove("loading");
   view.removeAttribute("aria-busy");
   renderPeriod();
@@ -324,11 +399,17 @@ function renderUsage() {
   const tile = (n, label, sub, title) => {
     const t = el("div", "kpi");
     if (title) t.title = title;
-    t.append(el("b", "", n), el("span", "", label));
-    if (sub) t.append(el("small", "", sub));
+    t.append(el("b", "", n), typeof label === "string" ? el("span", "", label) : label);
+    // a line in parts keeps each whole, wrapping between them rather than
+    // cutting the last off
+    if (Array.isArray(sub)) {
+      const s = el("small", "parts");
+      s.append(...usageParts(sub));
+      t.append(s);
+    } else if (sub) t.append(el("small", "", sub));
     stats.append(t);
   };
-  tile(fmtN(tokensOf(u)), t("tokens"), t("{a} in · {b} out", { a: fmtN(u.input), b: fmtN(u.output) }));
+  tile(fmtN(usageTokens(u)), usageTokensPick(), [t("{a} in · {b} out", { a: fmtN(u.input), b: fmtN(u.output) }), ...(usageWithCache && cacheOf(u) ? [t("{a} cache", { a: fmtN(cacheOf(u)) })] : [])]);
   // cache reads are billed at a fraction of input, so how much of the prompt
   // came from cache is the number that explains the bill; input here already
   // excludes the cached tokens, read and written (the gateway subtracts
@@ -345,7 +426,7 @@ function renderUsage() {
   const chart = $("#chart");
   chart.replaceChildren();
   const bars = el("div", "bars");
-  const peak = Math.max(1, ...u.series.map(tokensOf));
+  const peak = Math.max(1, ...u.series.map(usageTokens));
   const labels = el("div", "labels");
   const n = u.series.length;
   const every = n <= 8 ? 1 : n <= 31 ? Math.ceil(n / 6) : Math.ceil(n / 5);
@@ -354,11 +435,12 @@ function renderUsage() {
   u.series.forEach((p, i) => {
     const b = el("div", "bar");
     const inp = el("i", "in"), out = el("i", "out");
-    inp.style.height = (100 * p.input / peak).toFixed(1) + "%";
+    // counted with the cache, its tokens are in the prompt's part
+    inp.style.height = (100 * (usageTokens(p) - p.output) / peak).toFixed(1) + "%";
     out.style.height = (100 * p.output / peak).toFixed(1) + "%";
     b.append(out, inp);
     const when = u.bucket === "hour" ? `${p.label}:00` : u.bucket === "week" ? t("week of {label}", { label: dayOf(p) }) : dayOf(p);
-    b.title = p.calls ? t(p.calls === 1 ? "{when} · {tokens} tokens · {n} call" : "{when} · {tokens} tokens · {n} calls", { when, tokens: fmtN(tokensOf(p)), n: p.calls }) + (fmtCost(p) ? " · ≈" + fmtCost(p) : "") : t("{when} · nothing", { when });
+    b.title = p.calls ? t(p.calls === 1 ? "{when} · {tokens} tokens · {n} call" : "{when} · {tokens} tokens · {n} calls", { when, tokens: fmtN(usageTokens(p)), n: p.calls }) + (fmtCost(p) ? " · ≈" + fmtCost(p) : "") : t("{when} · nothing", { when });
     bars.append(b);
     const last = i === n - 1 && (n - 1) % every >= every / 2;
     labels.append(el("span", "", i % every === 0 || last ? dayOf(p) : ""));
@@ -366,7 +448,7 @@ function renderUsage() {
   chart.append(el("div", "peak", fmtN(peak)), bars, labels);
   fitChartLabels();
 
-  const total = Math.max(1, tokensOf(u));
+  const total = Math.max(1, usageTokens(u));
   const list = (id, groups, act) => {
     const box = typeof id === "string" ? $("#" + id) : id;
     box.replaceChildren();
@@ -401,16 +483,16 @@ function renderUsage() {
       r.append(who);
       const share = el("div", "share");
       const fill = el("i");
-      fill.style.width = Math.max(1.5, 100 * tokensOf(g) / total).toFixed(1) + "%";
+      fill.style.width = Math.max(1.5, 100 * usageTokens(g) / total).toFixed(1) + "%";
       share.append(fill);
-      share.title = t("{n}% of tokens", { n: Math.round(100 * tokensOf(g) / total) });
+      share.title = t("{n}% of tokens", { n: Math.round(100 * usageTokens(g) / total) });
       r.append(share);
       const num = el("div", "num");
       // how much of its prompt came from the cache, counted as the cache
       // read tile counts it (#925)
       const prompt = g.input + g.cache_read + (g.cache_write || 0);
       const hit = g.cache_read && prompt ? " · " + t("hit rate {p}", { p: Math.round(100 * g.cache_read / prompt) + "%" }) : "";
-      num.append(el("b", "", fmtN(tokensOf(g))), el("small", "", t("{a} in · {b} out", { a: fmtN(g.input), b: fmtN(g.output) }) + (g.cache_read ? " · " + t("{n} cached", { n: fmtN(g.cache_read) }) : "") + hit));
+      num.append(el("b", "", fmtN(usageTokens(g))), el("small", "", t("{a} in · {b} out", { a: fmtN(g.input), b: fmtN(g.output) }) + (g.cache_read ? " · " + t("{n} cached", { n: fmtN(g.cache_read) }) : "") + hit));
       r.append(num);
       r.append(el("div", "cost", fmtCost(g) ? "≈" + fmtCost(g) : ""));
       if (act) act(r, g);
@@ -605,17 +687,31 @@ const ledAborted = (e) => e?.name === "AbortError";
 // quiet: a refresh while it's looked at, redrawn only on a change
 async function loadLedger(quiet) {
   if (!ledger && !quiet) renderLedgerLoading();
+  // a pick over rows shown: they stay, dimmed, till its answer comes, so
+  // the pick is seen taken (#1990, overstarry: over a long history the
+  // read takes seconds, and the table sat as it was, as if the pick
+  // hadn't been)
+  else if (!quiet) ledPending(true);
   loadLedHeat().catch(() => {});
   const want = ledParams({ offset: ledOffset, limit: LED_PAGE });
   let l;
   try { l = await ledRead("page", "usage/requests?", want); } catch (e) {
     if (ledAborted(e)) return; // another page or filter was picked, and is read instead
+    ledPending(false);
     throw e;
   }
   if (want !== ledParams({ offset: ledOffset, limit: LED_PAGE })) return; // another page or filter was picked meanwhile
+  ledPending(false);
   if (quiet && JSON.stringify(l) === JSON.stringify(ledger)) return;
   ledger = l;
   if (view === "usage" && usageTab === "requests") renderLedger();
+}
+
+function ledPending(on) {
+  const wrap = $("#ledWrap");
+  wrap.classList.toggle("led-pending", on);
+  if (on) wrap.setAttribute("aria-busy", "true");
+  else wrap.removeAttribute("aria-busy");
 }
 
 function renderLedgerLoading() {
@@ -937,7 +1033,11 @@ function renderLedgerDash(l) {
   // a line holding a count's button wraps rather than cut the button off
   // (German's "nach erneutem Versuch beantwortet" runs past a narrow card)
   const jumps = (...parts) => { const s = line(...parts); s.classList.add("jumps"); return s; };
-  block("Tokens", fmtN(total), line(t("{a} in · {b} out", { a: fmtN(l.input), b: fmtN(l.output) }), " · ", t("{a} cache", { a: fmtN(l.cache_read + l.cache_write) })), "", ledNum(total));
+  // its parts kept whole, the cache's going under in a card too narrow for
+  // all three rather than cut (#2378: 缓存 879… in a wide window's five cards)
+  const tokParts = line(...usageParts([t("{a} in · {b} out", { a: fmtN(l.input), b: fmtN(l.output) }), t("{a} cache", { a: fmtN(l.cache_read + l.cache_write) })]));
+  tokParts.classList.add("parts");
+  block("Tokens", fmtN(total), tokParts, "", ledNum(total));
   // a request is counted once, by how it ended: one a later try answered
   // is not a failure, and is counted beside them as answered on a retry
   // (小一 on Discord). Each count is a button for its requests in the list.
@@ -1714,6 +1814,7 @@ let sessOver = null;
 let sessOverAt = "";
 let sessOverLoading = "";
 let sessTopOpen = ""; // the top session opened to its details
+let sessListOpen = ""; // with the Sessions page switched off, the listed session opened here to its details (#2311)
 const sessFull = new Map(); // a top session's key → the session read whole, or "…" while it is read
 
 function renderUsageTab() {
@@ -1751,7 +1852,7 @@ async function loadSessions() {
   const stop = first ? sessWatchIndex() : () => {};
   let s, st, o;
   try {
-    [s, st, o] = await Promise.all([api("sessions"), api("sessions/stats?days=" + sessDays()), api("sessions/overview?" + q)]);
+    [s, st, o] = await Promise.all([api("sessions"), api("sessions/stats?days=" + sessDays()), sessOverview(q)]);
   } finally { stop(); }
   if (range !== sessRange) return; // another range was picked meanwhile; its load draws
   const fresh = q === sessOverQ(); // no filter changed meanwhile
@@ -1763,6 +1864,19 @@ async function loadSessions() {
   if (view === "usage" && usageTab === "sessions") renderSessions();
 }
 
+// sessOverview reads a query's overview, once while a read of it is under
+// way: the page's reload, a filter's and a range's each asked for their
+// own, and over a long history each read is a long one (#2278)
+const sessOverReads = new Map();
+function sessOverview(q) {
+  let read = sessOverReads.get(q);
+  if (!read) {
+    read = api("sessions/overview?" + q).finally(() => sessOverReads.delete(q));
+    sessOverReads.set(q, read);
+  }
+  return read;
+}
+
 // the overview's query: the range and the filters
 const sessOverQ = () => new URLSearchParams({ days: sessDays(), agent: sessAgent === "all" ? "" : sessAgent, model: sessModel, cwd: sessFolder }).toString();
 // loadSessOverview reads the overview again when a filter changes, and draws
@@ -1772,7 +1886,7 @@ function loadSessOverview() {
   if (sessOverLoading === q) return;
   sessOverLoading = q;
   const done = () => { if (sessOverLoading === q) sessOverLoading = ""; };
-  api("sessions/overview?" + q).then((o) => {
+  sessOverview(q).then((o) => {
     done();
     if (q !== sessOverQ()) return;
     sessOver = o;
@@ -2606,9 +2720,12 @@ function renderSessTop() {
     const r = el("div", "row sess sess-top");
     r.append(icon(icons.get(s.agent) || "generic"));
     const who = el("div", "who");
-    who.append(el("div", "name", s.title || t("(no prompt)")));
-    const sub = el("div", "sub", [s.cwd ? baseName(s.cwd) : "", names[s.agent] || s.agent, s.models?.[0], ago(s.last)].filter(Boolean).join(" · "));
-    sub.title = s.cwd || "";
+    // a session magpie saw only through the gateway (#2285: a Pi
+    // subagent's, its file in a temp folder) has no folder and no prompt
+    // unless gateway conversations are recorded: say so, not "(no prompt)"
+    who.append(el("div", "name", s.title || t(s.gateway ? "(prompt not recorded)" : "(no prompt)")));
+    const sub = el("div", "sub", [s.cwd ? baseName(s.cwd) : s.gateway ? t("Gateway session") : "", names[s.agent] || s.agent, s.models?.[0], ago(s.last)].filter(Boolean).join(" · "));
+    sub.title = s.cwd || (s.gateway ? t("Seen only through the gateway: the agent kept no session file magpie can read. Turn on Record gateway conversations in Sessions to keep its prompts.") : "");
     who.append(sub);
     r.append(who);
     const fc = fmtCost({ cost: s.cost, unpriced: !s.priced });
@@ -2864,12 +2981,25 @@ function sessSpent(s) {
 // A row of the Usage page's list: what the session spent. It opens on the
 // Sessions page, where it is resumed, read in full and deleted (#752: the
 // two lists were one done twice, each lacking half).
+// A row opens its session on the Sessions page. With that page switched off
+// (Plugins › Built-in) there is nowhere to open it, so the row unfolds the
+// session's details in place, as a top session's do, instead of looking like
+// a link and doing nothing when clicked (#2311, betacatZ).
 function sessionItem(s) {
   const item = el("div", "sess-item");
+  item.sess = s;
   const r = el("div", "row sess sess-link");
+  const key = s.agent + ":" + s.id;
+  const here = featuresOff.has("sessions");
+  const unfolded = here && sessListOpen === key;
   r.tabIndex = 0;
-  r.setAttribute("role", "link");
-  r.title = t("Open in Sessions");
+  if (here) {
+    r.setAttribute("role", "button");
+    r.setAttribute("aria-expanded", String(unfolded));
+  } else {
+    r.setAttribute("role", "link");
+    r.title = t("Open in Sessions");
+  }
   r.append(icon(s.icon || "generic"));
   const who = el("div", "who");
   who.append(el("div", "name", s.title || t("(no prompt)")));
@@ -2879,16 +3009,27 @@ function sessionItem(s) {
   who.append(sub);
   r.append(who, ...sessSpent(s));
   const go = el("span", "sess-go");
-  go.append(svg(CHEV_R, 12, 1.6));
+  go.append(svg(here ? CHEV : CHEV_R, 12, 1.6));
+  if (unfolded) go.classList.add("up");
   r.append(go);
   const open = (e) => {
     if (window.getSelection()?.toString()) return;
-    if (featuresOff.has("sessions")) return; // Sessions is switched off: there is no page to open it on
-    magpie.call("sessions", "reveal", s, e);
+    if (!featuresOff.has("sessions")) return magpie.call("sessions", "reveal", s, e);
+    // Sessions is switched off: there is no page to open it on
+    sessListOpen = sessListOpen === key ? "" : key;
+    // one open at a time: the one that was folds
+    for (const o of item.parentElement?.querySelectorAll(":scope > .sess-item.open") || []) if (o !== item) o.replaceWith(sessionItem(o.sess));
+    const next = sessionItem(s);
+    item.replaceWith(next);
+    next.querySelector(".row.sess").focus({ preventScroll: true });
   };
   r.onclick = open;
   r.onkeydown = (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); open(e); } };
   item.append(r);
+  if (unfolded) {
+    item.classList.add("open");
+    item.append(sessionDetail(s));
+  }
   return item;
 }
 

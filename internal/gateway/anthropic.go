@@ -177,6 +177,17 @@ func parseAnthropic(body []byte) (*Request, error) {
 			if strings.HasPrefix(t.Type, "web_search") {
 				r.WebSearch = true
 			}
+			if strings.HasPrefix(t.Type, "advisor_") {
+				// Claude Code's advisor: its instructions, which would
+				// have the model call a tool it hasn't got (advisor.go)
+				for i := range r.Messages {
+					for j, pt := range r.Messages[i].Parts {
+						if pt.Kind == Text {
+							r.Messages[i].Parts[j].Text, _ = advisorGoneIn(pt.Text)
+						}
+					}
+				}
+			}
 			continue
 		}
 		if t.Name == "DeferredToolPlaceholder" {
@@ -1490,6 +1501,7 @@ func (e *anthropicEncoder) event(ev Event) {
 		if ev.Code != "" {
 			failed["code"] = ev.Code // preserve the upstream error type, including refusals
 		}
+		saidError(failed, ev.Said)
 		e.w.event("error", map[string]any{"type": "error", "error": failed})
 	}
 	e.col.add(ev)

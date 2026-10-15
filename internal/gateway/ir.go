@@ -189,6 +189,15 @@ type Request struct {
 	// them. text's format is read into Format.
 	ClientMetadata json.RawMessage
 	Text           json.RawMessage
+	// AccessPrograms is a client's access_programs, the program a request
+	// asks the model under (OpenAI's Daybreak: {"cyber":"daybreak_blue"}),
+	// which Codex CLI sends the ChatGPT backend on every turn it picked one
+	// for (codex-rs's ResponsesApiRequest.access_programs). It goes on as it
+	// was sent, null and all, when the request is built again for a
+	// Responses upstream, whose answer to a value it doesn't take
+	// (invalid_access_program) is the client's to read; no other API takes
+	// it (magpie-releases#18).
+	AccessPrograms json.RawMessage
 	// Metadata is an Anthropic client's metadata (Claude Code's user_id),
 	// which goes on as it was sent when the request is built again for an
 	// Anthropic upstream: a relay that serves only Claude Code turns a
@@ -269,6 +278,11 @@ const (
 	KSealed
 	// KTextSig: Text is Gemini's thoughtSignature on the text before it
 	KTextSig
+	// KAlive: nothing of the reply, only that its provider is still heard
+	// from (a keepalive, an event with nothing for the client) after
+	// keepaliveGap of nothing else: a reply read in rounds (searchReply)
+	// keeps its client alive with it as a translated stream does (#2316)
+	KAlive
 )
 
 // Event is one thing a streaming reply said.
@@ -296,6 +310,10 @@ type Event struct {
 	// Wait: for KError, how long the vendor said to wait before asking
 	// again, when it said; sent on as Retry-After
 	Wait time.Duration
+	// Said: for KError, the vendor's own error as {"error":{…}}, when it
+	// said the request itself is at fault; its code and param go to a
+	// client answered whole (writeVendorError)
+	Said json.RawMessage
 }
 
 // Usage counts tokens.
@@ -425,6 +443,7 @@ type collector struct {
 	// the error's status and kind, as its event gave them
 	errStatus int
 	errCode   string
+	errSaid   json.RawMessage
 }
 
 func (c *collector) last(k Kind) *Part {
@@ -522,7 +541,7 @@ func (c *collector) add(ev Event) {
 		c.res.Usage.add(ev.Usage)
 		c.res.Usage.add(Usage{RequestID: ev.RequestID})
 	case KError:
-		c.err, c.errStatus, c.errCode = ev.Text, ev.Status, ev.Code
+		c.err, c.errStatus, c.errCode, c.errSaid = ev.Text, ev.Status, ev.Code, ev.Said
 	case KSearch:
 		c.closeTool()
 		c.res.Parts = append(c.res.Parts, Part{Kind: Search, Text: ev.Text, Hits: ev.Hits})
@@ -531,7 +550,7 @@ func (c *collector) add(ev Event) {
 		c.res.Parts = append(c.res.Parts, Part{Kind: Image, MediaType: ev.Name, Data: ev.Text})
 	}
 	switch ev.Kind {
-	case KStart, KUsage, KError:
+	case KStart, KUsage, KError, KAlive:
 	default:
 		// what began has had its first content, or something else came
 		c.fresh = false

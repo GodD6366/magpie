@@ -576,7 +576,9 @@ func SetModelPrefs(pid string, prefs map[string]ModelPref) error {
 // setModelSame says which model a provider's model, spelt "provider/model",
 // is the same as, for one a vendor names its own way (Volcengine Ark's
 // dated ids, kyzhouxu on #583): the routing groups magpie finds merge it
-// with that model from every other provider (autoGroups). The name is a
+// with that model from every other provider (autoGroups), and a call to
+// it no list prices is costed at that model's maker's price (SamePriceIn,
+// #2344). The name is a
 // model's id as any vendor spells it ("deepseek-v4.1-flash", or with a
 // vendor's prefix); "" — or a name that is the model's own however spelt —
 // merges it by its own id again.
@@ -730,6 +732,14 @@ func Labels(es []Entry) []string {
 // this one's Provider in model names Off leaves out as well (ARNO on
 // Discord: "· Relay A" and "· routing group" stayed under Off).
 func (e Entry) PlainName() string { return cmp.Or(e.Plain, e.Name) }
+
+// Thinks is whether the model thinks, as /v1/models says it and every
+// agent's list is told it: a model with levels, or one marked Reasoning
+// with a thinking switch alone. An export that read the levels alone
+// marked Trae CN's kimi-k3-max, which always thinks and has no levels
+// magpie knows, not reasoning for Pi, and `magpie pi effort high` was
+// clamped to off (#2380).
+func (e Entry) Thinks() bool { return e.Reasoning || len(e.Efforts) > 0 }
 
 // The ways the agents' lists name models (SuffixMode): every name with its
 // provider's after it, as by default; all but the names the user gave
