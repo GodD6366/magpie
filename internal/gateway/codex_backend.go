@@ -177,11 +177,27 @@ func (s *Server) codexBackend(w http.ResponseWriter, r *http.Request) {
 			}
 			break // preserve native compaction's existing passthrough
 		}
-		body, _ = codexInput(body, false)
-		if id, ok := codexAccounts(r, model); ok {
-			s.serveAgent(w, r, provider.Responses, withModel(body, id))
+		id, ok := codexAccounts(r, model)
+		if !ok {
+			id, ok = codexSealedFor(r, model, body)
+		}
+		if ok {
+			// through magpie's accounts, Codex's compaction is the codex
+			// provider's to decide as a magpie model's is: sealed natively
+			// only with its native compaction on, as only the account that
+			// sealed it can read it; off, magpie's summary, which any of
+			// them reads (#2582, #2642: one of Codex's own models compacted
+			// natively whatever the setting, and the conversation was held
+			// to that account)
+			body, compact := codexInputAs(withModel(body, id), true, s.nativeCompactionFor(id))
+			if compact {
+				s.codexCompact(w, r, body)
+				return
+			}
+			s.serveAgent(w, r, provider.Responses, body)
 			return
 		}
+		body, _ = codexInput(body, false)
 		if r.Header.Get(AccountHeader) != "" {
 			// relayed as it came, it would go to Codex's own sign-in only
 			writeError(w, provider.Responses, 400, AccountHeader+" names one of magpie's Codex accounts, and Codex isn't signed in to ChatGPT here with any on in magpie")
@@ -277,7 +293,7 @@ func (s *Server) sealedReader(p provider.Provider, model string, sealers []strin
 }
 
 // sealedReaders keeps of cands those that can read a sealed subagent task,
-// pl's order with them.
+// pl's order, held, capped and unlisted with them.
 func (s *Server) sealedReaders(cands []candidate, pl planned, sealers []string) ([]candidate, planned) {
 	var kept []candidate
 	var order []Weighed
@@ -290,6 +306,17 @@ func (s *Server) sealedReaders(cands []candidate, pl planned, sealers []string) 
 	cands, pl.order = kept, order
 	pl.held = slices.DeleteFunc(slices.Clone(pl.held), func(c candidate) bool { return !s.sealedReader(c.p, c.model, sealers) })
 	pl.capped = slices.DeleteFunc(slices.Clone(pl.capped), func(c candidate) bool { return !s.sealedReader(c.p, c.model, sealers) })
+	// the accounts whose list lacks the model, which a native compaction's
+	// writer is taken back from (checkpointReaders), are narrowed alike
+	var unlisted []candidate
+	var unlistedW []Weighed
+	for i, c := range pl.unlisted {
+		if s.sealedReader(c.p, c.model, sealers) {
+			unlisted = append(unlisted, c)
+			unlistedW = append(unlistedW, pl.unlistedW[i])
+		}
+	}
+	pl.unlisted, pl.unlistedW = unlisted, unlistedW
 	return cands, pl
 }
 
@@ -668,6 +695,27 @@ func codexAccounts(r *http.Request, model string) (string, bool) {
 	return id, true
 }
 
+// codexSealedFor is codexAccounts for a request magpie would relay as it
+// came to Codex's own sign-in, the one account on, that carries a native
+// compaction magpie recorded the writer of: it goes through routing,
+// which sends it only to that writer or answers why not
+// (checkpointReaders, checkpointError). Relayed, it reached the sign-in
+// whoever sealed it, and was refused there (#2642: the account that
+// compacted it switched off, the one left was sent it).
+func codexSealedFor(r *http.Request, model string, body []byte) (string, bool) {
+	if model == "" || strings.Contains(model, "/") || apiKey(r.Header) {
+		return "", false
+	}
+	if _, sealed := checkpointOf(body); !sealed {
+		return "", false
+	}
+	id := "codex/" + model
+	if p, _, ok := provider.Resolve(id); !ok || p.Account == nil || p.Account.Agent != "codex" {
+		return "", false
+	}
+	return id, true
+}
+
 // withModel is a request body asking for another model.
 func withModel(body []byte, model string) []byte {
 	var q map[string]json.RawMessage
@@ -756,6 +804,17 @@ func (s *Server) codexUpstreamOn(w http.ResponseWriter, r *http.Request, rest st
 				replyDigest = titleReplyDigest(titleReply.buf.Bytes(), nil)
 			}
 			prompt := promptRead() // outside the trace's lock, which reading it takes
+			// the window Codex holds the conversation to, not models.dev's
+			// for the id, which is OpenAI's API's (netube on Discord: 922K
+			// on Routing for a Codex Plus account's 272K)
+			window := 0
+			if prompt != nil {
+				user := ""
+				if on != nil && on.Account != nil {
+					user = on.Account.User
+				}
+				window = cmp.Or(provider.CodexWindow(user, model), catalog.ContextOf(model))
+			}
 			s.trace.update(tr, func(t *Route) {
 				t.Tries[0].Done, t.Tries[0].Status, t.Tries[0].Millis, t.Tries[0].Error = true, status, ms, msg
 				t.Tries[0].TTFT, t.Tries[0].FirstText = ttft, text
@@ -772,7 +831,7 @@ func (s *Server) codexUpstreamOn(w http.ResponseWriter, r *http.Request, rest st
 				t.Flow, t.Tries[0].Flow = flow, flow
 				t.Usage = routeUsage("openai", model, uu)
 				if prompt != nil {
-					t.Prompt = prompt.calibrated(promptCounted(t.Usage), catalog.ContextOf(model))
+					t.Prompt = prompt.calibrated(promptCounted(t.Usage), window)
 				}
 				t.Tries[0].Served, t.Tries[0].Swapped = served, swapped(model, served)
 				t.Served, t.Swapped = t.Tries[0].Served, t.Tries[0].Swapped

@@ -83,7 +83,7 @@ const usage = `magpie — one place to pick every agent's model
   magpie visible [<agent> <family|provider|group>,… | all | --only-picked | --show-new]
                                   which models an agent is shown: families (magpie provider/group set <id> family=…),
                                   or only the models ticked for it, a new one off until it is ticked
-  magpie search [add <api> <key>|rm <api>]   Tavily, Brave, Exa, Firecrawl, You.com or SearXNG for web search when no provider can search
+  magpie search [add <api> <key>|rm <api>]   Tavily, Brave, Exa, Firecrawl, You.com, DeepSeek or SearXNG for web search when no provider can search
   magpie groups                   routing groups: several models agents pick as one, group/<id>
   magpie group add <name> models=<m1>,<m2> [routing=smart|order|rotate|usage|pace] [stays=auto|session|turn|off]
   magpie group <id> | set <id> k=v… | rm <id>   show, change or remove one (magpie group help for more)
@@ -113,6 +113,8 @@ const usage = `magpie — one place to pick every agent's model
   magpie daemon web [on|off] [--lan] [--addr host:port]
                                   the service's page: its link, or turn it on or off
   magpie healthcheck              exit 0 when the gateway answers (a container's HEALTHCHECK)
+  magpie heap [<file>]            a Go heap profile of the running magpie, with its memory numbers, for a report of it using too much memory
+  magpie cpu [<file>] [--seconds N]   a Go CPU profile of the running magpie over 30s (5..120) while you use it, for a report of it using too much CPU
   magpie gateway-key list|add <name>|rotate <id>|remove <id>   manage the keys clients use to call a shared gateway
   magpie gateway-key limit <id> [list|off|reset [n]|remove <n>|[add] day|week|month|<N>d|<N>h --tokens N --cost USD --cache-reads]   a key's own limits, and what it used
   magpie gateway-key models <id> [all|<provider>/<model>|<provider>/* ...]   the models a key may use, every one unless it names some
@@ -220,6 +222,14 @@ func run(args []string) error {
 	}
 	if len(args) > 0 && args[0] == "healthcheck" {
 		return healthcheck() // every few seconds in a container: nothing else
+	}
+	if len(args) > 0 && args[0] == "heap" {
+		// the running magpie's heap profile: asks it, and moves nothing here
+		return heapCmd(args[1:])
+	}
+	if len(args) > 0 && args[0] == "cpu" {
+		// the running magpie's CPU profile: asks it, and moves nothing here
+		return cpuCmd(args[1:])
 	}
 	if len(args) == 2 && args[0] == agent.DryRunArg {
 		// an agent disconnected on a copy of its files under a temporary

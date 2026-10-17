@@ -10770,6 +10770,14 @@ function renderModels(p) {
       if (rate) c.append(rate);
       const ctx = contextTag(m.context, m.name);
       if (ctx) c.append(ctx);
+      // the number Claude Desktop's menu says beside this model, which it
+      // names after its own catalog (#2578), so a row of that menu can be
+      // matched to this provider
+      if (m.desktop) {
+        const d = el("span", "badge ctx", m.desktop);
+        d.title = t("The number Claude Desktop's menu shows beside this model");
+        c.append(d);
+      }
       if (m.default) c.title = `${m.id} · ${m.default}`;
       else if (m.name && m.name !== m.id) c.title = m.id;
       if (free) c.title = (c.title || m.id) + " · " + t(m.free ? "free: it doesn't use the plan's credits" : "free: so its name says");
@@ -15094,6 +15102,7 @@ function renderQuotas() {
   renderPanelQuota();
   const subscriptions = $("#subscriptionUsage");
   const restoreFlash = keepQuotaFlash(subscriptions);
+  const restoreRefresh = keepQuotaRefresh(subscriptions);
   subscriptions.replaceChildren();
   // the allowances' own heading, apart from the period's cost: used or
   // left turns their meters, and is only there when some card has one (a
@@ -15120,9 +15129,10 @@ function renderQuotas() {
       subscriptions.append(card);
     }
     packUsageNow(subscriptions);
+    restoreRefresh();
     return;
   }
-  if (usageArranging) { usageRenderPending = true; return; }
+  if (usageArranging) { usageRenderPending = true; restoreRefresh(); return; }
   subscriptions.hidden = !quotas.length;
   // an agent with several accounts is one card, a section per account
   const groups = [];
@@ -15241,6 +15251,7 @@ function renderQuotas() {
   markUpstream();
   packUsageNow(subscriptions);
   restoreFlash();
+  restoreRefresh();
   requestAnimationFrame(focusQuotaCard);
 }
 
@@ -17560,20 +17571,43 @@ setInterval(() => {
 // as they were read (Hu9956, #840: 单独刷新某个套餐，而不用刷新全部). A
 // Claude account's is read by running Claude Code's own /usage, as the
 // page's Refresh does.
-const quotaRefreshing = new Set();
+const quotaRefreshing = new Map();
+let keptQuotaRefresh = null;
+// a redraw reuses the controls, so no reading restarts their motion
+function keepQuotaRefresh(box) {
+  const buttons = [...box.querySelectorAll(".quota-refresh")];
+  const focused = buttons.find(b => b === document.activeElement);
+  keptQuotaRefresh = new Map(buttons.map(b => [b.dataset.key, b]));
+  const shown = buttons.filter(b => b.getBoundingClientRect().width > 0);
+  for (const b of shown) b.classList.add("kept");
+  return () => {
+    keptQuotaRefresh = null;
+    if (focused?.isConnected) focused.focus({ preventScroll: true });
+    // a frame for the new hover state, so the reading doesn't slide
+    requestAnimationFrame(() => { for (const b of shown) b.classList.remove("kept"); });
+  };
+}
 function quotaRefresh(q) {
   const key = usageAcctKey(q);
-  const b = el("button", "quota-refresh" + (quotaRefreshing.has(key) ? " busy" : ""));
+  // only one its redraw took out: the panel and Usage page each draw it
+  const kept = [quotaRefreshing.get(key)?.button, keptQuotaRefresh?.get(key)].find((k) => k && !k.isConnected);
+  const b = kept || el("button", "quota-refresh");
+  if (quotaRefreshing.has(key) && b !== quotaRefreshing.get(key).button) b.classList.add("busy", "spun");
+  b.dataset.key = key;
   b.type = "button";
   b.title = t(q.provider === "claude" ? "Read this card again, by running Claude Code's own /usage" : "Read this card again");
   b.setAttribute("aria-label", t("Refresh this card"));
-  b.innerHTML = '<svg viewBox="0 0 16 16" width="11" height="11" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M13.5 8a5.5 5.5 0 1 1-1.6-3.9M13.5 2.5v3h-3"/></svg>';
+  if (!kept) b.innerHTML = '<svg viewBox="0 0 16 16" width="11" height="11" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M13.5 8a5.5 5.5 0 1 1-1.6-3.9M13.5 2.5v3h-3"/></svg>';
   b.onclick = async (e) => {
     e.stopPropagation();
     if (quotaRefreshing.has(key)) return;
-    quotaRefreshing.add(key);
     for (const k of quotaCycleHolds.keys()) if (k.startsWith(key + "\0")) quotaCycleHolds.delete(k);
     b.classList.add("busy");
+    const animation = !calm() && b.querySelector("path").animate([
+      { transform: "rotate(0deg)" }, { transform: "rotate(360deg)" },
+    ], { duration: 800, iterations: Infinity });
+    const refreshing = { button: b, animation };
+    quotaRefreshing.set(key, refreshing);
     const began = quotaRefreshVersion;
     try {
       const qs = await api("usage/quotas/refresh?provider=" + encodeURIComponent(q.provider) + (q.user ? "&user=" + encodeURIComponent(q.user) : ""), {});
@@ -17605,8 +17639,20 @@ function quotaRefresh(q) {
     } catch (err) {
       status(err.message, "err");
     } finally {
-      quotaRefreshing.delete(key);
+      // the reading now; the icon ends its turn (at least one)
       renderQuotas();
+      const done = () => {
+        if (quotaRefreshing.get(key) !== refreshing) return;
+        quotaRefreshing.delete(key);
+        b.classList.remove("busy");
+        for (const o of document.querySelectorAll(".quota-refresh.spun")) if (o.dataset.key === key) o.classList.remove("busy", "spun");
+        if (animation) animation.cancel();
+      };
+      if (animation && !calm()) {
+        const duration = animation.effect.getTiming().duration;
+        animation.effect.updateTiming({ iterations: Math.max(1, Math.ceil((animation.currentTime || 0) / duration)) });
+        animation.finished.then(done, done);
+      } else done();
     }
   };
   return b;
@@ -23224,7 +23270,7 @@ if (mode === "window") {
   // there or by a link) is drawn again in the sidebar, once a frame
   let queued = false;
   const again = () => { if (queued) return; queued = true; requestAnimationFrame(() => { queued = false; navSubs(); }); };
-  const mo = new MutationObserver(again);
+  const mo = new MutationObserver(() => { again(); if (document.body.classList.contains("side-nav")) tools(); });
   for (const v of Object.keys(NAV_SUBS)) mo.observe($("#view-" + v), { childList: true, subtree: true, attributes: true, attributeFilter: ["class", "hidden"] });
   // a page whose head is only its tools (Library, Plugins, Settings) has them
   // in the title bar beside the sidebar (app.css): between where the reader
@@ -23236,12 +23282,52 @@ if (mode === "window") {
     if (toolsAt) return;
     toolsAt = requestAnimationFrame(() => {
       toolsAt = 0;
-      const top = $(".top"), c = $("#crumb").getBoundingClientRect(), a = $(".actions").getBoundingClientRect();
-      const st = document.documentElement.style;
+      const top = $(".top"), crumb = $("#crumb"), a = $(".actions").getBoundingClientRect();
+      const st = document.documentElement.style, body = document.body;
       const set = (k, v) => { if (st.getPropertyValue(k) !== v) st.setProperty(k, v); };
       set("--top-h", top.offsetHeight + "px");
-      set("--tools-l", Math.ceil(c.right + 16) + "px");
       set("--tools-r", Math.ceil(innerWidth - a.left + 8) + "px");
+      // the room the title and the tools share (#2625): the title whole and
+      // the tools with their words; else the tools as icons; else the title
+      // cut at its end, so nothing lies over it. Each step is laid out and
+      // read again here, in this frame, the next only if it ran over
+      const kids = [...crumb.children];
+      for (const e of kids) if (e.hidden) e.hidden = false;
+      if (!body.classList.contains("side-nav")) {
+        body.classList.remove("tools-tight");
+        set("--crumb-max", "none");
+        return;
+      }
+      const head = $(":is(#view-library .lib-head, #view-plugins .pm-head, #view-settings .set-head):not([hidden] *)");
+      const c = crumb.getBoundingClientRect(), gap = parseFloat(getComputedStyle(crumb).columnGap) || 0;
+      const wide = kids.map((e) => (e.tagName === "B" ? e.scrollWidth : e.getBoundingClientRect().width) + gap);
+      const whole = Math.ceil(wide.reduce((w, x) => w + x, 0) - (kids.length ? gap : 0));
+      const over = () => {
+        const h = head.getBoundingClientRect();
+        let left = h.right;
+        for (const e of head.querySelectorAll("button, label, input")) {
+          if (!e.getClientRects().length || e.closest(".lib-tabs, .set-tabs")) continue;
+          left = Math.min(left, e.getBoundingClientRect().left);
+        }
+        return { over: left < h.left - 0.5, need: h.right - left };
+      };
+      body.classList.remove("tools-tight");
+      set("--crumb-max", "none");
+      set("--tools-l", Math.ceil(c.left + whole + 16) + "px");
+      if (!head || !over().over) return;
+      body.classList.add("tools-tight");
+      const o = over();
+      if (!o.over) return;
+      const max = Math.max(0, Math.floor(a.left - 8 - 16 - o.need - c.left));
+      // where the reader is keeps its last word: "Work / Library /" goes,
+      // a part and its slash at a time, before "MCP servers" is cut
+      let w = whole;
+      for (let i = 0; i + 1 < kids.length - 1 && w > max; i += 2) {
+        kids[i].hidden = kids[i + 1].hidden = true;
+        w -= wide[i] + wide[i + 1];
+      }
+      set("--crumb-max", max + "px");
+      set("--tools-l", Math.ceil(c.left + max + 16) + "px");
     });
   };
   const ro = new ResizeObserver(tools);
