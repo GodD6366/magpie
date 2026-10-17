@@ -190,9 +190,12 @@ func (s *Server) codexBackend(w http.ResponseWriter, r *http.Request) {
 	}
 	if r.Method == http.MethodPost && rest == "/responses" {
 		withGatewaySession(w, r)
-		var recorded func()
+		var recorded, hooked func()
 		w, recorded = recordConversation(w, r, provider.Responses, body)
 		defer recorded()
+		// Codex's own sign-in: the request hooks, not the middleware
+		w, body, hooked = gatewayHooks(w, r, provider.Responses, body)
+		defer hooked()
 	}
 	s.codexUpstream(w, r, rest, body)
 }
@@ -983,6 +986,7 @@ func (s *Server) codexUpstreamOn(w http.ResponseWriter, r *http.Request, rest st
 		errType = provider.ErrorType(refusal)
 	}
 	end(call.Status, call.Error, uu.Input+uu.Output+uu.CacheRead+uu.CacheWrite, uu.Output)
+	call.Route = tr.ID
 	s.record(call)
 	servedProvider, servedAccount := codexServed(base, r.Header, on)
 	rec := usage.Record{RouteID: tr.ID, Time: start, Agent: call.Agent,
@@ -1157,7 +1161,8 @@ func codexHeader(k string) bool {
 // makes on a hidden thread of its own goes without x-openai-subagent: its
 // x-codex-turn-metadata names the thread's source instead — "thread_title"
 // for the title of a new chat (#314), "guardian_review". A web search
-// magpie runs for a model that can't search is "web_search".
+// magpie runs for a model that can't search is "web_search". DSH marks its
+// compaction with x-deepseek-harness-compact: "compact" too.
 func callKind(h http.Header) string {
 	v := strings.TrimSpace(h.Get("x-openai-subagent"))
 	if v == "" && h.Get("x-openai-memgen-request") != "" {
@@ -1165,6 +1170,9 @@ func callKind(h http.Header) string {
 	}
 	if v == "" {
 		v = threadSource(h.Get("x-codex-turn-metadata"))
+	}
+	if v == "" && dshCompacts(h) {
+		v = "compact" // DSH's compaction of its context
 	}
 	if v == "" && h.Get("User-Agent") == SearchAgent {
 		v = "web_search"

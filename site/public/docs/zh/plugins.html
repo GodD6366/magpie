@@ -83,6 +83,7 @@
     <a href="#ids">供应商 id</a>
     <a href="#test">测试</a>
     <a href="#publish">发布与上架</a>
+    <a href="#gateway-request">异步网关请求钩子</a>
     <a href="#middleware">网关中间件</a>
     <a href="#tools">给每个智能体的工具</a>
     <a href="#agents">Agent 插件</a>
@@ -348,6 +349,7 @@ magpie quota                             <span class="c"># acme · Pro · 5h 37%
           <li><code>rateWas</code>：当前优惠之前的倍率。</li>
         </ul>
         模型选择器会显示它们。</li>
+      <li><code>serviceTiers</code>（在 <code>models</code> 钩子返回的模型上）：厂商为该模型提供的服务档位，写成 id，例如 <code>["priority", "ultrafast"]</code>。magpie 会把它们写进 Codex 的模型列表（<code>priority</code> 显示为 Fast）；Chat 或 Responses 请求选了其中一档时，会带着 <code>service_tier</code> 到达你的 <code>fetch</code>。在 magpie 转换协议的请求里，模型没列出的档位不会发出。</li>
       <li>模型支持推理时，<code>variants</code> 的键会成为它的推理档位。</li>
     </ul>
     <h3>连不上厂商时</h3>
@@ -598,15 +600,22 @@ m plugin logout acme</pre>
   <span class="s">"providers"</span>: [<span class="s">"acme"</span>],
   <span class="s">"summary"</span>: { <span class="s">"en"</span>: <span class="s">"Your Acme Coding Plan."</span>, <span class="s">"zh"</span>: <span class="s">"使用你的 Acme Coding Plan。"</span> } }</pre>
         </div>
-        中间件的条目写 <code>"kind": "middleware"</code>，不写 <code>providers</code>，列在<span class="ui">网关中间件</span>下。<code>MAGPIE_PLUGIN_MARKET=&lt;url&gt;</code> 让 magpie 改用另一份列表，可以用来检查你的条目；设为 <code>off</code> 则只用内置副本。</li>
+        中间件的条目写 <code>"kind": "middleware"</code>，不写 <code>providers</code>，列在<span class="ui">网关中间件</span>下。其他类型也一样：<code>"kind": "tools"</code> 列在<span class="ui">给 Agent 的工具</span>下，<code>"kind": "page"</code> 列在<span class="ui">页面</span>下，<code>"kind": "agent"</code> 列在 <span class="ui">Agent</span> 下。<code>MAGPIE_PLUGIN_MARKET=&lt;url&gt;</code> 让 magpie 改用另一份列表，可以用来检查你的条目；设为 <code>off</code> 则只用内置副本。</li>
       <li><b>GitHub 标签。</b>在 GitHub 上打了 <code>magpie-plugin</code> topic 的仓库，会显示在 <span class="ui">插件 → 发现 → 非官方插件 · GitHub</span> 里，Star 多的在前，并标明没有人审阅过。<code>package.json</code> 要放在仓库根目录。发布到 npm 且 <code>repository</code> 指向这个仓库的，从 npm 安装；否则按仓库当前的代码安装，所以它加载的文件必须提交进仓库：<code>dist</code> 只在发布时才构建的仓库不会显示。fork、已归档的仓库和 magpie-community 自己的仓库也不显示。magpie 最多每十分钟问一次 GitHub，仓库打上标签后几分钟内就会出现。卡片显示 <code>package.json</code> 里 <code>"magpie": { "icon": "…" }</code> 给的图标，没有就显示拼图图标。</li>
       <li><b>社区包。</b>想把插件贡献到 <a href="https://github.com/magpie-community/plugins">magpie-community/plugins</a>：
         <ul>
-          <li>放在 <code>packages/&lt;name&gt;</code> 下，包名为 <code>@magpie-community/opencode-&lt;name&gt;-auth</code>（供应商）或 <code>@magpie-community/middleware-&lt;name&gt;</code>（中间件），除非确实需要，不要有运行时依赖。</li>
+          <li>放在 <code>packages/&lt;name&gt;</code> 下，包名为 <code>@magpie-community/opencode-&lt;name&gt;-auth</code>（供应商）、<code>@magpie-community/middleware-&lt;name&gt;</code>（中间件或路由策略）、<code>@magpie-community/tools-&lt;name&gt;</code>（工具）、<code>@magpie-community/page-&lt;name&gt;</code>（页面）或 <code>@magpie-community/agent-&lt;name&gt;</code>（Agent），除非确实需要，不要有运行时依赖。</li>
           <li>把版本号的改动推到 <code>main</code> 就会发布。</li>
           <li>这些包在每个 magpie 里都会自动更新。</li>
         </ul></li>
     </ul>
+
+    <h2 id="gateway-request"><a class="anchor" href="#gateway-request">异步网关请求钩子</a></h2>
+    <p>插件可以在 Agent 请求路由前等待外部 I/O，例如召回项目上下文。在 package.json 声明 <code>"magpie": { "hooks": "./hooks.js" }</code>，或者添加 <code>*.hooks.js</code> / <code>.mjs</code> / <code>.ts</code> / <code>.mts</code> 文件（Bun 直接运行 TypeScript，无需构建）。导出具名异步 <code>onRequest(body, ctx)</code>。纯网关插件不需要 OpenCode 的 main/exports。</p>
+    <p>可选的异步 <code>onResponse(reply, ctx)</code> 在输出完成后接收尽力投递的通知，不修改回复，也不阻塞实时流。工具声明和工具循环由客户端负责。</p>
+<p>它在 Bun 中运行，每个 Agent 请求调用一次，位于 JS 网关中间件之前，对所有供应商生效，包括 Codex 自己的 ChatGPT 登录。body 是 Agent API 请求对象；ctx 包含 <code>protocol</code>、<code>model</code>、<code>stream</code>、<code>path</code>、<code>agent</code>、<code>session</code>、<code>cwd</code>、<code>query</code>、<code>options</code>、<code>signal</code>。query 是最后一条用户文本，不含工具结果和图片；缺失身份信息为空，HTTP Authorization 不传入。</p>
+<p>返回对象替换请求，undefined 保留此前请求。改动模型、流式、客户端工具或工具选择的钩子会被回滚，算作失败，这次请求不会调用它的 <code>onResponse</code>。每个钩子收到独立副本，失败或返回 undefined 时丢弃其原地修改。成功修改按启用顺序传给后续插件。每个钩子默认 1 秒；选项 <code>gatewayTimeoutMs</code> 可设为 100 到 10000 毫秒的整数。整条链按预算求和，限制为 2 到 10 秒，包含宿主启动及 RPC 共 11 秒。设置 → 插件提供选项编辑及调用次数、耗时、失败与最近结果。<code>ctx.report(code, bytes)</code> 只接受 ready/empty/unbound/unauthorized/unavailable/invalid/skipped 和字节数；不保存私有文本，重载后统计清零。fetch 应使用 <code>ctx.signal</code>。异常、畸形返回、超时、宿主正忙于启动时保留原请求。Bun 插件具有宿主权限，只安装可信代码。</p>
+<p>用 <code>magpie plugin add ./my-plugin</code> 安装，<code>magpie plugin options my-plugin '&lbrace;"serverUrl":"http://127.0.0.1:8000"&rbrace;'</code> 设置选项。on/off 和选项变更触发宿主重载；仅修改源码需主动触发配置重载。内部标题和分类请求跳过此钩子。</p>
 
     <h2 id="middleware"><a class="anchor" href="#middleware">网关中间件</a></h2>
     <p>插件还可以是<em>网关中间件</em>：agent 发给 magpie 网关的每个请求，在路由之前先经过它；回复在返回的路上也经过它。它可以给模型起别名、往系统提示词里加内容、拒绝请求、改写或隐藏模型说的话，或者自己统计经过的流量。它对所有供应商都起作用，不管是不是插件提供的。</p>

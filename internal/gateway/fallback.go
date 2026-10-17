@@ -21,6 +21,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"regexp"
 	"slices"
@@ -43,8 +44,8 @@ type candidate struct {
 	// ("provider/model:low"); "" for one that follows the agent or the group
 	effort string
 	// fast is set on a member the group sends in its vendor's fast mode
-	// (Group.Fast)
-	fast bool
+	// (Group.Fast); ultra on an agent's fast pick sent Ultrafast (#1954)
+	fast, ultra bool
 	// rank is its place in its provider's own list of accounts or keys,
 	// the order the provider's page shows and a drag sets (#217)
 	rank int
@@ -232,6 +233,7 @@ func perKeyBarred(p provider.Provider, model string, from provider.Protocol) (ou
 		return out, nil, left, barred
 	}
 	keys := p.KeysOn()
+	serves := p.Serving(model) // the lists read once, not once a key (@NetRozee on X)
 	var unlisted []candidate
 	var noURL provider.Protocol
 	for i, k := range keys {
@@ -250,7 +252,7 @@ func perKeyBarred(p provider.Provider, model string, from provider.Protocol) (ou
 			barred = append(barred, candidate{p: q, model: model, rest: rest, rank: i})
 			continue
 		}
-		if !p.Serves(k, model) {
+		if !serves(k) {
 			// the vendor lists the model to another key only
 			unlisted = append(unlisted, candidate{p: q, model: model, rest: rest, rank: i})
 			continue
@@ -639,9 +641,32 @@ func capHeld(p, acct provider.Provider, model string, now time.Time) *capHold {
 // that could take it is held at its usage cap, as the vendor's own refusal
 // would when all are used up; the soonest one is back is the wait.
 func cappedError(model string, ws []Weighed, now time.Time) (string, time.Time) {
+	held, soonest := heldReasons(ws, now)
+	capped, noCredits := heldBy(ws)
+	switch {
+	case !noCredits:
+		return fmt.Sprintf("usage cap reached: every account that serves %q is held at the usage cap set on it in magpie — %s. magpie uses it again once that window renews; %s", model, strings.Join(held, "; "), heldAdvice(capped, noCredits)), soonest
+	case !capped:
+		return fmt.Sprintf("usage limit reached: every account that serves %q has used up its allowance and is set in magpie not to spend its credits — %s. magpie uses it again once that window renews; %s", model, strings.Join(held, "; "), heldAdvice(capped, noCredits)), soonest
+	}
+	return fmt.Sprintf("usage limit reached: every account that serves %q is held by magpie — %s. magpie uses it again once that window renews; %s", model, strings.Join(held, "; "), heldAdvice(capped, noCredits)), soonest
+}
+
+// checkpointCappedError is cappedError for a request whose native
+// compaction only the account that sealed it can read (#1099), when that
+// one is held: the other accounts that serve model weren't tried for it,
+// not because they are held too (#2517).
+func checkpointCappedError(model string, cp checkpointWriter, ws []Weighed, now time.Time) (string, time.Time) {
+	held, soonest := heldReasons(ws, now)
+	capped, noCredits := heldBy(ws)
+	return fmt.Sprintf("usage limit reached on the one account this conversation can go to — %s. The conversation was compacted natively by %s, and only that key or account can read the compaction it sealed, so magpie doesn't send it to another account that serves %q, which would refuse it; the routing mode and how conversations stay don't change that. magpie uses it again once that window renews; %s, or start a new conversation", strings.Join(held, "; "), cp.Who, model, heldAdvice(capped, noCredits)), soonest
+}
+
+// heldReasons is what holds each account of ws held at a share, and the
+// soonest one is back.
+func heldReasons(ws []Weighed, now time.Time) ([]string, time.Time) {
 	var held []string
 	var soonest time.Time
-	capped, noCredits := heldBy(ws)
 	for _, w := range ws {
 		if w.Capped == 0 {
 			continue
@@ -658,13 +683,18 @@ func cappedError(model string, ws []Weighed, now time.Time) (string, time.Time) 
 		}
 		held = append(held, s)
 	}
+	return held, soonest
+}
+
+// heldAdvice is how to go on now past what heldBy says holds.
+func heldAdvice(capped, noCredits bool) string {
 	switch {
 	case !noCredits:
-		return fmt.Sprintf("usage cap reached: every account that serves %q is held at the usage cap set on it in magpie — %s. magpie uses it again once that window renews; raise or lift the cap in magpie (Providers → the account's cap, or magpie provider account-cap)", model, strings.Join(held, "; ")), soonest
+		return "raise or lift the cap in magpie (Providers → the account's cap, or magpie provider account-cap)"
 	case !capped:
-		return fmt.Sprintf("usage limit reached: every account that serves %q has used up its allowance and is set in magpie not to spend its credits — %s. magpie uses it again once that window renews; to go on now, if an account holds credits, let it spend them (Usage → the account's Use credits, or magpie quota credits <account> on)", model, strings.Join(held, "; ")), soonest
+		return "to go on now, if an account holds credits, let it spend them (Usage → the account's Use credits, or magpie quota credits <account> on)"
 	}
-	return fmt.Sprintf("usage limit reached: every account that serves %q is held by magpie — %s. magpie uses it again once that window renews; to go on now, raise or lift a cap (Providers → the account's cap, or magpie provider account-cap) or, if an account holds credits, let it spend them (Usage → the account's Use credits, or magpie quota credits <account> on)", model, strings.Join(held, "; ")), soonest
+	return "to go on now, raise or lift a cap (Providers → the account's cap, or magpie provider account-cap) or, if an account holds credits, let it spend them (Usage → the account's Use credits, or magpie quota credits <account> on)"
 }
 
 // heldBy says what holds the accounts of ws held at a share: a usage cap
@@ -676,6 +706,18 @@ func heldBy(ws []Weighed) (capped, noCredits bool) {
 		}
 	}
 	return capped, noCredits
+}
+
+// checkpointCappedRecord is the call's record of checkpointCappedError's
+// refusal, told apart as cappedRecord's.
+func checkpointCappedRecord(ws []Weighed) string {
+	switch capped, noCredits := heldBy(ws); {
+	case !noCredits:
+		return "native compaction's account at its usage cap"
+	case !capped:
+		return "native compaction's account held: set not to spend its credits"
+	}
+	return "native compaction's account held: at its usage cap or set not to spend its credits"
 }
 
 // cappedRecord is the call's record of the same refusal as cappedError,
@@ -1534,6 +1576,13 @@ type holdWriter struct {
 	// reply is asked again instead of ended: the guard then reads the
 	// next try's afresh
 	reask func(loopTrip) bool
+	// reasked is how many times reask asked the reply again in place,
+	// tries of the request its route doesn't list (#2436)
+	reasked int
+	// reloop: a reply passed through, whose reasoning loops before it
+	// said anything, may be let go for the request to ask it again
+	// (loopReasks, #2436); relooped says it was
+	reloop, relooped bool
 
 	// wantWhole: a reply wanted only whole, a compaction's summary (#2274): its
 	// stream is held to its end, never let through at its first content,
@@ -1634,7 +1683,7 @@ func (h *holdWriter) Write(b []byte) (int, error) {
 	if h.slow {
 		return 0, errSlowStart
 	}
-	if h.looped != "" {
+	if h.looped != "" || h.relooped {
 		return 0, errLooped
 	}
 	if h.status == 0 {
@@ -1642,10 +1691,15 @@ func (h *holdWriter) Write(b []byte) (int, error) {
 	}
 	if h.loop != nil && !h.whole && h.status < 400 {
 		if t, ok := h.loop.feed(b); ok {
-			if h.reask == nil || !h.reask(t) {
+			switch {
+			case h.reask != nil && h.reask(t):
+				h.reasked++
+				h.loop = &loopGuard{}
+			case h.reask == nil && h.mayReloop(t):
+				return h.letGoLoop(b)
+			default:
 				return h.cutLoop(b, t)
 			}
-			h.loop = &loopGuard{}
 		}
 	}
 	h.see(b)
@@ -1700,9 +1754,57 @@ func (h *holdWriter) cutLoop(b []byte, t loopTrip) (int, error) {
 	if h.alive != nil {
 		proto = h.alive.proto
 	}
+	// what is appended begins after a blank line, as in passthrough: the
+	// reply's last write may have stopped mid-line, and an event joined
+	// onto it is one the client can't parse (TestLoopCutMidLine)
+	if h.atLine {
+		io.WriteString(h.w, "\n")
+	} else {
+		io.WriteString(h.w, "\n\n")
+	}
 	streamError(h.w, proto, http.StatusBadGateway, msg)
 	h.looped, h.ended = msg, true
 	h.flush()
+	if h.stop != nil {
+		h.stop()
+	}
+	return 0, errLooped
+}
+
+// mayReloop says whether a reply passed through, found stuck in a loop
+// (t), is let go for the request to ask it again (letGoLoop) rather than
+// ended: its reasoning looped before it said a text or a call, the
+// request has an ask left (reloop), and the next try's stream can follow
+// what the agent has. Nothing of it sent, any can; sent, only a Chat
+// stream, whose chunks are deltas the agent adds up: a second stream's
+// follow the first's as they would its own. An Anthropic or Responses
+// stream begun can't be followed by another's message_start or
+// response.created, so it ends with the loop's error, as before.
+func (h *holdWriter) mayReloop(t loopTrip) bool {
+	if !h.reloop || !t.reasoning || h.loop.spoke || h.alive == nil || h.ctx != nil && h.ctx.Err() != nil {
+		return false
+	}
+	return !h.passing || h.alive.proto == provider.Chat
+}
+
+// letGoLoop lets a reply go whose reasoning looped before it said a word
+// (mayReloop), for the request to ask it again: the vendor's request is
+// let go, and the try's writes after it fail. Held, none of it reaches
+// the agent; passing, its events go up to the end of the one the loop was
+// found in, for the next try's stream to begin on a whole event.
+func (h *holdWriter) letGoLoop(b []byte) (int, error) {
+	if h.passing {
+		b = b[:max(len(b)-len(h.loop.pending), 0)]
+		h.sent(b)
+		h.w.Write(b)
+		h.flush()
+		// the next try's stream follows this one: its 200 and headers
+		// are not sent again
+		h.alive.sent = true
+	} else {
+		h.held.Reset()
+	}
+	h.relooped = true
 	if h.stop != nil {
 		h.stop()
 	}
@@ -1917,6 +2019,9 @@ type keptAlive struct {
 	// it asked; streams, whether it asked for a stream
 	told    time.Time
 	streams bool
+	// Only opted-in Claude cache reporting can defer initial keepalives.
+	// Selection releases it before process startup; expiry keeps the stream alive.
+	cacheReportUntil time.Time
 }
 
 // agentQuietMost is the longest a streaming Responses agent goes with no
@@ -1950,6 +2055,15 @@ func (h *holdWriter) keepAlive() {
 		return
 	}
 	if !a.sent {
+		if !a.cacheReportUntil.IsZero() {
+			if time.Now().Before(a.cacheReportUntil) {
+				return
+			}
+			a.cacheReportUntil = time.Time{}
+			h.header.Del("X-Magpie-Cache-Marks-Dropped")
+			h.notes.Del("X-Magpie-Cache-Marks-Dropped")
+			log.Printf("claude: cache-mark report timed out before run selection; streaming without the dropped-mark header")
+		}
 		// the try's header is whole once it has its status (WriteHeader,
 		// under mu); before, the vendor's are still being copied into it
 		// from the try's goroutine, and only magpie's notes are read
@@ -2316,7 +2430,7 @@ func (h *holdWriter) watch() func() {
 // comments only (keepAlive), none of the try, which another account may
 // still answer instead; passed, a comment goes between two lines of it.
 func (h *holdWriter) keepQuiet() {
-	if h.slow || h.ended || h.alive == nil || h.alive.proto == provider.Gemini || h.ctx != nil && h.ctx.Err() != nil {
+	if h.slow || h.relooped || h.ended || h.alive == nil || h.alive.proto == provider.Gemini || h.ctx != nil && h.ctx.Err() != nil {
 		return
 	}
 	if !h.heard.IsZero() && time.Since(h.heard) >= keepaliveLongest {

@@ -136,10 +136,10 @@ func (p Provider) ListedAPIs(model string) []Protocol {
 	if p.IsPlugin() {
 		return p.pluginAPIs(model)
 	}
-	// asked for every model of every agent: read once while a request holds
-	ms, _, _ := p.live()
-	for _, m := range ms {
-		if m.ID == model && len(m.APIs) > 0 {
+	// asked for every model of every agent: looked up, not the list
+	// copied and scanned for each (2,500 models' /v1/models took 3s)
+	for _, m := range p.liveByID(model) {
+		if len(m.APIs) > 0 {
 			out := make([]Protocol, len(m.APIs))
 			for i, a := range m.APIs {
 				out[i] = Protocol(a)
@@ -315,6 +315,10 @@ type Exclusion struct {
 	// Tucked: hidden from the Add sheet too, but for its "Show N hidden"
 	// and a search by name (#116).
 	Tucked bool `json:"tucked,omitempty"`
+	// Retry: the keychain didn't give Codex's sign-in (refused, no
+	// answer, or its prompt still up); Try again asks it once more
+	// (RetryCodexKeychain, #2367).
+	Retry bool `json:"retry,omitempty"`
 }
 
 // Excluded lists sign-ins magpie detects but leaves out: the accounts the
