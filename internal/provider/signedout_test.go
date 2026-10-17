@@ -38,8 +38,60 @@ func TestSavedButSignedOut(t *testing.T) {
 	if codex == nil || !strings.Contains(codex.Why, "2 accounts are") || !strings.Contains(codex.Why, filepath.Join(home, ".codex", "auth.json")) {
 		t.Fatalf("codex: %+v", codex)
 	}
-	// signed in: nothing to say
+	if strings.Contains(codex.Why, "keychain") {
+		t.Fatalf("no keyring set, yet: %s", codex.Why)
+	}
+	// Codex set to keep its sign-in in the keychain (#2312, #2367). Where
+	// magpie reads the item (macOS), an empty one is signed out, said of
+	// the item; a read the keychain refused is not known, and the reason
+	// says how to let magpie in. Where it doesn't (Linux, Windows, or
+	// Codex's encrypted auth storage), it is signed in only not where
+	// magpie looks, and the reason says how to put it there.
 	os.MkdirAll(filepath.Join(home, ".codex"), 0o700)
+	excluded := func() *Exclusion {
+		forgetCodexKeychain()
+		for _, x := range Excluded() {
+			if x.Agent == "codex" && x.SignedOut {
+				return &x
+			}
+		}
+		return nil
+	}
+	defer func(k keychain, here bool) { codexKeychain, codexKeychainHere = k, here }(codexKeychain, codexKeychainHere)
+	for _, store := range []string{"keyring", "auto"} {
+		config := "model = \"gpt-5.6\"\ncli_auth_credentials_store = \"" + store + "\"\n\n[profiles.x]\nmodel = \"o3\"\n"
+		os.WriteFile(filepath.Join(home, ".codex", "config.toml"), []byte(config), 0o600)
+
+		codexKeychain, codexKeychainHere = &fakeKeychain{}, true
+		if codex = excluded(); codex == nil || len(codex.Users) != 2 || !strings.Contains(codex.Why, "isn't signed in here") ||
+			!strings.Contains(codex.Why, `keychain item "Codex Auth"`) {
+			t.Fatalf("%s, no item: %+v", store, codex)
+		}
+		codexKeychain = &fakeKeychain{findErr: errKeychainUnread}
+		if codex = excluded(); codex == nil || strings.Contains(codex.Why, "isn't signed in here") ||
+			!strings.Contains(codex.Why, "Allow magpie") || !strings.Contains(codex.Why, `cli_auth_credentials_store = "file"`) {
+			t.Fatalf("%s, item not read: %+v", store, codex)
+		}
+
+		codexKeychainHere = false
+		if codex = excluded(); codex == nil || len(codex.Users) != 2 || strings.Contains(codex.Why, "isn't signed in here") ||
+			!strings.Contains(codex.Why, `cli_auth_credentials_store = "`+store+`"`) || !strings.Contains(codex.Why, `cli_auth_credentials_store = "file"`) ||
+			!strings.Contains(codex.Why, "doesn't read") {
+			t.Fatalf("%s, keychain not read here: %+v", store, codex)
+		}
+		codexKeychainHere = true
+		os.WriteFile(filepath.Join(home, ".codex", "config.toml"), []byte(config+"\n[features]\nsecret_auth_storage = true\n"), 0o600)
+		if codex = excluded(); codex == nil || !strings.Contains(codex.Why, "encrypted auth storage") || strings.Contains(codex.Why, "isn't signed in here") {
+			t.Fatalf("%s, encrypted storage: %+v", store, codex)
+		}
+	}
+	os.WriteFile(filepath.Join(home, ".codex", "config.toml"), []byte("cli_auth_credentials_store = \"file\"\n"), 0o600)
+	for _, x := range Excluded() {
+		if x.Agent == "codex" && x.SignedOut && strings.Contains(x.Why, "keychain") {
+			t.Fatalf("file store, yet: %s", x.Why)
+		}
+	}
+	// signed in: nothing to say
 	os.WriteFile(filepath.Join(home, ".codex", "auth.json"), []byte(`{"auth_mode":"chatgpt","tokens":{"access_token":"x","account_id":"acc-1"}}`), 0o600)
 	for _, x := range Excluded() {
 		if x.SignedOut {

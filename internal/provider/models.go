@@ -615,7 +615,7 @@ func (p Provider) fetchOne(ctx context.Context) (fetched, error) {
 		if anthropic {
 			ctx = p.listAuth(ctx)
 		}
-		ms, err := catalog.FetchURL(ctx, u, p.Key, anthropic, p.listHeaders())
+		ms, err := catalog.FetchURL(ctx, u, p.Key, anthropic, p.listHeadersAt(u))
 		if err != nil {
 			return fetched{}, err
 		}
@@ -672,7 +672,7 @@ func (p Provider) fetchOne(ctx context.Context) (fetched, error) {
 			// listed as the Gemini API lists them, the key in its header,
 			// and merged like any other protocol's list (#1346)
 			asked[protoBase] = true
-			ms, _, err := catalog.FetchGemini(ctx, protoBase, p.Key, p.listHeaders())
+			ms, _, err := catalog.FetchGemini(ctx, protoBase, p.Key, p.listHeadersAt(protoBase))
 			if err != nil {
 				if !slices.Contains(errs, err.Error()) {
 					errs = append(errs, err.Error())
@@ -718,7 +718,7 @@ func (p Provider) fetchOne(ctx context.Context) (fetched, error) {
 			continue
 		}
 		asked[protoBase] = true
-		ms, u, err := catalog.FetchAtListed(lctx, protoBase, p.Key, proto == Anthropic, p.listHeaders(), listed)
+		ms, u, err := catalog.FetchAtListed(lctx, protoBase, p.Key, proto == Anthropic, p.listHeadersAt(protoBase), listed)
 		if err == nil && proto == Anthropic && HostOf(protoBase) == openRouterHost {
 			// the pages of the list are followed to its end, and what
 			// comes back is still not a list of models to serve
@@ -1639,7 +1639,9 @@ var makerCatalogs = sync.OnceValue(func() []string {
 // account, Copilot) or a relay with no models.dev id of its own is priced
 // at gpt-6-astra's or gemini-3.8-flash's maker's price, as a Claude
 // account is at Anthropic's. A remote magpie's is what that magpie counts
-// the model at, as its list says (remotePrice).
+// the model at, as its list says (remotePrice). A model no catalog prices
+// is at the price its plugin lists it at (pluginListPrice), else, when the
+// plugin says the plan serves it free, costs nothing (pluginFree).
 func (p Provider) ListPrice(model string) (catalog.Price, bool) {
 	if pr, ok := p.remotePrice(model); ok {
 		return pr, true
@@ -1652,6 +1654,9 @@ func (p Provider) ListPrice(model string) (catalog.Price, bool) {
 		return pr, true
 	}
 	if pr, ok := p.factoryFastPrice(model); ok {
+		return pr, true
+	}
+	if pr, ok := p.grokFastPrice(model); ok {
 		return pr, true
 	}
 	names := pricedNames(model)
@@ -1672,7 +1677,46 @@ func (p Provider) ListPrice(model string) (catalog.Price, bool) {
 			return pr, true
 		}
 	}
+	if pr, ok := p.pluginListPrice(model); ok {
+		return pr, true
+	}
+	if p.pluginFree(model) {
+		return catalog.Price{}, true
+	}
 	return catalog.Price{}, false
+}
+
+// pluginListPrice is the price the plugin serving p lists model at
+// (pluginPrice): Devin's own, from GetCliModelConfigs, for its SWE models
+// that no catalog has. Only where no catalog prices the model, as with
+// pluginFree, so no price a catalog gave changes.
+func (p Provider) pluginListPrice(model string) (catalog.Price, bool) {
+	pp, ok := PluginOf(p.ID)
+	if !ok {
+		return catalog.Price{}, false
+	}
+	m, ok := pluginModel(pp, model)
+	if !ok {
+		return catalog.Price{}, false
+	}
+	return pluginPrice(m)
+}
+
+// pluginFree is whether the plugin serving p lists model as one its plan
+// serves at no cost (plugin.Model.Free): Devin's SWE-2, which Devin gives
+// the "Free" cost tier and no allowance counts, Qoder's and WorkBuddy's
+// x0 models. Such a model is the vendor's own, sold per token nowhere, so
+// no catalog prices it, and without this its calls showed no cost at all
+// (太陽と向日葵 on Discord, on SWE-2 after Devin's quota was used up).
+// Only where no list price is known: a free model a catalog prices keeps
+// that price, as it did.
+func (p Provider) pluginFree(model string) bool {
+	pp, ok := PluginOf(p.ID)
+	if !ok {
+		return false
+	}
+	m, ok := pluginModel(pp, model)
+	return ok && m.Free
 }
 
 // EndpointCatalog is the models.dev catalog a provider the user added by
@@ -1757,6 +1801,50 @@ func (p Provider) cursorFastPrice(model string) (catalog.Price, bool) {
 		pr.Tiers = slices.Clone(pr.Tiers)
 	}
 	return pr, ok
+}
+
+// grokBuildFast is Grok Build's id of a Grok model's fast variant, as its
+// own model list offers it (grok-4.7-build-fast, and at a window of its
+// own, grok-4.7-build-fast@500k). m[1] is the model it is fast of.
+var grokBuildFast = regexp.MustCompile(`^(grok-[0-9][0-9.]*)-build-fast(?:@[0-9]+k?)?$`)
+
+// grokFastPrice is a Grok account's (the built-in's or the Grok plugin's)
+// price for its fast variant of a Grok model: twice the model's own, every
+// tier with it, as xAI says it sells it ("We also serve a fast variant
+// with twice the output speed at twice the price",
+// https://x.ai/news/grok-4-7, read 2026-10-15). No catalog lists
+// grok-4.7-build-fast, so every call a routing group of Cursor's and
+// Grok's Grok 4.7 fast sent to Grok was unpriced, and the group's cost
+// left out half its calls (TradingLife on Discord, after cbc96b599 priced
+// Cursor's half). Only on a Grok account: no other vendor serves the id.
+func (p Provider) grokFastPrice(model string) (catalog.Price, bool) {
+	if p.Account == nil || p.Account.Agent != "grok" && p.PluginProvider() != "grok" {
+		return catalog.Price{}, false
+	}
+	base, ok := GrokBuildFast(model)
+	if !ok {
+		return catalog.Price{}, false
+	}
+	pr, ok := p.ListPrice(base)
+	if !ok {
+		return catalog.Price{}, false
+	}
+	return pr.Times(GrokFastTimes), true
+}
+
+// GrokFastTimes is how many times its model's price xAI sells a Grok
+// model's fast variant at (grokFastPrice).
+const GrokFastTimes = 2
+
+// GrokBuildFast is the Grok model id is Grok Build's fast variant of
+// (grok-4.7-build-fast is grok-4.7's), and whether it is one: for a Grok
+// CLI session, which names it bare, priced as grokFastPrice prices it.
+func GrokBuildFast(id string) (string, bool) {
+	m := grokBuildFast.FindStringSubmatch(strings.ToLower(strings.TrimSpace(id)))
+	if m == nil {
+		return "", false
+	}
+	return m[1], true
 }
 
 // factoryFastTimes is how many times its base model's list price each
@@ -1856,10 +1944,26 @@ func MakerPrice(model string) (catalog.Price, bool) {
 	return catalog.Price{}, false
 }
 
+// SamePriceIn is the maker's list price of the model the user said
+// providerID's model is the same as (settings' ModelSameAs, #2344): for an
+// id of the provider's own that no list prices, as WorkBuddy's kimi-k3-1
+// or a plugin's qfmodel. It is the last place a price is looked for, after
+// the user's own, the provider's list and the model's maker's by its own
+// id, and is never another provider's tariff. MakerPrice reads the id as
+// any vendor spells it, with its prefix ("moonshotai/kimi-k3") or not.
+func SamePriceIn(s settings.Settings, providerID, model string) (catalog.Price, bool) {
+	same := strings.TrimSpace(s.ModelSameAs[providerID+"/"+model])
+	if same == "" {
+		return catalog.Price{}, false
+	}
+	return MakerPrice(same)
+}
+
 // EffectivePrice is what a call to a provider's model costs the user: the
 // price they set for that model, or for every model of that provider, or for
 // that model from any provider (settings' ModelPrices), else the provider's own list price, else its
-// maker's, either at the provider's price rate (PriceRate). The second return is false only when no price is known at all,
+// maker's, else the maker's of the model the user said it is the same as
+// (SamePriceIn), each at the provider's price rate (PriceRate). The second return is false only when no price is known at all,
 // which is not the same as a price of zero: that one is set, deliberately.
 //
 // A price here is the provider's tariff, not the model's: the same model
@@ -1904,11 +2008,17 @@ func priceOf(s settings.Settings, p Provider, known bool, model string) (catalog
 		}
 	}
 	if !known {
-		return MakerPrice(model)
+		if pr, ok := MakerPrice(model); ok {
+			return pr, true
+		}
+		return SamePriceIn(s, id, model)
 	}
 	pr, ok := p.ListPrice(model)
 	if !ok {
 		pr, ok = MakerPrice(model)
+	}
+	if !ok {
+		pr, ok = SamePriceIn(s, id, model)
 	}
 	// what the provider bills against it (#819)
 	if ok && p.PriceRate > 0 {
@@ -1992,7 +2102,8 @@ var grokWindow = regexp.MustCompile(`^((?:.*/)?grok-[0-9][^/@]*)@[0-9]+k?$`)
 // This is a list-price estimate, not evidence of a response's served model.
 // Other names without catalog prices stay unpriced here (grok-4.7-build,
 // grok-4.7-mini, grok-4.7-fast); a Cursor account's fast ids are priced at
-// Cursor's own fast rate (Provider.cursorFastPrice).
+// Cursor's own fast rate (Provider.cursorFastPrice), and a Grok account's
+// grok-4.7-build-fast at twice grok-4.7's (Provider.grokFastPrice).
 func pricedNames(model string) []string {
 	out := []string{model}
 	if model == "codex-auto-review" {

@@ -138,7 +138,9 @@ const usage = `magpie — one place to pick every agent's model
                                   http(s):// or socks5:// proxy for it; --mirror: a GitHub download mirror put
                                   before the github.com URL (none unless given; still checked against usemagpie.ai's SHA-256)
   magpie update mirror [<prefix>|off]  the mirror every update, the app's own too, is downloaded through
-  magpie update auto [on|off] [30m|1h|6h|24h]  whether the app looks for updates by itself, and how often (6h)
+  magpie update auto [on|off] [download|notify] [30m|1h|6h|24h]
+                                  whether the app looks for updates by itself, how often (6h), and whether
+                                  it downloads one at once or only says it is out (notify: for metered networks)
 
 agents: claude (cc), codex, gemini, opencode (oc), openclaw, mimocode, deveco, pi, goose, cursor, zed, copilot, crush, aside
 `
@@ -412,6 +414,10 @@ func run(args []string) error {
 		// `magpie cindy`: it takes magpie through its own link, confirmed there
 		if len(args) > 1 {
 			link := a.Import()
+			if link == "" {
+				// Lody takes only a gateway on this computer's loopback
+				return fmt.Errorf("%s takes magpie only at a loopback address, and the gateway is at %s: nothing was opened", a.Name, gateway.URL())
+			}
 			openInBrowser(link)
 			fmt.Println(green.Render("✓"), bold.Render(a.Name), muted.Render("opened to add magpie — confirm it there"))
 			fmt.Println(muted.Render("  " + link))

@@ -47,6 +47,15 @@ type Target struct {
 	// Settings is Claude Code's settings.json, whose permissions.deny
 	// leaves out the tools of a server turned off (mcp_tools_off.go)
 	Settings string
+	// Gone is an agent no longer installed here that still has what magpie
+	// gave it (held): a sync only takes things out of it, as they are
+	// unticked, and gives it nothing.
+	Gone bool
+	// Profile says the instructions file is the user's profile to the
+	// agent, not instructions alone (Alma's USER.md): magpie adds its part
+	// after the user's, but never moves the user's own lines out of it
+	// (ImportInstructions), as the agent reads who its owner is there.
+	Profile bool
 }
 
 func home() string { h, _ := os.UserHomeDir(); return h }
@@ -257,8 +266,16 @@ func targetOf(a *agent.Agent) *Target {
 		// and ~/.agents/skills besides (its skills service, #824). Its MCP
 		// servers are ~/.config/alma/mcp.json's mcpServers, read as Alma
 		// starts and when its MCP settings refresh (0.4.164's
-		// out/main/index.js, #1292). It has no user-wide instructions file,
-		// its prompts being its settings' own
+		// out/main/index.js, #1292). Its main chat puts ~/.config/alma/
+		// USER.md, on every system, in its system prompt as its owner's
+		// profile ("name, preferences, habits"), unless the thread's
+		// workspace has a USER.md of its own (0.4.164's out/main/index.js,
+		// #2315): magpie's part goes after what the user has there. The
+		// file's YAML front matter is where Alma's Telegram and Discord
+		// bots read who the owner is, so it is a Profile: the user's own
+		// lines are never moved out of it
+		t.Instructions = filepath.Join(h, ".config", "alma", "USER.md")
+		t.Profile = true
 		t.Skills = filepath.Join(h, ".config", "alma", "skills")
 		t.MCP = &mcpFile{Path: filepath.Join(h, ".config", "alma", "mcp.json"), Format: fmtAlma}
 		t.SkillsAlso = []string{"claude", "codex"}
@@ -691,6 +708,39 @@ func targets(gone bool) []*Target {
 	return out
 }
 
+// held are the agents not among have (Targets) — uninstalled, or gone for
+// their CLI — that the library still gives something, or that hold a skill,
+// server or hook magpie put there: each is listed on the rows of what it
+// has, for that to be unticked and taken out of it, and on no other row
+// (@jiahao_jayden on X: an agent that isn't installed was on every row). A
+// sync gives them nothing new (Gone).
+func (l *Library) held(have []*Target) []*Target {
+	in := map[string]bool{}
+	for _, t := range have {
+		in[t.Agent.ID] = true
+	}
+	has := func(id string) bool {
+		if a := l.Applied[id]; a != nil && (len(a.Skills) > 0 || len(a.MCP) > 0 || len(a.Hooks) > 0) {
+			return true
+		}
+		return slices.ContainsFunc(l.Skills, func(s *Skill) bool { return slices.Contains(s.Agents, id) }) ||
+			slices.ContainsFunc(l.MCP, func(s *Server) bool { return slices.Contains(s.Agents, id) }) ||
+			slices.ContainsFunc(l.Hooks, func(h *Hook) bool { return slices.Contains(h.Agents, id) })
+	}
+	var out []*Target
+	for _, a := range append(apps(), agent.All()...) {
+		if in[a.ID] || a.WSL != "" || !has(a.ID) {
+			continue
+		}
+		in[a.ID] = true
+		if t := targetOf(a); t != nil && t.open() {
+			t.Gone = true
+			out = append(out, t)
+		}
+	}
+	return out
+}
+
 // readsShared are the agents that read ~/.agents/skills as well as their
 // own folder (each one's docs or source).
 var readsShared = []string{"codex", "gemini", "opencode", "deveco", "crush", "dsh", "commandcode", "devin", "droid", "cline", "grok", "grok-app", "fx", "alma"}
@@ -726,7 +776,7 @@ func readsWith(ts []*Target) {
 // whether any place is left.
 func (t *Target) open() bool {
 	if t.Instructions != "" && agent.Taken(filepath.Dir(t.Instructions)) {
-		t.Instructions, t.Override, t.Note = "", "", ""
+		t.Instructions, t.Override, t.Note, t.Profile = "", "", "", false
 	}
 	if t.MCP != nil && slices.ContainsFunc(t.MCP.files(), func(p string) bool { return agent.Taken(filepath.Dir(p)) }) {
 		t.MCP, t.MCPVia = nil, ""

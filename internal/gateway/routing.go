@@ -15,6 +15,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"math"
 	"net/http"
 	"regexp"
@@ -159,6 +160,17 @@ var (
 	// answer ("切换其他模型", "switch to the other models"): its limit is
 	// the model's, and the model alone rests
 	otherModels = regexp.MustCompile(`(?i)switch(?:ing)? to (?:the )?other models?|切换(?:到)?其他模型`)
+	// clineFreeLimit: Cline's refusal of a free model whose day's allowance
+	// is used up, 429 "Daily free limit reached on model deepseek/deepseek-
+	// v4-flash. Try again in 23h 59m", as its own clients read it (cline/
+	// cline sdk/packages/llms/src/providers/errors.ts,
+	// isClineFreeModelLimitMessage, which tells the user to pick another
+	// model): the limit is that model's, and the model alone rests
+	// (#1398, wuasakura)
+	clineFreeLimit = regexp.MustCompile(`(?i)free limit reached on model`)
+	// tryAgainIn: how long Cline's free-model refusal says until it is
+	// back ("Try again in 23h 59m"), in the units resetsInWords reads
+	tryAgainIn = regexp.MustCompile(`(?i)\btry again in (?:(\d+)\s*d(?:ays?)?\b\s*)?(?:(\d+)\s*h(?:ours?|rs?)?\b\s*)?(?:(\d+)\s*m(?:in(?:utes?|s)?)?\b)?`)
 	// quotaCodes: a vendor's own code for a used-up allowance, which alone
 	// makes a server error (5xx) one over the quota: Claude Code's resets
 	// line, the ChatGPT backend's usage_limit_reached, Google's
@@ -556,7 +568,80 @@ func resetsAt(body []byte, now time.Time) time.Duration {
 	if d := resetsWritten(body, now); d > 0 {
 		return d
 	}
+	if d := resetsZhipu(body, now); d > 0 {
+		return d
+	}
 	return resetsAfter(body)
+}
+
+// zhipuResets: Zhipu's 1308 and 1310 (Z.ai and bigmodel.cn, GLM Coding
+// Plan), as its error code pages give them: "Usage limit reached for 5
+// hour. Your limit will reset at 2026-09-22 01:18:11", "Weekly/Monthly
+// Limit Exhausted. Your limit will reset at …", "已达到 5 小时的使用上限。
+// 您的限额将在 … 重置". The time has no zone; it is Beijing's (a 1308
+// received at 2026-09-21T17:17:32Z said 01:18:11, 39 seconds later read as
+// UTC+8, 8 hours later as UTC). Read with resetsWhen's offset alone, it was
+// not read at all, and the key rested a quarter of an hour, not until the
+// time Z.ai named (Player on Discord: "reset at 2026-10-15 20:12", "not
+// asked again before 17:12"). Only these words, then a whole date and a
+// time to the minute at least, with no digit, colon or zone after it.
+var zhipuResets = regexp.MustCompile(`(?:\bYour limit will reset at|您的限额将在)\s*(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2})(?::(\d{2}))?(\s*\S{0,3})`)
+
+// heldClock is when a key or model held out of its allowance is asked
+// again, as an error put in words says it. The agent reading it, or a
+// Remote magpie's user, may be on another clock than this magpie's, so the
+// offset goes with it: "20:12 UTC+8" today, else "Oct 16 09:00 UTC+8".
+// Without it a magpie on UTC+8 said "not asked again before 17:12" to a
+// user who couldn't tell whose 17:12 it was (Player on Discord).
+func heldClock(t, now time.Time) string {
+	t, now = t.Local(), now.Local()
+	s := t.Format("Jan 2 15:04")
+	if y, m, d := t.Date(); now.Year() == y && now.Month() == m && now.Day() == d {
+		s = t.Format("15:04")
+	}
+	_, off := t.Zone()
+	sign := "+"
+	if off < 0 {
+		sign, off = "-", -off
+	}
+	z := fmt.Sprintf("UTC%s%d", sign, off/3600)
+	if m := off % 3600 / 60; m > 0 {
+		z += fmt.Sprintf(":%02d", m)
+	}
+	return s + " " + z
+}
+
+// zhipuZone is the zone Zhipu writes its reset times in.
+var zhipuZone = time.FixedZone("UTC+8", 8*3600)
+
+// resetsZhipu is how long until the time a Zhipu 1308 or 1310 names
+// (zhipuResets), read in Beijing's time. Zero when there is none, it isn't
+// a real date, it is written with a zone of its own (resetsWritten reads
+// those), it has passed, or it is over longestWritten off.
+func resetsZhipu(body []byte, now time.Time) time.Duration {
+	m := zhipuResets.FindSubmatch(wordsOf(body))
+	if m == nil {
+		return 0
+	}
+	// cut in its seconds ("20:12:1"), or a zone after it: not this form
+	if after := bytes.TrimLeft(m[7], " "); len(after) > 0 && (after[0] >= '0' && after[0] <= '9' || after[0] == ':' || after[0] == '+' || after[0] == '-' || bytes.HasPrefix(bytes.ToUpper(after), []byte("UTC")) || bytes.HasPrefix(bytes.ToUpper(after), []byte("GMT")) || after[0] == 'Z') {
+		return 0
+	}
+	n := make([]int, 6)
+	for i, g := range m[1:7] {
+		if len(g) > 0 {
+			n[i], _ = strconv.Atoi(string(g))
+		}
+	}
+	y, mo, d, h, mi, sec := n[0], n[1], n[2], n[3], n[4], n[5]
+	t := time.Date(y, time.Month(mo), d, h, mi, sec, 0, zhipuZone)
+	if t.Year() != y || int(t.Month()) != mo || t.Day() != d || t.Hour() != h || t.Minute() != mi || t.Second() != sec {
+		return 0
+	}
+	if w := t.Sub(now); w > 0 && w <= longestWritten {
+		return w
+	}
+	return 0
 }
 
 // resetsInWords: a refusal that says how long until it is back in days,
@@ -568,7 +653,28 @@ var resetsInWords = regexp.MustCompile(`(?i)\bresets? in (?:(\d+)\s*d(?:ays?)?\b
 // resetsAfter is how long the refusal says until it is back (resetsInWords),
 // held to longestWritten. Zero when it doesn't say.
 func resetsAfter(body []byte) time.Duration {
-	m := resetsInWords.FindSubmatch(wordsOf(body))
+	return spanWritten(resetsInWords.FindSubmatch(wordsOf(body)))
+}
+
+// clineModelLimited says c, a provider whose requests reach Cline's API,
+// was refused for one free model's own daily limit (clineFreeLimit).
+func clineModelLimited(c candidate, body []byte) bool {
+	return c.p.ClinePinnable() && clineFreeLimit.Match(wordsOf(body))
+}
+
+// clineBackIn is how long Cline's free-model refusal says until the model
+// is back (tryAgainIn), held to longestWritten. Zero for another refusal,
+// or one that doesn't say.
+func clineBackIn(c candidate, body []byte) time.Duration {
+	if !clineModelLimited(c, body) {
+		return 0
+	}
+	return spanWritten(tryAgainIn.FindSubmatch(wordsOf(body)))
+}
+
+// spanWritten is the days, hours and minutes a match of resetsInWords or
+// tryAgainIn names, held to longestWritten. Zero when it names none.
+func spanWritten(m [][]byte) time.Duration {
 	if m == nil || len(m[1])+len(m[2])+len(m[3]) == 0 {
 		return 0
 	}
@@ -677,6 +783,8 @@ func (s *Server) restAfterMarked(c candidate, status int, header http.Header, bo
 		}
 		if w := resetsAt(body, now); w > 0 {
 			d, r.By = w, "resets"
+		} else if w := clineBackIn(c, body); w > 0 {
+			d, r.By = w, "resets"
 		} else if w := resetsNoted(header, now); w > 0 {
 			d, r.By = w, "resets"
 		} else if t := c.full(now); !t.IsZero() {
@@ -776,6 +884,11 @@ func (s *Server) restAfterMarked(c candidate, status int, header http.Header, bo
 	// models is the model's limit: the others still answer (WorkBuddy's
 	// "您也可以切换其他模型继续使用", #1669)
 	if pooled || unserved || modelBackoff || why == failQuota && resetsWhen.Match(wordsOf(body)) && otherModels.Match(wordsOf(body)) {
+		id = c.restID()
+	}
+	// Cline's daily limit of one free model is that model's: its others,
+	// free or the plan's, still answer (#1398, wuasakura)
+	if why == failQuota && clineModelLimited(c, body) {
 		id = c.restID()
 	}
 	// out of credit, or of a quota, on a model that costs credits where

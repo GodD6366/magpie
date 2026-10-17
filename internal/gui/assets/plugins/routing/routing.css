@@ -10,6 +10,8 @@
 .rt-wires { position: absolute; inset: 0; width: 100%; height: 100%; overflow: visible; pointer-events: none; }
 .rt-wires path { fill: none; stroke: var(--line); stroke-width: 1.5; transition: opacity .3s; }
 .rt-wires path.live { stroke: var(--agent, var(--muted)); stroke-dasharray: 3 5; animation: rtflow .7s linear infinite; }
+/* lit: the way the request shown went, over; only a request in flight flows (#2386) */
+.rt-wires path.lit { stroke: var(--agent, var(--muted)); }
 .rt-wires path.rest { stroke-dasharray: 2 6; opacity: .45; }
 @keyframes rtflow { to { stroke-dashoffset: -8; } }
 /* the magpies, over the nodes: one carries each request out, another
@@ -86,7 +88,8 @@
 .rt-accts li.on { border-color: var(--fg); }
 .rt-accts li.on em { color: var(--fg); }
 .rt-accts li.on .bar i { background: var(--fg); }
-.rt-accts li.on .dot { background: var(--fg); border-color: var(--fg); animation: rtlive 1.8s infinite; }
+.rt-accts li.on .dot { background: var(--fg); border-color: var(--fg); }
+.rt-accts li.now .dot { animation: rtlive 1.8s infinite; }
 @keyframes rtlive { 0% { box-shadow: 0 0 0 0 color-mix(in srgb, var(--fg) 40%, transparent); } 70%, 100% { box-shadow: 0 0 0 6px transparent; } }
 .rt-accts li.low em { color: var(--fg-2); }
 .rt-accts li.rest { border-style: dashed; }
@@ -135,7 +138,7 @@
 .rt-steps li.wait::before { animation: rtlive 1.8s infinite; }
 .rt-off { padding: 18px 4px; text-align: center; color: var(--muted); font-size: 13px; }
 @media (prefers-reduced-motion: reduce) {
-  .rt-accts li.on .dot, .rt-wires path.live, .rt-sky .pkt.held, .rt-accts li.new, .rt-accts li.hit, .rt-hub.tick, .rt-src.tick, .rt-cap.in, .rt-steps li.wait::before, .masking .pii { animation: none; }
+  .rt-accts li.now .dot, .rt-wires path.live, .rt-sky .pkt.held, .rt-accts li.new, .rt-accts li.hit, .rt-hub.tick, .rt-src.tick, .rt-cap.in, .rt-steps li.wait::before, .masking .pii { animation: none; }
   .rt-accts li { transition: none; }
 }
 /* The narrow and wide layouts below go by a box's own width, as container
@@ -295,6 +298,12 @@ button.rt-session { cursor: pointer; }
 :where(.rt-col.max440) .rt-purpose { max-width: 150px; }
 /* Keep the compact row on wide lists. In a narrow column the destination
    and the metrics go under the model; individual metrics stay whole. */
+/* Where a request's numbers don't fit their column on one line (set by
+   metaFit), they go on a line of their own under where it went, which keeps
+   its room (#2288, xishuchkui-code). */
+:where(.rt-col.meta-under:not(.max760)) .rt-reqs { grid-template-columns: auto fit-content(45%) minmax(0, 1fr); }
+:where(.rt-col.meta-under:not(.max760)) .rt-req { row-gap: 2px; }
+:where(.rt-col.meta-under:not(.max760)) .rt-req .meta { grid-column: 2 / -1; grid-row: 2; justify-content: flex-start; }
 :where(.rt-col.max760) .rt-reqs { grid-template-columns: auto minmax(0, 1fr); }
 :where(.rt-col.max760) .rt-req { row-gap: 2px; }
 :where(.rt-col.max760) .rt-req .asked { grid-column: 2; grid-row: 1; }
@@ -405,7 +414,8 @@ button.rt-session { cursor: pointer; }
 /* a classifier that failed (#1929): a dot, never a stripe */
 .rt-group .mem.clsfail { color: var(--amber); }
 .rt-group .mem.clsfail .dot { display: inline-block; width: 6px; height: 6px; border-radius: 50%; background: currentColor; margin-right: 6px; vertical-align: 1px; }
-.rt-patadd { display: flex; gap: 6px; align-items: center; margin-top: 4px; }
+.rt-patadd { display: flex; gap: 6px; align-items: center; }
+.rt-pats .fbl:not(:empty) + .rt-patadd { margin-top: 4px; }
 .rt-patadd input { flex: 1; min-width: 0; }
 .rt-group .tags { display: flex; gap: 4px; flex: none; }
 .rt-group .tag { font-size: 11px; line-height: 18px; padding: 0 8px; border-radius: 999px; box-shadow: inset 0 0 0 1px var(--line); color: var(--muted); white-space: nowrap; }
@@ -440,8 +450,9 @@ button.rt-session { cursor: pointer; }
 .rt-gedit { cursor: default; scroll-margin-top: 12px; }
 .rt-gedit .ehead.fold { cursor: pointer; }
 .rt-gedit .segs { max-width: 100%; }
-.rt-gedit .ctx-wrap { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
-.rt-gedit .ctx-wrap .hint { flex-basis: 100%; }
+/* its hint as close under the choices as every other row's: 4px */
+.rt-gedit .ctx-wrap { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 8px; }
+.rt-gedit .ctx-wrap .hint { flex-basis: 100%; margin-top: 0; }
 .rt-gedit .gsuffix { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 8px; }
 .rt-gedit .gsuffix .hint { overflow-wrap: anywhere; }
 .rt-gedit .ctx-wrap input.ctx-in { width: 96px; flex: none; }
@@ -553,7 +564,6 @@ button.rt-session { cursor: pointer; }
 .rt-gadds > [hidden] { display: none; }
 /* a group's rules, each one line read as a sentence: the conditions it
    has, → and the model it sends that turn to first; its acts under ⋯ */
-.rt-rules .fbl:empty { display: none; }
 .rt-rules .fbl:not(:empty) + .rt-gadds { margin-top: 2px; }
 /* the rules share their columns (each rule a subgrid of the list), so
    every rule's → and model start at one x: the number, the conditions

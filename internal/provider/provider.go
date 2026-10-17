@@ -272,6 +272,13 @@ type Provider struct {
 	// See SkipsRedaction.
 	Unredacted bool `json:"unredacted,omitempty"`
 
+	// InsecureTLS has magpie take the certificate of the provider's own
+	// HTTPS host as it is, unchecked (#2383, fangzhengjin: a vLLM on the
+	// LAN, Ollama behind a self-signed cert). Only a provider the user
+	// added takes it (TakesInsecureTLS), and only for the hosts of its own
+	// base URLs (UncheckedHosts); see Via.
+	InsecureTLS bool `json:"insecureTLS,omitempty"`
+
 	// Proxy is the proxy magpie's requests to this provider go through
 	// (#237: Codex through one, a vendor at home without): "" follows
 	// the global one (Settings' Proxy, the environment's, the system's),
@@ -313,6 +320,10 @@ type Provider struct {
 	// magpie knows need neither.
 	BalanceURL  string `json:"balanceURL,omitempty"`
 	BalancePath string `json:"balancePath,omitempty"`
+	// BalanceMethod is how BalanceURL is asked: "" (or GET), or POST with
+	// no body, for an endpoint that answers only a POST (#2368). Any other
+	// is refused when the balance is read (balanceMethodOf).
+	BalanceMethod string `json:"balanceMethod,omitempty"`
 	// BalanceToken is what a vendor tells the whole account's balance to,
 	// where a key is told only what is left on itself: AiHubMix's system
 	// access token, or a new-api relay's for its /api/user/self named in
@@ -661,6 +672,9 @@ func withPicks(a, pk Provider) Provider {
 	a.MaxConcurrency, a.PinUpstream = pk.MaxConcurrency, pk.PinUpstream
 	a.AccountConcurrency, a.QueueLimit, a.QueueWait = pk.AccountConcurrency, pk.QueueLimit, pk.QueueWait
 	a.MaxRPM = pk.MaxRPM
+	// the extra body fields written for it, which a ChatGPT account's
+	// requests take (WithExtraBody, magpie-releases#18)
+	a.ExtraBody = pk.ExtraBody
 	return a
 }
 
@@ -792,6 +806,9 @@ func Save(p Provider) error {
 			}
 			return errors.New("a provider needs a base URL")
 		}
+		if p.InsecureTLS && !p.TakesInsecureTLS() {
+			return fmt.Errorf("%s is a preset's: only a provider you added with your own base URL can skip the certificate check", p.Name)
+		}
 		if strings.Contains(p.Decide, WorkspaceID) {
 			return errors.New("Bailian's decision model is asked at your workspace's host: give its workspace ID (workspace=… or the editor's Workspace ID), or pick the Token Plan")
 		}
@@ -813,6 +830,13 @@ func Save(p Provider) error {
 		if p.Was == nil {
 			p.Was = was.Was
 		}
+		if sameStored(*was, p) {
+			// Save pressed on an editor left as it was: providers.json
+			// would be written byte for byte as it is, and its write
+			// handed the catalog to every agent again (agent.SyncCatalog),
+			// seconds of CPU with many agents set up (#1962, witt-bit)
+			return nil
+		}
 		f.Providers[i] = p
 	} else {
 		f.Providers = append(f.Providers, p)
@@ -826,6 +850,16 @@ func Save(p Provider) error {
 		syncClaudeProxyEnvNow()
 	}
 	return nil
+}
+
+// sameStored is whether a and b are written to providers.json alike.
+func sameStored(a, b Provider) bool {
+	x, err := json.Marshal(a)
+	if err != nil {
+		return false
+	}
+	y, err := json.Marshal(b)
+	return err == nil && bytes.Equal(x, y)
 }
 
 // listedWith is what p.PickedFrom is saved as: none without picks; what was
@@ -1104,7 +1138,12 @@ func Delete(id string) error {
 		return fmt.Errorf("no provider %q", id)
 	}
 	f.Providers = keep
-	return store(f)
+	if err := store(f); err != nil {
+		return err
+	}
+	// its StepFun sign-in goes with it, not to a provider added later
+	// under the same id
+	return forgetStepFun(id)
 }
 
 // keyOptional is true for local servers, which usually have no key.
@@ -1193,7 +1232,7 @@ func normalize(p Provider) Provider {
 	if (p.Preset == OMLXPreset || p.Preset == MLXServePreset) && p.Decide == "" && p.Chat != "" {
 		p.Decide = p.Chat
 	}
-	if p.Routing != Ordered && p.Routing != Rotate && p.Routing != LeastUsed && p.Routing != Pace && p.Routing != Weighted {
+	if p.Routing != Ordered && p.Routing != Rotate && p.Routing != LeastUsed && p.Routing != Pace && p.Routing != Weighted && !PluginRouting(p.Routing) {
 		p.Routing = ""
 	}
 	if !slices.Contains(Affinities, p.Affinity) {
@@ -1527,8 +1566,7 @@ func (p Provider) Where() string {
 // which routes and caches by conversation and turns away requests that do
 // not name one in x-opencode-session.
 func (p Provider) IsOpenCode() bool {
-	h := p.Host()
-	return h == "opencode.ai" || strings.HasSuffix(h, ".opencode.ai")
+	return OpenCodeURL("//" + p.Host()) // its port, if it names one, aside
 }
 
 // IsBedrock reports whether the provider is Amazon Bedrock's runtime: made
