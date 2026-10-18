@@ -104,7 +104,10 @@ function routingPage(part) {
   const steps = el("ol", "rt-steps");
   // what the request's prompt held: its context window (context.js)
   const ctxBox = el("div", "rt-ctx");
-  log.append(logHead, steps, ctxBox);
+  // the request's own request and response, opened from its head
+  const bodies = el("div", "rt-bodies");
+  bodies.hidden = true;
+  log.append(logHead, steps, bodies, ctxBox);
   const off = el("div", "none rt-off");
   // over the stage while a replay plays: the time it is replaying, which
   // requests are in flight then, and where it is among them
@@ -556,6 +559,7 @@ function routingPage(part) {
     if (!f) return t("Nothing could take {model}.", { model: r.model });
     const w = who(f);
     if (r.sealedTask && r.leadAccount === f.id) return t("{who} goes first: it answered the parent agent and may be needed to read this encrypted task.", { who: w });
+    if (r.compaction && r.order.length === 1) return t("{who} compacted this conversation natively, and only it can read that compaction, so the conversation stays on it: other accounts aren't asked. Start a new conversation to use them.", { who: w });
     if (r.order.length === 1) {
       if (f.rest) return t("{who} is the only one, so it's tried though it is resting.", { who: w });
       return f.kind === "account" ? t("{who} is the only account on for {model} — nothing to choose between.", { who: w, model: wentOn(r) })
@@ -845,6 +849,10 @@ function routingPage(part) {
     if (tr.fixed) return r.effort && r.effort !== tr.effort
       ? t("{level} reasoning, fixed on this model in the group; {agent} asked for {asked}", { level: tr.effort, agent, asked: r.effort })
       : t("{level} reasoning, fixed on this model in the group", { level: tr.effort });
+    // the rule that sent the turn here asks its model for one (#2633)
+    if (tr.ruleEffort) return r.effort && r.effort !== tr.effort
+      ? t("{level} reasoning, set by the rule; {agent} asked for {asked}", { level: tr.effort, agent, asked: r.effort })
+      : t("{level} reasoning, set by the rule", { level: tr.effort });
     if (tr.picked) return r.effort && r.effort !== tr.effort
       ? t("{level} reasoning, picked for the turn; {agent} asked for {asked}", { level: tr.effort, agent, asked: r.effort })
       : t("{level} reasoning, picked for the turn", { level: tr.effort });
@@ -861,9 +869,70 @@ function routingPage(part) {
     const agent = agentName(r.agent);
     return said + (/[。！？]$/.test(said) ? "" : " ") + (tr.fixed
       ? t("The group fixes this model at {fixed} reasoning, in place of the {asked} {agent} asked for.", { fixed: tr.fixed, asked: r.effort, agent })
+      : tr.ruleEffort
+      ? t("The rule asks this model for {level} reasoning, in place of the {asked} {agent} asked for.", { level: tr.effort, asked: r.effort, agent })
       : tr.picked
       ? t("The turn's pick replaced the {asked} {agent} asked for.", { asked: r.effort, agent })
       : t("{level} is the model's nearest to the {asked} {agent} asked for.", { level: tr.effort, asked: r.effort, agent }));
+  }
+
+  // where a try's time went (gateway.TryNet, Discord Magic_zero: the
+  // gateway looked slow): magpie's own, the network's on the way out, and
+  // the vendor's, from the try's start to its end, the parts that took
+  // none left out. Only a try whose request magpie sent itself has it: one
+  // that went out some other way (a plugin's own fetch), or a trace from
+  // before magpie measured it, says nothing more than the time it took.
+  const ms1 = (n) => n < 10 ? t("{n} ms", { n: (Math.round(n * 10) / 10).toString() }) : took(Math.round(n));
+  function timeParts(tr) {
+    const n = tr.net, out = [], add = (who, label, v) => { if (v >= 0.1) out.push({ who, label, v }); };
+    if (!n) return out;
+    add("magpie", "Waiting for a slot", tr.queued || 0);
+    add("magpie", "In magpie", n.own || 0);
+    add("net", "Requests before it", n.before || 0);
+    // what's left of the pool's wait once a dial is out is a rounding
+    if ((n.pool || 0) >= 1) add("net", "Waiting for a connection", n.pool);
+    add("net", "DNS", n.dns || 0);
+    add("net", "Connecting", n.connect || 0);
+    add("net", "TLS", n.tls || 0);
+    add("net", "Sending", n.send || 0);
+    add("vendor", "Vendor (first byte)", n.wait || 0);
+    const head = n.head || 0;
+    if (tr.ttft > 0) {
+      add("vendor", "First token", tr.ttft - head);
+      add("vendor", "Streaming", (tr.ms || 0) - tr.ttft);
+    } else add("vendor", "Reading the reply", (tr.ms || 0) - head);
+    return out;
+  }
+  const WHO = { magpie: "magpie {ms}", net: "network {ms}", vendor: "vendor {ms}" };
+  function timeSaid(tr) {
+    const parts = timeParts(tr);
+    if (!parts.length) return "";
+    const sum = {};
+    for (const p of parts) sum[p.who] = (sum[p.who] || 0) + p.v;
+    const whose = Object.keys(WHO).filter((k) => sum[k] > 0).map((k) => t(WHO[k], { ms: ms1(sum[k]) }));
+    return [t("Where the time went"), whose.join(" · "), parts.map((p) => t(p.label) + " " + ms1(p.v)).join(" · ")].filter(Boolean).join(": ");
+  }
+  function timeElement(tr) {
+    const parts = timeParts(tr), total = parts.reduce((a, p) => a + p.v, 0) || 1;
+    const box = el("div", "rt-time");
+    const head = el("div", "rt-time-head", t("Where the time went"));
+    const sum = {};
+    for (const p of parts) sum[p.who] = (sum[p.who] || 0) + p.v;
+    for (const k of Object.keys(WHO)) if (sum[k] > 0) head.append(el("span", "rt-time-who " + k, t(WHO[k], { ms: ms1(sum[k]) })));
+    const bar = el("div", "rt-time-bar");
+    bar.setAttribute("aria-hidden", "true");
+    const list = el("ul", "rt-time-parts");
+    for (const p of parts) {
+      const seg = el("span", p.who);
+      seg.style.flexGrow = String(p.v / total);
+      seg.title = t(p.label) + " " + ms1(p.v);
+      bar.append(seg);
+      const li = el("li", p.who);
+      li.append(el("span", "k", t(p.label)), el("span", "v", ms1(p.v)));
+      list.append(li);
+    }
+    box.append(head, bar, list);
+    return box;
   }
 
   // what the gateway adds to WorkBuddy's "unapproved channel" refusal
@@ -1734,12 +1803,13 @@ function routingPage(part) {
   // the log is drawn again only when what it says changes: it is asked to
   // on every trace update (#308)
   let logR = null, headKey = "", stepsKey = "";
+  let bodiesFor = 0, bodiesKey = ""; // the request opened to its bodies (renderBodies)
   function renderLog() {
     const r = logR = pinned || cur;
     log.hidden = !r;
     if (!r) return;
     const on = () => listed().filter((x) => x.id >= logR.id);
-    const head = JSON.stringify([document.documentElement.lang, !!rp, pinned?.id, r.id, r.time, r.done, !!pinned && on().length > 1]);
+    const head = JSON.stringify([document.documentElement.lang, !!rp, pinned?.id, r.id, r.time, r.done, !!pinned && on().length > 1, bodiesFor === r.id]);
     if (headKey !== head) {
       headKey = head;
       logHead.replaceChildren(
@@ -1750,7 +1820,11 @@ function routingPage(part) {
         const usage = el("button", "text", t("View usage"));
         usage.dataset.feature = "usage"; // it opens on the Usage page
         usage.onclick = () => window.openUsageRoute(logR);
-        logHead.append(usage);
+        const open = bodiesFor === r.id;
+        const wire = el("button", "text rt-bodies-b", t(open ? "Hide request and response" : "Request and response"));
+        wire.setAttribute("aria-expanded", String(open));
+        wire.onclick = () => { bodiesFor = bodiesFor === logR.id ? 0 : logR.id; renderLog(); };
+        logHead.append(wire, usage);
         const again = el("button", "text", t("Replay"));
         again.onclick = () => replay([logR], pinned);
         logHead.append(again);
@@ -1769,7 +1843,68 @@ function routingPage(part) {
     }
     renderSteps(r);
     holdStory();
+    renderBodies(r);
     renderCtx(r);
+  }
+  // A request's request and response (Fate on Discord: a request on this
+  // page, a Codex prediction say, couldn't be opened to what was sent and
+  // what came back). The gateway's recent calls keep the last 40 calls'
+  // bodies, cut at 256 KB and in memory only, read when asked as the
+  // Gateway page's are (#1521); once they have let the request go, the
+  // request archive's copy, when it was on. Nothing more is recorded for
+  // it: without the archive an older request says how to keep them.
+  const bodiesGot = new Map(); // route id → { busy } | its bodies | { gone } | { error }
+  async function loadBodies(id) {
+    const pending = { busy: true };
+    bodiesGot.set(id, pending);
+    let got;
+    try {
+      const res = await fetch("/api/gateway/call?route=" + encodeURIComponent(id), { cache: "no-store" });
+      if (res.status === 404) got = { gone: true };
+      else if (!res.ok) got = { error: (await res.json().catch(() => null))?.error || res.statusText || String(res.status) };
+      else got = await res.json();
+    } catch (e) {
+      got = { error: e.message };
+    }
+    if (bodiesGot.get(id) !== pending) return;
+    bodiesGot.set(id, got);
+    bodiesKey = "";
+    if (logR) renderBodies(logR);
+  }
+  function renderBodies(r) {
+    const open = !rp && r.done && bodiesFor === r.id;
+    bodies.hidden = !open;
+    if (!open) {
+      if (bodiesKey) { bodiesKey = ""; bodies.replaceChildren(); }
+      return;
+    }
+    if (!bodiesGot.has(r.id)) loadBodies(r.id);
+    const got = bodiesGot.get(r.id);
+    const key = JSON.stringify([document.documentElement.lang, r.id, r.archive || "", got.busy ? "busy" : got.gone ? "gone" : got.error ? "error" : "in"]);
+    if (key === bodiesKey) return;
+    bodiesKey = key;
+    if (got.busy) { bodies.replaceChildren(el("div", "none", t("Fetching…"))); return; }
+    if (got.error) {
+      const again = el("button", "text", t("Try again"));
+      again.onclick = () => { bodiesGot.delete(r.id); bodiesKey = ""; renderBodies(logR); };
+      bodies.replaceChildren(el("div", "call-archive-err", t(got.error)), again);
+      return;
+    }
+    if (got.gone) {
+      if (r.archive) {
+        const draw = () => { if (bodiesFor === r.id) bodies.replaceChildren(archivePanel(r.archive, "rt|" + r.id, draw)); };
+        draw();
+        return;
+      }
+      bodies.replaceChildren(el("p", "rt-bodies-gone", t("magpie keeps the request and response of only the last 40 requests, until it quits. To keep every request's, turn on Request archive at the top of Usage › Requests.")));
+      return;
+    }
+    const grid = el("div", "call-details");
+    grid.append(
+      callBodyPanel("Request Body", got.requestBody, got.requestTruncated, undefined, "rt|" + r.id + "|req"),
+      callBodyPanel("Response Body", got.responseBody, got.responseTruncated, "rt|" + r.id),
+    );
+    bodies.replaceChildren(grid);
   }
   // holdStory keeps the story of the live request, its head and its lines,
   // as tall as it has been since the reader began following live, at this
@@ -1890,6 +2025,9 @@ function routingPage(part) {
     for (const a of asides(r)) items.push([a, "aside"]);
     r.tries.forEach((tr, i) => {
       items.push([tryWhy(r, i), tr.done ? (tryOk(tr) ? "ok" : "bad") : "wait"]);
+      // where its time went, once it is done
+      const when = tr.done && timeSaid(tr);
+      if (when) items.push([when, "aside time", tr]);
       // each model Copilot's Auto picked for it, where from, and whether
       // Copilot refused it, on which API and with Auto's session token or
       // without (#256)
@@ -1939,6 +2077,7 @@ function routingPage(part) {
       li.append(...(/^(why|ok|bad|wait|aside)$/.test(c) ? logoed(s, r) : [s]));
       if (c === "aside kind") li.prepend(kindTag(r), " ");
       if (c === "swap") li.prepend(swapTag(tr), " ");
+      if (c === "aside time") li.replaceChildren(timeElement(tr));
       return li;
     }));
     keptIcons = null;
@@ -3354,7 +3493,32 @@ function routingPage(part) {
   const gNames = el("div", "rt-gnames");
   // the groups go with the routing groups built-in plugin; the pools stay
   for (const n of [gHead, gFound, gNames, gList]) n.dataset.feature = "groups";
-  gsec.append(gHead, gFound, gNames, gList, pHead, pList);
+  // and off (the Essentials preset leaves it off), where they were
+  // the page says so and turns it on (bigbenniu on X: past the requests
+  // there was nothing, and no word of where New group had gone). The
+  // groups magpie finds route all the same.
+  const gOff = el("div", "rt-goff");
+  gOff.dataset.featureOff = "groups";
+  const gOn = el("button", "text rt-goffon", t("Turn on routing groups"));
+  gOn.type = "button";
+  gOn.onclick = async () => {
+    gOn.disabled = true;
+    try {
+      const next = await api("plugins/builtin", { id: "groups", on: true });
+      if (state.settings) state.settings.builtins = next;
+      applyFeatures(next);
+      status(t("Routing groups are on"), "ok", 1500);
+      loadGroups();
+    } catch (err) {
+      status(t(err.message), "err");
+    } finally {
+      gOn.disabled = false;
+    }
+  };
+  const gOffBox = el("div", "list rt-goffbox");
+  gOffBox.append(el("div", "rt-goffwhy", t("Routing groups are off in Plugins › Built-in: the groups magpie finds, one model several providers serve, still route, but your own can't be made or changed here.")), gOn);
+  gOff.append(el("div", "row-head", el("span", "label", t("Routing groups"))), gOffBox);
+  gsec.append(gHead, gFound, gNames, gList, gOff, pHead, pList);
   // after the requests: a request picked in the list plays on the stage,
   // so the list sits right under it
   more.append(gsec);
@@ -3459,6 +3623,7 @@ function routingPage(part) {
     try { next = groupsFrom(await api("groups")); } catch { return; }
     if (quiet === true && groups && JSON.stringify(next) === JSON.stringify(groups)) return;
     groups = next;
+    if (pBox) renderPanel();
     if (headOf) header(...headOf);
     if (!gEdit && !gsec.contains(document.activeElement)) renderGroups(); // not under someone's hands
   }
@@ -4010,7 +4175,7 @@ function routingPage(part) {
     if (g.firstToken > 0 && !manual) tags.append(el("span", "tag", t("Next after {n} without a first token", { n: took(g.firstToken * 1000) })));
     if (g.rules?.length) {
       const r = el("span", "tag" + (manual ? " idle" : ""), t(g.rules.length === 1 ? "1 rule" : "{n} rules", { n: g.rules.length }));
-      r.title = (manual ? t("The rules wait while you pick the model by hand.") + "\n" : "") + g.rules.map((x, i) => `${i + 1}. ${ruleText(x)} → ${x.pause ? t("pause") + " " : ""}${memberLabel(g, x.use)}`).join("\n");
+      r.title = (manual ? t("The rules wait while you pick the model by hand.") + "\n" : "") + g.rules.map((x, i) => `${i + 1}. ${ruleText(x)} → ${x.pause ? t("pause") + " " : ""}${memberLabel(g, x.use)}${x.useEffort ? " · " + t("{level} reasoning", { level: x.useEffort }) : ""}`).join("\n");
       tags.append(r);
     }
     if (g.disabled) tags.append(el("span", "tag idle", t("switched off")));
@@ -4658,7 +4823,7 @@ function routingPage(part) {
     // (the owner, 10-14: every rule showed all ten conditions, empty —
     // "用户要输入、填写这么多东西，太恐怖了"; CherryL1quor on X took Jev for
     // the effort alone while the intent sat among the others).
-    const RULE_PAUSE = "M6 4.5v7M10 4.5v7", RULE_SEND = "M3 8h9M8.5 4.5 12 8l-3.5 3.5";
+    const RULE_PAUSE = "M6 4.5v7M10 4.5v7", RULE_SEND = "M3 8h9M8.5 4.5 12 8l-3.5 3.5", RULE_EFFORT = "M3 11.5a5 5 0 0 1 10 0M8 11.5l2.5-3.5";
     // how a part works, said under an ⓘ beside it rather than in a
     // paragraph under it: on hover, and read out with focus
     const infoTip = (text) => {
@@ -4971,7 +5136,7 @@ function routingPage(part) {
           r.pause = v === "pause";
           // what a pause doesn't take is cleared, not kept out of sight
           if (r.pause) {
-            Object.assign(r, { tokens: 0, images: false, effort: "", intent: "", compact: false });
+            Object.assign(r, { tokens: 0, images: false, effort: "", intent: "", compact: false, useEffort: "" });
             for (const [k, , p] of COND_KINDS) if (!p) openedOf(r).delete(k);
           }
           drawRules();
@@ -4984,7 +5149,22 @@ function routingPage(part) {
           ], setAct, "pause");
           then.append(act);
         }
-        then.append(ub, hint);
+        then.append(ub);
+        // the reasoning the rule asks its model for (#2633): an intent
+        // picks the model and its effort as a pair. Unset, the model is
+        // asked as the agent asked, and nothing is drawn; it is set from
+        // the rule's ⋯ and shown beside the model once it is
+        const pickEffort = (anchor, ev) => pickFrom("reasoning", anchor, ev, [
+          { value: "", label: t("As the agent asks"), note: t("the rule sets none") },
+          ...EFFORTS.map((v) => ({ value: v, label: fixedWords(v), note: t("whatever the agent asks") })),
+        ], (v) => { r.useEffort = v; drawRules(); }, r.useEffort || "");
+        if (!r.pause && r.useEffort) {
+          const eb = el("button", "rt-cond on rt-useeffort", fixedWords(r.useEffort));
+          eb.title = t("The rule asks the model for {level} reasoning whatever the agent asks, at the model's nearest level; a model whose levels aren't known is asked as the agent asked", { level: r.useEffort });
+          eb.onclick = (ev) => pickEffort(eb, ev);
+          then.append(eb);
+        }
+        then.append(hint);
         // the rule's own acts, under ⋯ as on the groups' cards: its place
         // in the order, sending or pausing, and taking it out
         const more = el("button", "icon rt-rmore");
@@ -5001,6 +5181,7 @@ function routingPage(part) {
           openRowMenu(more, [
             { name: "Move up", icon: MOVE_UP, off: i === 0, run: () => move(i - 1) },
             { name: "Move down", icon: MOVE_DOWN, off: i === d.rules.length - 1, run: () => move(i + 1) },
+            ...(r.pause ? [] : [{ name: r.useEffort ? "Change its reasoning" : "Set its reasoning", icon: RULE_EFFORT, sep: true, run: (ev) => pickEffort(more, ev) }]),
             r.pause
               ? { name: "Send to the model instead", icon: RULE_SEND, sep: true, run: () => setAct("send") }
               : { name: "Pause the model instead", icon: RULE_PAUSE, sep: true, run: () => setAct("pause") },
@@ -5014,7 +5195,7 @@ function routingPage(part) {
       focusCond = null;
       focus?.();
     };
-    const newRule = () => ({ use: d.members[d.members.length - 1], pause: false, tokens: 0, images: false, effort: "", agents: [], intent: "", compact: false, folders: [], exceptFolders: [], time: null });
+    const newRule = () => ({ use: d.members[d.members.length - 1], pause: false, useEffort: "", tokens: 0, images: false, effort: "", agents: [], intent: "", compact: false, folders: [], exceptFolders: [], time: null });
     // a new rule asks for an intent first, its box focused and the
     // classifier shown (Jev picked when there is one); any other condition
     // is a + away, and the intent an × away
@@ -5329,7 +5510,13 @@ function routingPage(part) {
     try { today = await api("usage?period=today"); } catch { return; }
     renderPanel();
   }
-  window.panelRoutingShown = () => { if (pShown() && performance.now() - todayAt > 5e3) loadToday(); pDraw(); };
+  window.panelRoutingShown = () => {
+    if (pShown() && performance.now() - todayAt > 5e3) loadToday();
+    // a group switched on the Routing page or by `magpie group pick`
+    // since: the tab shows the model it goes to now
+    if (pShown()) loadGroups(true);
+    pDraw();
+  };
 
   // ---- the stage: agents → magpie → providers ----
   // Three a side at most, each kept where it is while it stays: one that
@@ -5560,6 +5747,8 @@ function routingPage(part) {
     open.onclick = (e) => { api("window/main?view=routing", {}); e.currentTarget.blur(); };
     head.append(el("span", "rt-livedot"), sum, el("span", "grow"), open);
     const out = [head];
+    const picks = panelPicks();
+    if (picks) out.push(picks);
     const rs = [...routes.values()].sort((a, b) => b.id - a.id).slice(0, P_ROWS);
     if (!offMsg && loaded && rs.length) out.push(pStage);
     if (offMsg) out.push(el("p", "pr-none", t(offMsg)));
@@ -5578,6 +5767,47 @@ function routingPage(part) {
     pDraw();
     pWake();
     fit();
+  }
+  // a Manual group's model, switched here as its card's radios do (#2489,
+  // Jerell.OvO on Discord): CC Switch's one provider on at a time, from
+  // the tray. A row a group of two or more that is on, its picked
+  // member a button that opens the members as a menu.
+  function panelPicks() {
+    const gs = (groups?.groups || []).filter((g) => g.routing === "manual" && !g.hidden && !g.disabled && g.members.length > 1);
+    if (!gs.length) return null;
+    const box = el("div", "pr-picks");
+    for (const g of gs) {
+      const picked = g.picked || (g.members.includes(g.pick) ? g.pick : g.members[0]);
+      const row = el("div", "pr-pick");
+      row.dataset.id = g.id;
+      const b = el("button", "sess-pick set");
+      b.type = "button";
+      b.setAttribute("aria-haspopup", "menu");
+      b.setAttribute("aria-expanded", "false");
+      b.setAttribute("aria-label", t("Model every request goes to") + " · " + g.name);
+      b.title = t("Every request goes to {name}", { name: memberLabel(g, picked) });
+      b.append(el("span", "", memberName(picked)), svg(CHEV, 10, 1.6));
+      b.onclick = (e) => {
+        e.stopPropagation();
+        if (b.classList.contains("open")) return closeProtoMenu();
+        openProtoMenu(b, g.members.map((id) => {
+          const info = g.memberInfo?.find((x) => x.id === id);
+          const note = [memberNote(id), fastIn(g, id) && t("fast"), info && !info.ready && t("no provider serves it now")].filter(Boolean).join(" · ");
+          return { v: id, name: memberName(id), literalName: true, note, title: memberLabel(g, id) };
+        }), picked, async (id) => {
+          closeProtoMenu();
+          if (id === picked) return;
+          try {
+            groups = groupsFrom(await api("groups/pick", { id: g.id, pick: id }));
+            renderPanel();
+            load(); // the gateway's model list, the agents' pickers
+          } catch (err) { status(err.message, "err"); }
+        }, "Model every request goes to", "", "right");
+      };
+      row.append(el("span", "pr-gname", g.name), b);
+      box.append(row);
+    }
+    return box;
   }
   function panelRow(r) {
     const [, how, tr] = outcome(r);

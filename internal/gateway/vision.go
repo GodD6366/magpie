@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -46,9 +47,11 @@ var visionTimeout, visionWaitMost = 3 * time.Minute, 10 * time.Minute
 // visionParallel is how many images of a request are described at once.
 const visionParallel = 4
 
-// sightsKept is how many descriptions are kept: an agent sends a
-// conversation's images again every turn.
-const sightsKept = 256
+// sightsKept is how many descriptions are kept, the least recently used
+// dropped first: an agent sends a conversation's images again every turn,
+// and a long Computer Use one holds hundreds of screenshots (fflake33).
+// A description is a few kilobytes.
+const sightsKept = 2048
 
 const visionSystem = `You describe images for an AI model that cannot see them. It will answer the user from your description alone, so leave nothing out that it may need.
 - Transcribe all text exactly as written, keeping its layout: code, terminal output, error messages, logs, UI labels, menus, file names, numbers.
@@ -141,6 +144,26 @@ func missingSeerNote() string {
 		return fmt.Sprintf("; the Image recognition model picked in magpie's Settings, %q, isn't set up any more: pick another in Settings → Models → Image recognition", v)
 	}
 	return ""
+}
+
+// textOnlyNote is what a request turned away for its image says of why
+// magpie takes the model for text-only and where that is changed, so the
+// reader turns on the model's switch rather than trying another model or
+// reinstalling the agent (KimYx0207 on X, over mark_li21's Codex paste): the
+// user's own answer, else what the provider's list says; for a group, that
+// none of its members is marked as taking images.
+func textOnlyNote(p provider.Provider, model string, group string) string {
+	if group != "" {
+		return fmt.Sprintf("; no model in the group %s is marked as taking images: turn on Accepts images for one that does, in its provider's Names & levels in magpie", group)
+	}
+	name := p.Name
+	if name == "" {
+		name = p.ID
+	}
+	if v, ok := provider.ImageOverride(p.ID, model); ok && !v {
+		return fmt.Sprintf("; Accepts images is turned off for it in magpie, in Providers → %s → Names & levels", name)
+	}
+	return fmt.Sprintf("; %s's model list marks it as not taking images: if it does, turn on Accepts images for it in magpie, in Providers → %s → Names & levels", name, name)
 }
 
 // noSeerNote is what a request turned away for an image says of why no
@@ -272,6 +295,12 @@ func (s *Server) describe(ctx context.Context, model, src string) (string, error
 	key := hex.EncodeToString(sum[:])
 	s.sightMu.Lock()
 	if e, ok := s.sights[key]; ok {
+		// used again, so the last to go: a long conversation's first
+		// images, still sent every turn, outlast those of conversations
+		// that have ended
+		if i := slices.Index(s.sightOrder, key); i >= 0 {
+			s.sightOrder = append(append(s.sightOrder[:i:i], s.sightOrder[i+1:]...), key)
+		}
 		s.sightMu.Unlock()
 		select {
 		case <-e.done:

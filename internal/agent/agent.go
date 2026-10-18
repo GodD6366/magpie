@@ -70,6 +70,11 @@ type Option struct {
 	// by its address (provider.OwnFast, #1615), asked for there as OpenAI's
 	// priority, which the provider may or may not serve
 	OwnFast bool `json:"ownFast,omitempty"`
+	// UltraOK: an account offers the model as Ultrafast (provider.CanUltra,
+	// #1954), so the fast switch has a third setting; Ultra is whether it
+	// is on (provider.IsUltraPick)
+	UltraOK bool `json:"ultraOk,omitempty"`
+	Ultra   bool `json:"ultra,omitempty"`
 
 	// own: served on the agent's own sign-in (viaMagpie), for Same
 	own bool
@@ -282,6 +287,11 @@ type Agent struct {
 	// (omp's, when PI_CODING_AGENT_DIR points it at Pi's): that it is there
 	// says nothing of this agent.
 	dirShared bool
+	// shared, when set, is the name of what the agent keeps in a folder its
+	// vendor's other app reads and writes the same way: Cursor CLI's
+	// ~/.cursor (MCP servers, skills, hooks, chats) is the Cursor editor's
+	// too, so the Library and Sessions call it Cursor (SharedName).
+	shared string
 	// pathOwn, when set, says whether the file at Path is this agent's,
 	// not one another tool wrote there first: a JetBrains plugin's
 	// settings.json in Qoder CN's folder (#1495).
@@ -312,6 +322,26 @@ var Running = func(patterns ...string) bool {
 		}
 	}
 	return false
+}
+
+// SharedName is the agent's name over what it keeps where another app of
+// its vendor's reads it too (the Library's MCP servers and skills, the
+// chats Sessions lists): Cursor for Cursor CLI, whose ~/.cursor the Cursor
+// editor shares; Name for any other.
+func (a *Agent) SharedName() string {
+	if a.shared != "" {
+		return a.shared
+	}
+	return a.Name
+}
+
+// SharedHere reports whether the folder the agent shares with its vendor's
+// other app is here (Cursor CLI's ~/.cursor, made by the Cursor editor),
+// whether the agent is or not. The agent isn't Detected for it (dirShared),
+// but what the other app reads there too, the Library's MCP servers and
+// skills, is still given.
+func (a *Agent) SharedHere() bool {
+	return a.shared != "" && a.WSL == "" && a.Dir != "" && !Taken(a.Dir) && agentDir(a.Dir)
 }
 
 // Detected reports whether the agent seems to be installed or configured.

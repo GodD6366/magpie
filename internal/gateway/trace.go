@@ -58,6 +58,10 @@ type Route struct {
 	Rule          *RuleHit     `json:"rule,omitempty"`          // the group's rules for it, when it has any
 	SealedTask    bool         `json:"sealedTask,omitempty"`    // only ChatGPT accounts can read this subagent's task
 	LeadAccount   string       `json:"leadAccount,omitempty"`   // the parent account put first for a sealed task
+	// Compaction: the key or account that sealed the native compaction
+	// the request carries, the only one it went to (#1099): Routing says
+	// so, not that it is the only one on for the model (#2639)
+	Compaction string `json:"compaction,omitempty"`
 	// Subagent is a Codex or Claude Desktop subagent's request put on
 	// the model set for its subagents, or kept on the one asked for and why
 	Subagent *SubagentPick `json:"subagent,omitempty"`
@@ -99,6 +103,14 @@ type Route struct {
 	ReasoningHidden bool  `json:"reasoningHidden,omitempty"`
 	// Flow: the ms its content took to come (Call.Flow)
 	Flow int64 `json:"flow,omitempty"`
+	// Sent: ms from the request to its answering try's request written
+	// to the vendor, and of it Own magpie's, Retried the tries that
+	// failed first, Queued waiting for a slot, as the usage record has
+	// them (Record.Sent); the rest of Sent is connecting and sending
+	Sent    int64 `json:"sent,omitempty"`
+	Own     int64 `json:"own,omitempty"`
+	Retried int64 `json:"retried,omitempty"`
+	Queued  int64 `json:"queued,omitempty"`
 	// Served: the model the reply says answered, as the last try has it;
 	// Swapped: another than the one that try asked for; Routed: that try
 	// asked another magpie's routing group, and Served is its member
@@ -117,6 +129,10 @@ type Route struct {
 	// in (shortFolder), never the whole path; a request that says none
 	// takes its session's, as said last (#1068)
 	Folder string `json:"folder,omitempty"`
+	// Archive: "<date>/<id>", where the request archive keeps the call,
+	// when it was on (Call.Archive), for the page to read its bodies back
+	// once the recent calls have let them go
+	Archive string `json:"archive,omitempty"`
 }
 
 // RouteUsage is one billable attempt's pricing inputs, kept in routing history.
@@ -284,12 +300,15 @@ type Try struct {
 	Picked bool   `json:"picked,omitempty"` // Effort is the turn's pick, in place of the agent's
 	// Fixed: the effort the group's member it went to is fixed at, which
 	// Effort is (fitted to the model's levels) whatever was asked
-	Fixed  string    `json:"fixed,omitempty"`
-	Fast   bool      `json:"fast,omitempty"` // sent in its vendor's fast mode, as the group's member it went to is
-	Start  time.Time `json:"start"`
-	Done   bool      `json:"done"`
-	Status int       `json:"status,omitempty"`
-	Millis int64     `json:"ms,omitempty"`
+	Fixed string `json:"fixed,omitempty"`
+	// RuleEffort: the reasoning the group's rule asks the member for
+	// (Rule.UseEffort, #2633), which Effort is whatever was asked
+	RuleEffort string    `json:"ruleEffort,omitempty"`
+	Fast       bool      `json:"fast,omitempty"` // sent in its vendor's fast mode, as the group's member it went to is
+	Start      time.Time `json:"start"`
+	Done       bool      `json:"done"`
+	Status     int       `json:"status,omitempty"`
+	Millis     int64     `json:"ms,omitempty"`
 	// TTFT: ms from Start to its reply's first content, FirstText to its
 	// first text, when it streamed any (#196)
 	TTFT      int64 `json:"ttft,omitempty"`
@@ -336,6 +355,8 @@ type Try struct {
 	// Queued: ms it waited for one of its key's or account's slots, the
 	// provider's MaxConcurrency out already (concurrency.go)
 	Queued int64 `json:"queued,omitempty"`
+	// Net: where its time went up to its reply's first byte (TryNet)
+	Net *TryNet `json:"net,omitempty"`
 	// Reset: its week used up and nobody else left, one of the account's
 	// Codex resets was spent by itself (the user's setting) — on Who, and
 	// what spending it did — and the request asked again
@@ -364,6 +385,13 @@ type planned struct {
 	// cap set on them, for a conversation that stays strictly on one to
 	// go on there (provider.AffinityStrict, #1797)
 	capped []candidate
+	// unlisted: the accounts left out (in left) as their own list lacks
+	// the model, their rows beside them in unlistedW, kept for the
+	// checkpoint narrowing: the one that sealed a conversation's compaction
+	// is tried for it as the last resort an account whose list lacks the
+	// model is, though no other can read it
+	unlisted  []candidate
+	unlistedW []Weighed
 }
 
 func weighed(c candidate, p provider.Provider, wg weighing, fallback bool, from provider.Protocol) Weighed {

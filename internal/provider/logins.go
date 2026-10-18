@@ -620,7 +620,8 @@ func savedButSignedOut() []Exclusion {
 		if saved[a] > 1 {
 			n = fmt.Sprintf("%d accounts are", saved[a])
 		}
-		out = append(out, Exclusion{Agent: a, SignedOut: true, Users: users[a],
+		_, _, err := readCodexLogin(codexHome(), false)
+		out = append(out, Exclusion{Agent: a, SignedOut: true, Users: users[a], Retry: codexKeychainUnread(err),
 			Why: fmt.Sprintf("%s saved in magpie, and they are only offered beside the account Codex is signed in to. %s", n, codexSignedOutWhy())})
 	}
 	return out
@@ -646,7 +647,7 @@ func codexSignedOutWhy() string {
 	case se.Setting.Mode == "ephemeral":
 		return se.Error() + ". Set cli_auth_credentials_store = \"file\" there and sign in again (codex login)."
 	case se.Cause != nil:
-		return se.Error() + ". Allow magpie when macOS asks for the keychain, or set cli_auth_credentials_store = \"file\" there and sign in again (codex login)."
+		return se.Error() + ". Allow magpie when macOS asks for the keychain (\"Always Allow\" lets /usr/bin/security read that item from then on, so macOS stops asking each time Codex changes it), or set cli_auth_credentials_store = \"file\" there and sign in again (codex login)."
 	}
 	return se.Error() + fmt.Sprintf(": here it reads only %s. Set cli_auth_credentials_store = \"file\" there and sign in again (codex login).", codexAuthPath())
 }
@@ -804,28 +805,8 @@ func Logins(agent string) []Login {
 	}
 	var side []Login
 	switch agent {
-	case "grok":
-		return grokLoginList()
 	case "copilot":
 		return copilotLoginList()
-	case "zcode":
-		return zcodeLoginList()
-	case "kiro":
-		return kiroLoginList()
-	case "devin":
-		return devinLoginList()
-	case "workbuddy", WorkBuddyAIID:
-		return wbLoginList(wbSiteOf(agent))
-	case CommandCodePlanID:
-		return cmdLoginList()
-	case "qoder", QoderCNID:
-		return loginsOf(qoderLoginsOf(agent))
-	case "zed":
-		return zedLoginList()
-	case "factory":
-		return factoryLoginList()
-	case MiMoID:
-		return mimoLoginList()
 	case ChatGPTAPIID:
 		return siwcLoginList()
 	case "gemini", "antigravity":
@@ -842,20 +823,19 @@ func Logins(agent string) []Login {
 			}
 		}
 		// a built-in moved onto its plugin lists its accounts there (an
-		// agent's own sign-in, which the built-in still finds, too)
+		// agent's own sign-in, which the built-in still finds, too); a
+		// retired one (no list) keeps its place, its plugin serving it
 		for _, b := range []struct {
 			id   string
 			list func() []Login
 		}{
-			{"grok", grokLoginList}, {"copilot", copilotLoginList}, {"zcode", zcodeLoginList}, {"kiro", kiroLoginList},
-			{"devin", devinLoginList}, {"workbuddy", func() []Login { return wbLoginList(wbCN) }},
-			{WorkBuddyAIID, func() []Login { return wbLoginList(wbAI) }}, {CommandCodePlanID, cmdLoginList},
-			{"qoder", func() []Login { return loginsOf(qoderLogins()) }},
-			{QoderCNID, func() []Login { return loginsOf(qoderLoginsOf(QoderCNID)) }}, {"zed", zedLoginList}, {"factory", factoryLoginList},
-			{MiMoID, mimoLoginList}, {ChatGPTAPIID, siwcLoginList}, {"gemini", func() []Login { return googleLoginList("gemini") }},
+			{"grok", nil}, {"copilot", copilotLoginList}, {"zcode", nil}, {"kiro", nil},
+			{"devin", nil}, {"workbuddy", nil}, {WorkBuddyAIID, nil}, {CommandCodePlanID, nil},
+			{"qoder", nil}, {QoderCNID, nil}, {"zed", nil}, {"factory", nil},
+			{MiMoID, nil}, {ChatGPTAPIID, siwcLoginList}, {"gemini", func() []Login { return googleLoginList("gemini") }},
 			{"antigravity", func() []Login { return googleLoginList("antigravity") }},
 		} {
-			if !Moved(b.id) {
+			if !PluginServes(b.id) {
 				side = append(side, b.list()...)
 				continue
 			}
@@ -1046,28 +1026,8 @@ func switchLogin(agent, user string) error {
 		return switchPluginLogin(pp, user)
 	}
 	switch agent {
-	case "grok":
-		return switchGrokLogin(user)
 	case "copilot":
 		return switchCopilotLogin(user)
-	case "zcode":
-		return switchZCodeLogin(user)
-	case "kiro":
-		return switchKiroLogin(user)
-	case "devin":
-		return switchDevinLogin(user)
-	case "workbuddy", WorkBuddyAIID:
-		return switchWorkBuddyLogin(wbSiteOf(agent), user)
-	case CommandCodePlanID:
-		return switchCommandCodeLogin(user)
-	case "qoder", QoderCNID:
-		return switchSideLogin(agent, user, qoderLoginsOf(agent))
-	case "zed":
-		return switchZedLogin(user)
-	case "factory":
-		return switchFactoryLogin(user)
-	case MiMoID:
-		return switchMiMoLogin(user)
 	case ChatGPTAPIID:
 		return switchSIWCLogin(user)
 	case "gemini", "antigravity":
@@ -1240,28 +1200,8 @@ func ForgetLogin(agent, user string) error {
 		return forgetPluginLogin(pp, user)
 	}
 	switch agent {
-	case "grok":
-		return forgetGrokLogin(user)
 	case "copilot":
 		return forgetCopilotLogin(user)
-	case "zcode":
-		return forgetZCodeLogin(user)
-	case "kiro":
-		return forgetKiroLogin(user)
-	case "devin":
-		return forgetDevinLogin(user)
-	case "workbuddy", WorkBuddyAIID:
-		return forgetWorkBuddyLogin(wbSiteOf(agent), user)
-	case CommandCodePlanID:
-		return forgetCommandCodeLogin(user)
-	case "qoder", QoderCNID:
-		return forgetQoderLogin(agent, user)
-	case "zed":
-		return forgetZedLogin(user)
-	case "factory":
-		return forgetFactoryLogin(user)
-	case MiMoID:
-		return forgetMiMoLogin(user)
 	case ChatGPTAPIID:
 		return forgetSIWCLogin(user)
 	case "gemini", "antigravity":

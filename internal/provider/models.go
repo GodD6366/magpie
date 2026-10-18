@@ -155,6 +155,15 @@ func (p Provider) live() ([]catalog.Model, time.Time, bool) {
 	return l.ms, l.at, l.ok
 }
 
+// liveByID are the models of live with this id: what a look at one
+// model, asked for each of a list's, reads instead of the whole list.
+func (p Provider) liveByID(model string) []catalog.Model {
+	if !p.lists() {
+		return nil
+	}
+	return catalog.LiveByID(p.ID, model)
+}
+
 // lists says whether the provider's fetched list is its own to read: not
 // a plugin's, nor a preset's that lists nothing (Preset.NoList).
 func (p Provider) lists() bool {
@@ -165,9 +174,18 @@ func (p Provider) lists() bool {
 	return p.Account != nil || pr == nil || !pr.NoList || strings.TrimSpace(p.ModelsURL) != "" || p.listRegion(pr)
 }
 
+// listsRead counts liveAll's reads (ListsRead).
+var listsRead atomic.Int64
+
+// ListsRead is how many times a provider's saved lists have been asked
+// for whole in this process: a test counts them to say a request reads
+// them once, not once a key (@NetRozee on X).
+func ListsRead() int64 { return listsRead.Load() }
+
 // liveAll is live with the models that draw or make videos too
 // (catalog.LiveAll): which of its keys serves one is said there alone.
 func (p Provider) liveAll() ([]catalog.Model, bool) {
+	listsRead.Add(1)
 	if !p.lists() {
 		return nil, false
 	}
@@ -427,11 +445,9 @@ func FetchNewBehind(timeout time.Duration) {
 // fetchNewGo is FetchNew in the background, counted in newRunning before
 // it returns when there is work, so a page reading FetchingNew straight
 // after is told; with none nothing is started or counted. Which accounts
-// are due is known at once unless a CLI is still asked who is signed in:
-// then the fetch is counted and waits for it in its goroutine, as the page
-// doesn't wait on a CLI (#541), and isn't told nothing is coming before
-// that account's list does (#1789). The accounts are listed here only once
-// no CLI is left to wait on.
+// are due is known at once: no CLI is asked who is signed in for a list
+// FetchNew fetches, since every built-in that asked one is retired and its
+// plugin lists its own accounts.
 func fetchNewGo(timeout time.Duration) {
 	run := func(fetch func()) {
 		newRunning.Add(1)
@@ -446,24 +462,7 @@ func fetchNewGo(timeout time.Duration) {
 		run(func() { FetchNew(timeout) })
 		return
 	}
-	behind := func() {
-		run(func() {
-			defer newFetches.Unlock()
-			fetchNewHeld(timeout)
-		})
-	}
-	if identitiesUnsettled() {
-		behind()
-		return
-	}
-	// no CLI left to ask, unless one was forgotten while they were listed
-	// (a sign-in just finished): asked behind the page, as left out
-	ps := All()
-	if identitiesUnsettled() {
-		behind()
-		return
-	}
-	due, _ := newDue(ps)
+	due, _ := newDue(All())
 	if len(due) == 0 {
 		newFetches.Unlock()
 		fetchingNew.Store(false)
@@ -505,18 +504,7 @@ func FetchNew(timeout time.Duration) (missing bool) {
 
 // fetchNewHeld is FetchNew with newFetches held.
 func fetchNewHeld(timeout time.Duration) (missing bool) {
-	// listing them asks a CLI who is signed in, if never asked: one that
-	// hasn't answered yet is waited for, and they are listed again
-	answered := identitiesAnswered()
-	ps := All()
-	// one answered since, while they were listed (its look gave up
-	// waiting) or after: an account it says is signed in was left out
-	if waited, unknown := awaitIdentities(timeout); unknown {
-		missing = true
-	} else if waited || answered != identitiesAnswered() {
-		ps = All()
-	}
-	due, skipped := newDue(ps)
+	due, skipped := newDue(All())
 	if fetchDue(due, timeout) {
 		missing = true
 	}
@@ -1151,6 +1139,10 @@ func (p Provider) fetchPerKey(ctx context.Context, keys []KeyAccount) ([]catalog
 	}
 	var deadKept []deadModel
 	at := map[string]int{}
+	// each model's keys as a set beside its list, and the models of the
+	// list before that each key saw: with a thousand keys, looking along
+	// the lists for every key and model took seconds (@NetRozee on X)
+	var has []map[string]bool
 	add := func(m catalog.Model, id string) int {
 		i, ok := at[m.ID]
 		if !ok {
@@ -1158,15 +1150,19 @@ func (p Provider) fetchPerKey(ctx context.Context, keys []KeyAccount) ([]catalog
 			at[m.ID], i = len(out), len(out)
 			out = append(out, m)
 			from = append(from, nil)
+			has = append(has, map[string]bool{})
 		} else {
 			out[i].ImageInput = sharedImageInput(out[i].ImageInput, m.ImageInput)
 			out[i].Images = out[i].Images && m.Images
 		}
-		if !slices.Contains(out[i].Keys, id) {
+		if !has[i][id] {
+			has[i][id] = true
 			out[i].Keys = append(out[i].Keys, id)
 		}
 		return i
 	}
+	var oldOf map[string][]int // a key's models in old, made when one fails
+	keptOld := map[int]bool{}  // the models of old kept for a key that failed
 	var base string
 	var lastErr error
 	for _, k := range keys {
@@ -1175,9 +1171,23 @@ func (p Provider) fetchPerKey(ctx context.Context, keys []KeyAccount) ([]catalog
 		l, err := q.fetchOne(ctx)
 		if err != nil {
 			lastErr = err
-			for _, m := range old {
-				if slices.Contains(m.Keys, id) {
-					deadKept = append(deadKept, deadModel{add(m, id), m.Keys})
+			if oldOf == nil {
+				oldOf = map[string][]int{}
+				for j, m := range old {
+					for _, kid := range m.Keys {
+						if js := oldOf[kid]; len(js) == 0 || js[len(js)-1] != j {
+							oldOf[kid] = append(js, j)
+						}
+					}
+				}
+			}
+			for _, j := range oldOf[id] {
+				i := add(old[j], id)
+				// each model kept once: its bases are worked out from
+				// its keys, the same whichever of them failed
+				if !keptOld[j] {
+					keptOld[j] = true
+					deadKept = append(deadKept, deadModel{i, old[j].Keys})
 				}
 			}
 			continue
@@ -1308,23 +1318,64 @@ func anyImageInput(a, b *bool) *bool {
 // first of five keys left out of every request). The lists are read whole,
 // the models that draw or make videos among them: a text key never says
 // it serves an image model only another key lists (#1657).
-func (p Provider) Serves(k KeyAccount, model string) bool {
-	live, ok := p.liveAll()
+func (p Provider) Serves(k KeyAccount, model string) bool { return p.Serving(model)(k) }
+
+// Serving is Serves for model, for each of the provider's keys in turn:
+// the lists are read once, not once a key. Read for every key of every
+// request, a provider of a thousand keys had its list's file looked at a
+// thousand times, and each model's thousand keys looked along, before a
+// request went out: a tenth of a second a request, seconds for five
+// thousand keys (@NetRozee on X).
+func (p Provider) Serving(model string) func(KeyAccount) bool {
+	x, ok := p.keyLists()
 	if !ok {
-		return true
+		return func(KeyAccount) bool { return true }
 	}
-	id := keyID(k.Key)
-	var keys []string
-	found, listed := false, false
+	keys, found := x.of[model]
+	return func(k KeyAccount) bool {
+		id := keyID(k.Key)
+		return !found || len(keys) == 0 || !x.listed[id] || keys[id]
+	}
+}
+
+// keyLists is which keys the provider's lists name: every key any model
+// is listed to, and each model's own, as sets. The last of a model listed
+// twice is its.
+type keyLists struct {
+	from   []catalog.Model // the lists they were made from
+	listed map[string]bool
+	of     map[string]map[string]bool
+}
+
+// keyListsMade is each provider's keyLists, made again when its lists are
+// read anew: a list read once is the same list until its file changes
+// (filememo), and is held here, so a new one is never at its address.
+var keyListsMade = struct {
+	sync.Mutex
+	m map[string]*keyLists
+}{m: map[string]*keyLists{}}
+
+func (p Provider) keyLists() (*keyLists, bool) {
+	live, ok := p.liveAll()
+	if !ok || len(live) == 0 {
+		return nil, false
+	}
+	keyListsMade.Lock()
+	defer keyListsMade.Unlock()
+	if x := keyListsMade.m[p.ID]; x != nil && len(x.from) == len(live) && &x.from[0] == &live[0] {
+		return x, true
+	}
+	x := &keyLists{from: live, listed: map[string]bool{}, of: make(map[string]map[string]bool, len(live))}
 	for _, m := range live {
-		if m.ID == model {
-			keys, found = m.Keys, true
+		set := make(map[string]bool, len(m.Keys))
+		for _, id := range m.Keys {
+			set[id] = true
+			x.listed[id] = true
 		}
-		if !listed && slices.Contains(m.Keys, id) {
-			listed = true
-		}
+		x.of[m.ID] = set
 	}
-	return !found || len(keys) == 0 || !listed || slices.Contains(keys, id)
+	keyListsMade.m[p.ID] = x
+	return x, true
 }
 
 // ServesNone is the user's Select none (NoModels) with nothing picked:
@@ -2088,9 +2139,9 @@ func byIDOrWas(id string) (Provider, bool) {
 var grokEffort = regexp.MustCompile(`^((?:.*/)?grok-[0-9][^/]*?)-(?:minimal|low|medium|high|xhigh|extra-high)$`)
 
 // grokWindow is a Grok id offered at a context window of its own
-// ("grok-4.7@500k", grokContextModels and the grok plugin's windowsOf): the
-// same model, asked for at a longer window. A window no multiple of 1000
-// the id names without the k (grokWindowLabel, grokWindowed).
+// ("grok-4.7@500k", the grok plugin's windowsOf): the same model, asked for
+// at a longer window. A window no multiple of 1000 the id names without the
+// k.
 var grokWindow = regexp.MustCompile(`^((?:.*/)?grok-[0-9][^/@]*)@[0-9]+k?$`)
 
 // pricedNames are the ids a model is priced by, in order: its own, then,
@@ -2218,7 +2269,8 @@ type Entry struct {
 	// tasks a magpie-served lead writes as text.
 	AgentsV2 bool `json:"-"`
 	// Tiers are the service tiers its list offers Codex on the model:
-	// another magpie's, those it offers its own Codex (#1234)
+	// another magpie's, those it offers its own Codex (#1234); a provider
+	// plugin's, those it says its vendor serves the model at (#2514)
 	Tiers []string `json:"-"`
 	// Released is the model's release day (YYYY-MM-DD) as its list or
 	// models.dev says it, "" when neither does: what a group's template
@@ -2296,11 +2348,25 @@ func buildEntries() []Entry { return entriesOff(disabledNow()) }
 
 // entriesOff is the providers' catalog less the models off reports.
 func entriesOff(off func(pid, model string) bool) []Entry {
+	return entriesOf(Provider.On, off)
+}
+
+// heldOffEntries are the models of the providers the user switched off,
+// which the groups magpie finds keep (foundFrom). One without a key, a
+// plugin not signed in, finds no group.
+func heldOffEntries() []Entry {
+	return heldOf("off entries", func() []Entry {
+		return slices.Clip(entriesOf(func(p Provider) bool { return p.Ready() && p.Off }, disabledNow()))
+	})
+}
+
+// entriesOf is the catalog of the providers of, less the models off reports.
+func entriesOf(of func(Provider) bool, off func(pid, model string) bool) []Entry {
 	var out []Entry
 	s := settings.Load()
 	gone := retiredNow() // its vendor said it is retired (retired.go)
 	for _, p := range All() {
-		if !p.On() || p.DecideOnly() { // a dedicated decision API only routes
+		if !of(p) || p.DecideOnly() { // a dedicated decision API only routes
 			continue
 		}
 		for _, m := range p.Exposed() {
