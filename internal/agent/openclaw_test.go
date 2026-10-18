@@ -56,7 +56,7 @@ func TestOpenClawInstallOnFreshHome(t *testing.T) {
 				if x.ID != a.ID {
 					continue
 				}
-				if x.Name != a.Name || x.Icon != "openclaw-color" || len(x.Commands) != 2 || x.Missing {
+				if x.Name != a.Name || x.Icon != "openclaw-color" || len(x.Commands) != 1 || x.Missing {
 					t.Fatalf("OpenClaw install entry: %+v", x)
 				}
 				if _, err := os.Stat(a.Dir); !os.IsNotExist(err) {
@@ -399,6 +399,82 @@ func TestOpenClawPathsAndReadOnly(t *testing.T) {
 	}
 }
 
+func TestOpenClawTildePaths(t *testing.T) {
+	a, _ := openclawHome(t, "")
+	home := filepath.Dir(a.Dir)
+	for _, override := range []string{"", filepath.Join(home, "other")} {
+		t.Run("home="+override, func(t *testing.T) {
+			t.Setenv("OPENCLAW_HOME", override)
+			base := override
+			if base == "" {
+				base = home
+			}
+			t.Setenv("OPENCLAW_STATE_DIR", "~/state")
+			if got := openclaw(home); got.Dir != filepath.Join(base, "state") || got.Path != filepath.Join(base, "state", "openclaw.json") {
+				t.Fatalf("tilde state directory: %s, %s", got.Dir, got.Path)
+			}
+			t.Setenv("OPENCLAW_CONFIG_PATH", "~/custom.json")
+			if got := openclaw(home).Path; got != filepath.Join(base, "custom.json") {
+				t.Fatalf("tilde config path: %s", got)
+			}
+			t.Setenv("OPENCLAW_STATE_DIR", "~")
+			if got := openclaw(home).Dir; got != base {
+				t.Fatalf("bare tilde state directory: %s", got)
+			}
+		})
+	}
+	t.Setenv("OPENCLAW_HOME", "~/other")
+	if got := openclaw(home).Dir; got != filepath.Join(home, "other", ".openclaw") {
+		t.Fatalf("tilde home: %s", got)
+	}
+}
+
+// Sync's address filter runs inside WriteAtomic. The saved provider must
+// match those final bytes, so Disconnect can still restore the user's own.
+func TestOpenClawSyncKeepsProxy(t *testing.T) {
+	for _, proxy := range []string{corpProxy, localProxy} {
+		for _, original := range []string{"", `{"baseUrl":"https://mine.example/v1","apiKey":"own-key","models":[]}`} {
+			t.Run(proxy+original, func(t *testing.T) {
+				a, read := openclawHome(t, `{}`)
+				if original != "" {
+					if err := edit.SetJSON(a.Path, edit.KV{Path: openclawProvider, Value: json.RawMessage(original)}); err != nil {
+						t.Fatal(err)
+					}
+				}
+				if err := a.Connect(); err != nil {
+					t.Fatal(err)
+				}
+				if err := edit.SetJSON(a.Path, edit.KV{Path: openclawProvider + ".baseUrl", Value: proxy + "/v1"}); err != nil {
+					t.Fatal(err)
+				}
+				fakeMagpieAt(t, map[string]bool{proxy: true})
+				for range 2 {
+					if err := synced(a.Sync); err != nil {
+						t.Fatal(err)
+					}
+					cur := gjson.GetBytes(read(), openclawProvider)
+					if cur.Get("baseUrl").String() != proxy+"/v1" {
+						t.Fatalf("sync lost proxy: %s", cur.Raw)
+					}
+					rec, err := openclawSaved("openclaw.config:.openclaw/openclaw.json")
+					if err != nil {
+						t.Fatal(err)
+					}
+					if !sameJSON(cur.Raw, rec.Edits[openclawProvider].After) {
+						t.Error("saved provider differs from the provider written through the proxy")
+					}
+				}
+				if err := a.Disconnect(); err != nil {
+					t.Fatal(err)
+				}
+				if got := gjson.GetBytes(read(), openclawProvider); got.Exists() != (original != "") || original != "" && !sameJSON(got.Raw, json.RawMessage(original)) {
+					t.Fatalf("disconnect left %s, want original provider %s", got.Raw, original)
+				}
+			})
+		}
+	}
+}
+
 func TestOpenClawJSON5Numbers(t *testing.T) {
 	const original = `{gateway:{port:0x4965},agents:{defaults:{model:'mine/original',timeoutSeconds:+120,contextTokens:123456789012345}}}`
 	a, read := openclawHome(t, original)
@@ -460,6 +536,10 @@ func TestOpenClawWSL(t *testing.T) {
 	a, _ := openclawHome(t, "")
 	home := filepath.Dir(a.Dir)
 	t.Setenv("OPENCLAW_CONFIG_PATH", filepath.Join(t.TempDir(), "windows.json"))
+	t.Setenv("OPENCLAW_STATE_DIR", filepath.Join(t.TempDir(), "windows-state"))
+	t.Setenv("OPENCLAW_HOME", t.TempDir())
+	t.Setenv("OPENCLAW_CONFIG_READONLY", "1")
+	t.Setenv("OPENCLAW_NIX_MODE", "1")
 	wsl := openclawIn(place{home: home, id: "openclaw@wsl:Ubuntu", spell: func(p string) string { return p }, base: func() string { return "http://172.22.0.1:20186" }})
 	if wsl.Path != a.Path {
 		t.Fatal("WSL read Windows' config variable")
