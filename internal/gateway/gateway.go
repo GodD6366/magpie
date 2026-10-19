@@ -591,6 +591,8 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 		defer cancel()
 		srv.Shutdown(c)
 		s.subscription.abortAll()
+		provider.FlushServed() // what answered last, kept for the next start and the CLI
+		flushSticks()          // who answered which conversation, for the next start or the magpie handed over to
 	}()
 	for {
 		err := srv.Serve(ln)
@@ -626,6 +628,11 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/hello", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 200, map[string]any{"name": "magpie", "version": Version})
 	})
+	// the Ollama API's model routes, for a client that takes a custom
+	// endpoint only as an Ollama server (ollama.go)
+	mux.HandleFunc("GET /api/version", s.ollamaVersion)
+	mux.HandleFunc("GET /api/tags", s.ollamaTags)
+	mux.HandleFunc("POST /api/show", s.ollamaShow)
 	mux.HandleFunc("GET /v1/magpie/quotas", s.quotas)
 	mux.HandleFunc("GET /v1/magpie/usage", s.usageSummary)
 	mux.HandleFunc("GET /v1/magpie/usage/requests", s.usageRequests)
@@ -2245,9 +2252,13 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 	repicked := 0    // times Copilot's Auto was asked again for a model the account is served
 	floored := false // the reply's length raised to what the provider takes
 	plainFor := ""   // the account and model asked again without effort updates (#617)
+	// the account and model asked again for a reply that fits the window
+	// the prompt leaves, and how long that is (roomCap)
+	roomFor, roomCap := "", 0
 	// the key or subscription account the last try went to (#557)
 	providerKeyID, providerKeyName, providerAccount := "", "", ""
 	var other *Try                 // the first failure that wasn't an allowance run out
+	var forbade []forbidden        // the plain 403s rested so far (forbiddenAlike)
 	autoReset := resetFirst != nil // a Codex or Claude reset looked at, once a request
 	// what the tries' held streams sent the agent ahead of a reply (#751)
 	kept := &keptAlive{proto: from, told: start}
@@ -2428,6 +2439,11 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 			}
 		} else if n := userOutput(c.p, c.model); n > 0 {
 			attemptBody = withMaxOutput(from, attemptBody, n)
+		}
+		if roomFor == c.who()+"|"+c.model {
+			if b, ok := withReplyCap(from, attemptBody, roomCap); ok {
+				attemptBody = b
+			}
 		}
 		picked := false // the effort asked for in place of the agent's
 		// a member fixed at an effort (#189), else the model asked for at
@@ -2868,6 +2884,24 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 				continue
 			}
 		}
+		if roomFor != c.who()+"|"+c.model && !hw.passing && (hw.code() == 400 || hw.code() == 422) {
+			// the window holds the prompt but not the reply asked for with
+			// it: DeepSeek counts max_tokens in its 1M window, and a client
+			// asking its full 384K for a 700K conversation (max_completion_
+			// tokens, passed as max_tokens since #2355) was refused as too
+			// long, where every other member of its group answered
+			// (molvqingtai on Discord). The same one is asked again for what
+			// the window has left, as the vendor counted it
+			if left := replyLeft(wordsOf(hw.errBody())); left >= leastReplyLeft {
+				if _, ok := withReplyCap(from, attemptBody, left); ok {
+					roomFor, roomCap = c.who()+"|"+c.model, left
+					try.Fail = failRoom
+					s.trace.update(tr, func(t *Route) { t.Tries[len(t.Tries)-1] = try })
+					i--
+					continue
+				}
+			}
+		}
 		if hw.failed() && hw.refused {
 			refusals++
 			if !refusalAsksAgain(refusals) {
@@ -3066,12 +3100,22 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 		// had cost 616 tries, and the accounts their allowances. Another
 		// vendor left in the group is asked, once
 		protected := !hw.passing && !hw.refused && protectionRefused(hw.code(), hw.errBody())
-		if protected {
+		// Command Code's Zero Data Retention setting refused the model
+		// (plugins #246): every account of the provider is sent the same
+		// header, so none of them is asked the model again, and nobody
+		// rests — it answers as soon as the switch is off. Another member,
+		// its other models among them, is asked
+		zdr := !hw.passing && !hw.refused && hw.code() >= 400 && hw.header.Get(zdrHeader) != ""
+		if protected || zdr {
 			if other == nil {
 				other = &Try{Status: call.Status, Error: call.Error}
 			}
 			try.Fail = failOther
-			if left := elsewhere(cands[i+1:], c); len(left) > 0 {
+			left := elsewhere(cands[i+1:], c)
+			if zdr {
+				left = notMates(cands[i+1:], c)
+			}
+			if len(left) > 0 {
 				try.Fail = failShape
 				s.trace.update(tr, func(t *Route) { t.Tries[len(t.Tries)-1] = try })
 				skipped = append(skipped, c.label()+": "+call.Error)
@@ -3081,6 +3125,8 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 			cands = cands[:i+1]
 			last = true
 		}
+		// nor is it asked again after a moment
+		protected = protected || zdr
 		if wait, ok := passing(hw.code(), hw.header, hw.errBody(), again); ok && !protected && !last && hw.failed() && spentAfter(cands[i+1:]) {
 			// the others left are out of their allowance (Discord, waroy: a
 			// Codex account run out, Grok busy a moment): this one is the
@@ -3141,13 +3187,47 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 			matesLast(cands[i+1:], c)
 			continue
 		}
+		plain403 := hw.failed() && !hw.refused && plainForbidden(c, hw.code(), hw.errBody())
+		if alike, others := forbiddenAlike(forbade, c); plain403 && len(alike) > 0 {
+			// a mate refused this request with a plain 403 too: the
+			// request is what is refused, not each account (plugins#243).
+			// Neither rests, the mate's rest taken back, and its other
+			// mates are asked last, as for a prompt turned away
+			for _, f := range alike {
+				unforbid(f)
+			}
+			forbade = others // each taken back once
+			try.Fail = failOther
+			s.trace.update(tr, func(t *Route) {
+				for _, f := range alike {
+					if f.try >= 0 && f.try < len(t.Tries) {
+						t.Tries[f.try].Rest = nil
+					}
+				}
+				if !last {
+					t.Tries[len(t.Tries)-1] = try
+				}
+			})
+			if !last {
+				if other == nil {
+					other = &Try{Status: call.Status, Error: call.Error}
+				}
+				skipped = append(skipped, c.label()+": "+call.Error)
+				matesLast(cands[i+1:], c)
+				continue
+			}
+		}
 		if !last && hw.failed() {
 			if f := failure(hw.code(), hw.errBody()); other == nil && f != failQuota && f != failCredit {
 				other = &Try{Status: call.Status, Error: call.Error}
 			}
 			rest := s.restAfterMarked(c, hw.code(), hw.header, hw.errBody(), hw.sharedPool)
 			try.Fail, try.Rest = rest.Why, &rest
-			s.trace.update(tr, func(t *Route) { t.Tries[len(t.Tries)-1] = try })
+			at := -1
+			s.trace.update(tr, func(t *Route) { t.Tries[len(t.Tries)-1], at = try, len(t.Tries)-1 })
+			if plain403 {
+				forbade = append(forbade, forbidden{c: c, rest: rest, try: at})
+			}
 			skipped = append(skipped, c.label()+": "+call.Error)
 			if waitsOf(c.patience, patienceFallback) > 0 && !hw.turnedAway && busy(hw.code(), hw.errBody()) {
 				busyNow = noteBusy(busyNow, c, hw.header)
@@ -3537,7 +3617,7 @@ func (s *Server) attempt(w http.ResponseWriter, r *http.Request, from provider.P
 	ownAPI := false
 	// except a subagent's task its lead sealed (#1109): only the server
 	// that sealed it reads it, and a translation would drop it
-	if relay && searchAsked(from, body) && (from == provider.Chat && !p.IsRemoteMagpie() || !searchesModel(p, from, model)) && !(from == provider.Responses && hasSealedAgentMessage(body)) {
+	if relay && searchedForIt(p, from, model, body) && !(from == provider.Responses && hasSealedAgentMessage(body)) {
 		relay, ownAPI = false, true
 	}
 	// Copilot seals an argument the tools mark "encrypted" (spawn_agent's
@@ -3752,6 +3832,7 @@ func (s *Server) forwardOnce(ctx context.Context, p provider.Provider, to provid
 	body = deepseekTokenField(p, to, body)
 	body = toolOneOfAsAnyOf(p, to, body)
 	body = kimiToolEnumTypes(p, to, body)
+	body = kimiToolRefTypes(p, to, body)
 	body = kimiLockedSampling(p, to, body)
 	body = clinePin(p, to, body)
 	body = codexImagesFit(p, to, body)
