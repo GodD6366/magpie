@@ -123,7 +123,9 @@ image input, reasoning and known prices; native Responses and Anthropic
 models use their respective API adapters. A nonempty `agents.defaults.models`
 menu gets magpie's entries beside its own; an explicit `modelPolicy.allow`
 gets `magpie/*`. Sync updates only a provider carrying magpie's key and
-removes obsolete, unedited menu entries. Disconnect restores the prior
+removes obsolete, unedited menu entries. The saved provider records the actual
+file after Sync's address filter, including a remote gateway or reverse proxy,
+so Disconnect compares against what OpenClaw reads. Disconnect restores the prior
 primary (including string shorthand), provider and policy, preserving
 fallback lists and later user edits. The GUI's inline model controls read
 and atomically saves the primary and ordered fallbacks through
@@ -147,12 +149,14 @@ obsolete copy, so the next connection backs up the current JSON5 text.
 Malformed configs, `$include` configs and OpenClaw's read-only/Nix flags
 fail without writing. Config location follows `OPENCLAW_CONFIG_PATH`, then
 `OPENCLAW_STATE_DIR`, then `.openclaw` under `OPENCLAW_HOME` or the user's
-home; absolute overrides use `appdir.Getenv` and join `agentenv.Vars` for
-sandboxing. WSL uses the distro's default folder and gateway address, not
-Windows' overrides. When neither its config nor CLI is present, the Agents
+home. `~` in state/config overrides expands against that effective home;
+`~` in `OPENCLAW_HOME` expands against the OS home. Overrides use
+`appdir.Getenv` and join `agentenv.Vars` for sandboxing. WSL uses the distro's
+default folder and gateway address, ignoring Windows' path and read-only
+variables. When neither its config nor CLI is present, the Agents
 page still offers OpenClaw under **Install other agents**, using its vendor
-installer labeled `shell` for macOS/Linux or PowerShell on Windows, plus
-`npm i -g openclaw` on each platform for users who already manage Node.js
+installer labeled `script` for macOS/Linux or PowerShell on Windows. Only
+the vendor installer is offered, so it can set up the required Node.js version
 ([`install.go`](../../internal/agent/install.go)). Listing these commands
 neither runs an installer nor creates an OpenClaw config.
 

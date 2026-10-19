@@ -43,15 +43,15 @@ type openclawRecord struct {
 func openclaw(home string) *Agent { return openclawIn(here(home)) }
 
 func openclawIn(at place) *Agent {
-	home := at.getenv("OPENCLAW_HOME")
+	home := openclawPath(at.home, at.getenv("OPENCLAW_HOME"))
 	if home == "" {
 		home = at.home
 	}
-	dir := at.getenv("OPENCLAW_STATE_DIR")
+	dir := openclawPath(home, at.getenv("OPENCLAW_STATE_DIR"))
 	if dir == "" {
 		dir = filepath.Join(home, ".openclaw")
 	}
-	path := at.getenv("OPENCLAW_CONFIG_PATH")
+	path := openclawPath(home, at.getenv("OPENCLAW_CONFIG_PATH"))
 	if path == "" {
 		path = filepath.Join(dir, "openclaw.json")
 	}
@@ -73,7 +73,7 @@ func openclawIn(at place) *Agent {
 		return c.Primary
 	}
 	writable := func() error {
-		if at.spell == nil && (os.Getenv("OPENCLAW_CONFIG_READONLY") == "1" || os.Getenv("OPENCLAW_NIX_MODE") == "1") {
+		if at.getenv("OPENCLAW_CONFIG_READONLY") == "1" || at.getenv("OPENCLAW_NIX_MODE") == "1" {
 			return fmt.Errorf("OpenClaw config is read-only")
 		}
 		return nil
@@ -147,6 +147,15 @@ func openclawIn(at place) *Agent {
 			},
 		}},
 	}
+}
+
+// OpenClaw expands path overrides against OPENCLAW_HOME, whose own tilde
+// is relative to the OS home (src/infra/home-dir.ts).
+func openclawPath(home, path string) string {
+	if rest, ok := strings.CutPrefix(path, "~"); ok && (rest == "" || rest[0] == '/' || rest[0] == filepath.Separator) {
+		return filepath.Clean(home + rest)
+	}
+	return path
 }
 
 // openclawRead validates before editing. JSONC keeps its layout. Other JSON5
@@ -479,6 +488,15 @@ func openclawWriteChain(path, key string, at place, model string, chain *ModelCh
 			return err
 		}
 	}
+	// Sync's write filter can keep a remote gateway or reverse proxy. Save
+	// the provider actually written, so Disconnect compares against that.
+	_, written, err := openclawRead(path)
+	if err != nil {
+		return err
+	}
+	e := rec.Edits[openclawProvider]
+	e.After = json.RawMessage(gjson.GetBytes(written, openclawProvider).Raw)
+	rec.Edits[openclawProvider] = e
 	b, _ := json.Marshal(rec)
 	stash(map[string]string{key: string(b)})
 	return nil

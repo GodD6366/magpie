@@ -76,11 +76,11 @@ var vendorInstall = map[string]func(goos string) []InstallCmd{
 		return []InstallCmd{{Via: "script", Command: "curl -fsSL https://opencode.ai/install | bash"}}
 	},
 	"openclaw": func(goos string) []InstallCmd {
-		installer := InstallCmd{Via: "shell", Command: "curl -fsSL https://openclaw.ai/install.sh | bash"}
+		installer := InstallCmd{Via: "script", Command: "curl -fsSL https://openclaw.ai/install.sh | bash"}
 		if goos == "windows" {
 			installer = InstallCmd{Via: "powershell", Command: "iwr -useb https://openclaw.ai/install.ps1 | iex"}
 		}
-		return []InstallCmd{installer, {Via: "npm", Command: "npm i -g openclaw"}}
+		return []InstallCmd{installer}
 	},
 	"codex": func(goos string) []InstallCmd {
 		switch goos {
