@@ -228,6 +228,15 @@ type Provider struct {
 	// fitting, which a backend that isn't OpenAI's needs (#350).
 	CodexAsSent bool `json:"codexAsSent,omitempty"`
 
+	// AdditionalTools says the provider's Responses API takes an
+	// additional_tools input item, as OpenAI's does: a deferred tool an
+	// Anthropic client's tool search loaded goes to it in such an item
+	// where the search loaded it, not in the top-level tools, which keeps
+	// the prompt's cached prefix (#2660). OpenAI's own API is sent one
+	// without it; another vendor isn't unless this is set, since xAI's
+	// turns the item away (#350).
+	AdditionalTools bool `json:"additionalTools,omitempty"`
+
 	// NativeCompaction has Codex's compaction_trigger go to the provider
 	// as Codex sent it, and the compaction the provider writes back go to
 	// Codex as it came (#1099), where magpie otherwise asks the model for
@@ -782,6 +791,9 @@ func Save(p Provider) error {
 	if p.ID == strings.TrimSuffix(GroupPrefix, "/") {
 		return errors.New(`"group" starts the ids of routing groups; pick another id`)
 	}
+	if p.ID == autoID && !stored(p.ID) { // one saved before keeps it (autoRefsOn)
+		return errAutoID
+	}
 	if err := settings.CheckProxy(p.Proxy); err != nil {
 		return err
 	}
@@ -1272,12 +1284,13 @@ func normalize(p Provider) Provider {
 			p.Decide = pr.Decide
 		}
 	}
-	// an oMLX or MLX-Serve provider saved before its preset had System One (#1641)
-	// asks it where its chat completions are, at whatever port it was given
-	if (p.Preset == OMLXPreset || p.Preset == MLXServePreset) && p.Decide == "" && p.Chat != "" {
+	// an oMLX, MLX-Serve or Ollama provider saved before its preset had
+	// System One (#1641; Nanka on Discord) asks it where its chat
+	// completions are, at whatever address it was given
+	if (p.Preset == OMLXPreset || p.Preset == MLXServePreset || p.Preset == "ollama" || p.Preset == "ollama-cloud") && p.Decide == "" && p.Chat != "" {
 		p.Decide = p.Chat
 	}
-	if p.Routing != Ordered && p.Routing != Rotate && p.Routing != LeastUsed && p.Routing != Pace && p.Routing != Weighted && !PluginRouting(p.Routing) {
+	if p.Routing != Ordered && p.Routing != Rotate && p.Routing != LeastUsed && p.Routing != Pace && p.Routing != Weighted && p.Routing != FreeFirst && !PluginRouting(p.Routing) {
 		p.Routing = ""
 	}
 	if !slices.Contains(Affinities, p.Affinity) {
@@ -1537,6 +1550,10 @@ func claudeModel(model string) bool {
 	m := strings.ToLower(model[strings.LastIndex(model, "/")+1:])
 	return strings.HasPrefix(m, "claude") || bedrockClaude(m)
 }
+
+// ClaudeModel is claudeModel for another package: whether model, after any
+// vendor prefix, is one of Anthropic's Claude models by its name.
+func ClaudeModel(model string) bool { return claudeModel(model) }
 
 // openAIModel is whether model is one of OpenAI's own by its name: a GPT,
 // a Codex or an o-series model, after any vendor prefix.

@@ -105,6 +105,12 @@ var kindCats = func() map[string][]string {
 			}
 		}
 	}
+	// and the model's: a name it found is personal data, not a secret
+	for _, k := range modelKinds {
+		if c := modelCat(k); c != "" && !slices.Contains(m[k], c) {
+			m[k] = append(m[k], c)
+		}
+	}
 	return m
 }()
 
@@ -151,7 +157,7 @@ func knownSpans(s string, o Options) []span {
 			best = &known[s[i:i+minKnown]][j]
 		}
 		if best != nil {
-			out = append(out, span{i, i + len(best.v), best.kind})
+			out = append(out, span{i, i + len(best.v), best.kind, ByKnown})
 			i += len(best.v) - 1
 		}
 	}

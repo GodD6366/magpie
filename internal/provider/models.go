@@ -1602,7 +1602,7 @@ func (p Provider) Efforts(model string) []string {
 	if all := p.Known(model); len(all) > 0 {
 		return all
 	}
-	return effortsKept(nil, settings.Load().ModelEfforts[p.ID+"/"+model])
+	return effortsKept(nil, settings.Shared().ModelEfforts[p.ID+"/"+model])
 }
 
 // Thinks reports whether the model reasons: it has levels, its list says
@@ -1638,6 +1638,30 @@ func (p Provider) PaidBesideFree(model string) bool {
 		free = free || m.Free
 	}
 	return listed && paid && free
+}
+
+// FreeModel says model costs nothing on p: its vendor serves it at no cost
+// to the subscription's allowance or credits (catalog.Model's Free:
+// WorkBuddy's "x0.00", Qoder's is_free, Cline's free models, an OpenCode Zen
+// free one), or, with no such word from the vendor, it is listed at $0 on
+// every count — a vendor's free model a catalog prices at 0, as
+// mimo-v2.6-flash-free is, and a key's free model, which has no allowance
+// to draw on and so is judged by its price alone.
+//
+// A model neither listed free nor priced is not free: nothing says it costs
+// nothing, and the routes that go by this put it with the paid ones, so a
+// pool without free models behaves as In order.
+func (p Provider) FreeModel(model string) bool {
+	for _, m := range p.Available() {
+		if strings.EqualFold(m.ID, model) {
+			if m.Free {
+				return true
+			}
+			break
+		}
+	}
+	pr, ok := p.ListPrice(model)
+	return ok && pr.Input == 0 && pr.Output == 0 && pr.CacheRead == 0 && pr.CacheWrite == 0
 }
 
 // Known are the model's own reasoning levels, when known.
@@ -2407,7 +2431,9 @@ func entriesOff(off func(pid, model string) bool) []Entry {
 // plugin not signed in, finds no group.
 func heldOffEntries() []Entry {
 	return heldOf("off entries", func() []Entry {
-		return slices.Clip(entriesOf(func(p Provider) bool { return p.Ready() && p.Off }, disabledNow()))
+		return keptOf("off entries", func() []Entry {
+			return slices.Clip(entriesOf(func(p Provider) bool { return p.Ready() && p.Off }, disabledNow()))
+		})
 	})
 }
 
@@ -2545,6 +2571,13 @@ func entryIn(entries []Entry, id string) (Entry, bool) {
 			return e, true
 		}
 	}
+	if gid, ok := GroupIDOf(id); ok { // a found group by either of its ids
+		for _, e := range entries {
+			if e.Group == gid {
+				return e, true
+			}
+		}
+	}
 	return Entry{}, false
 }
 
@@ -2561,11 +2594,9 @@ func Resolve(id string) (Provider, string, bool) {
 	// Claude Code's mark for a model with a 1M window; it drops it before
 	// asking, but a value in its settings still has it
 	id = strings.TrimSuffix(strings.TrimSpace(id), "[1m]")
-	if strings.HasPrefix(id, GroupPrefix) {
-		for _, e := range Catalog() {
-			if e.ID == id {
-				return e.Provider, e.Model, true
-			}
+	if IsGroupRef(id) {
+		if e, ok := entryIn(Catalog(), id); ok {
+			return e.Provider, e.Model, true
 		}
 		return Provider{}, "", false
 	}
@@ -2919,7 +2950,7 @@ func DropModelOutput(id string) (string, bool, error) {
 // display name, and the same resolution outputOf reads it back under.
 func outputKeyOf(id string) (string, error) {
 	r := strings.TrimPrefix(strings.TrimSpace(id), "magpie/")
-	if strings.HasPrefix(r, GroupPrefix) {
+	if IsGroupRef(r) {
 		return "", errorf("that is a routing group, not a provider's model")
 	}
 	pid, model, ok := strings.Cut(r, "/")

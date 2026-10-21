@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/yetone/magpie/internal/agent"
+	"github.com/yetone/magpie/internal/autostart"
 	"github.com/yetone/magpie/internal/catalog"
 	"github.com/yetone/magpie/internal/gateway"
 	"github.com/yetone/magpie/internal/provider"
@@ -434,10 +435,15 @@ type gatewayJSON struct {
 	// Version is another magpie's, serving it, and Older says it is older
 	// than this one: agents' requests are then sent as that version sends
 	// them, without this one's fixes (#506)
-	Version string         `json:"version,omitempty"`
-	Older   bool           `json:"older,omitempty"`
-	Models  int            `json:"models"`
-	Calls   []gateway.Call `json:"calls"`
+	Version string `json:"version,omitempty"`
+	Older   bool   `json:"older,omitempty"`
+	// Pid and Serves are the serving magpie's own: which process it is and
+	// how it was started, for the Routing page to name the one that is
+	// routing (#2606)
+	Pid    int            `json:"pid,omitempty"`
+	Serves string         `json:"serves,omitempty"`
+	Models int            `json:"models"`
+	Calls  []gateway.Call `json:"calls"`
 	// Lanes are the keys and accounts with requests out or waiting under
 	// a limit on requests at once (#892), by provider#keyid or
 	// provider@account
@@ -536,7 +542,7 @@ func agentUses(agents []*agent.Agent, findGroup func(string) (provider.Group, []
 	for _, a := range agents {
 		u := agentUse{Agent: a}
 		v := agentModel(a)
-		if strings.HasPrefix(v, provider.GroupPrefix) {
+		if provider.IsGroupRef(v) {
 			u.group, u.members, u.inGroup = findGroup(v)
 		} else if pid, model, ok := strings.Cut(v, "/"); ok {
 			if _, err := provider.Find(pid); err == nil {
@@ -936,6 +942,15 @@ func providersState() providersJSON {
 		o := gateway.ServedBy()
 		s.Gateway.Running, s.Gateway.Window, s.Gateway.Version = o.Running, o.Window, o.Version
 		s.Gateway.Older = o.Running && update.Newer(gateway.Version, o.Version)
+		// the process that is routing, for the Routing page to name it
+		// (#2606): another magpie on this computer, whose routing this
+		// console shows through OwnerTrace, and its lanes for the rows
+		s.Gateway.Pid, s.Gateway.Serves = o.Pid, o.Serves
+		if o.Running {
+			if l, ok := gateway.OwnerLanes(); ok {
+				s.Gateway.Lanes = l
+			}
+		}
 	}
 	s.Gateway.Archive = archiveState()
 	s.CodexDaemon = provider.CodexDaemonStale()
@@ -985,6 +1000,10 @@ func providerRoutes(mux *http.ServeMux, w Windows) {
 		lanes := map[string]gateway.Lane{}
 		if gw := served.Load(); gw != nil {
 			lanes = gw.Lanes()
+		} else if l, ok := gateway.OwnerLanes(); ok {
+			// another magpie on this computer serves the gateway: its lanes
+			// are the ones to show (the rows read the same wherever it runs)
+			lanes = l
 		}
 		writeJSON(rw, lanes)
 	})
@@ -1011,7 +1030,20 @@ func providerRoutes(mux *http.ServeMux, w Windows) {
 		if r.URL.Query().Has("wait") {
 			provider.FetchNew(8 * time.Second)
 		}
-		writeJSON(rw, providersState())
+		// ?last=1: the list kept from the last read, at once (#1519);
+		// null when none is kept
+		if r.URL.Query().Get("last") == "1" {
+			if b, ok := lastKnownProviders(); ok {
+				rw.Header().Set("Content-Type", "application/json")
+				rw.Write(b)
+			} else {
+				writeJSON(rw, nil)
+			}
+			return
+		}
+		s := providersState()
+		writeJSON(rw, s)
+		keepProviders(s)
 	})
 	// Recent-call bodies are read only when their row is opened, not with
 	// every Providers or Gateway refresh (#1521): forty calls' bodies made
@@ -1507,6 +1539,11 @@ func providerRoutes(mux *http.ServeMux, w Windows) {
 				// set <id> codex=as-sent` (#1758)
 				if !in.CodexAsSent && old != nil {
 					in.CodexAsSent = old.CodexAsSent
+				}
+				// and additional_tools taken, set with `magpie provider
+				// set <id> additional-tools=on` (#2660)
+				if !in.AdditionalTools && old != nil {
+					in.AdditionalTools = old.AdditionalTools
 				}
 				// each account's own proxy likewise: {} clears them
 				if in.AccountProxies == nil && old != nil {
@@ -2258,7 +2295,9 @@ func providerRoutes(mux *http.ServeMux, w Windows) {
 	mux.HandleFunc("POST /api/open", func(rw http.ResponseWriter, r *http.Request) {
 		var in struct{ URL string }
 		_ = json.NewDecoder(r.Body).Decode(&in)
-		if strings.HasPrefix(in.URL, "https://") || strings.HasPrefix(in.URL, "http://") || strings.HasPrefix(in.URL, agent.CindyScheme) || strings.HasPrefix(in.URL, agent.LodyScheme) {
+		// and System Settings' Login Items, where Open at login is allowed
+		// again: that one pane, not System Settings' scheme at large
+		if strings.HasPrefix(in.URL, "https://") || strings.HasPrefix(in.URL, "http://") || strings.HasPrefix(in.URL, agent.CindyScheme) || strings.HasPrefix(in.URL, agent.LodyScheme) || in.URL == autostart.LoginItemsURL {
 			// Open again on a sign-in says why it didn't open (#2043)
 			if err := w.OpenURL(in.URL); err != nil {
 				fail(rw, err)
