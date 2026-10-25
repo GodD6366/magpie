@@ -14,7 +14,7 @@ func sandbox(t *testing.T, now time.Time) string {
 	oldDir, oldClock, oldOwn := Dir, clock, ownTest
 	Dir, clock, ownTest = func() string { return dir }, func() time.Time { return now }, true
 	store.mu.Lock()
-	store.days, store.snips, store.last, store.pruned = nil, nil, 0, time.Time{}
+	store.days, store.snips, store.sent, store.sentBytes, store.last, store.pruned = nil, nil, nil, 0, 0, time.Time{}
 	store.mu.Unlock()
 	t.Cleanup(func() { Dir, clock, ownTest = oldDir, oldClock, oldOwn })
 	return dir
@@ -98,6 +98,10 @@ func TestSum(t *testing.T) {
 	if rs, more := List(0, 10, Filter{By: "model"}); len(rs) != 1 || more || rs[0].Agent != "codex" {
 		t.Fatalf("filtered: %+v", rs)
 	}
+	// several kinds, split by commas
+	if rs, _ := List(0, 10, Filter{Kind: "EMAIL,API_KEY"}); len(rs) != 2 || rs[0].Agent != "claude" {
+		t.Fatalf("kinds: %+v", rs)
+	}
 	rs, more := List(0, 2, Filter{})
 	if len(rs) != 2 || !more || !rs[0].Time.Equal(now) {
 		t.Fatalf("page: %+v %v", rs, more)
@@ -117,5 +121,34 @@ func TestPrune(t *testing.T) {
 	Add(Record{Time: now, N: 1, Values: []Value{{Placeholder: "{{X_aaaaaaaa}}", Kind: "X", By: "rule"}}})
 	if _, err := os.Stat(old); !os.IsNotExist(err) {
 		t.Fatalf("old day kept: %v", err)
+	}
+}
+
+// A value sent as written is counted as warned, not as one masked, and a
+// request held back is counted, read from disk and kept up alike (#1977).
+func TestSumWarnedAndBlocked(t *testing.T) {
+	now := time.Date(2026, 10, 20, 15, 0, 0, 0, time.Local)
+	sandbox(t, now)
+	e, k := "{{EMAIL_aaaabbbb}}", "{{API_KEY_ccccdddd}}"
+	Add(Record{Time: now.Add(-time.Hour), N: 1, Values: []Value{{Placeholder: e, Kind: "EMAIL", By: "rule", Len: 9, N: 2, Action: "warn"}, {Placeholder: k, Kind: "API_KEY", By: "rule", Len: 40}}})
+	for _, fresh := range []bool{true, false} {
+		if fresh {
+			store.mu.Lock()
+			store.days = nil
+			store.mu.Unlock()
+		}
+		_ = Sum(7)
+		Add(Record{Time: now, What: "blocked", Blocked: true, N: 1, Values: []Value{{Placeholder: k, Kind: "API_KEY", By: "rule", Len: 40, Action: "block"}}})
+	}
+	s := Sum(7)
+	if s.Warned != 2 || s.Blocked != 2 || s.Distinct != 1 || s.N != 3 || len(s.Kinds) != 1 || s.Kinds[0].Name != "API_KEY" {
+		t.Fatalf("summary: %+v", s)
+	}
+	if got, _ := List(0, 1, Filter{}); len(got) != 1 || !got[0].Blocked || got[0].Values[0].Action != "block" {
+		t.Fatalf("record: %+v", got)
+	}
+	// only the requests held back
+	if got, _ := List(0, 10, Filter{Blocked: true}); len(got) != 2 || !got[0].Blocked || !got[1].Blocked {
+		t.Fatalf("held back: %+v", got)
 	}
 }

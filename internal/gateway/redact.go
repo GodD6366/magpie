@@ -1,10 +1,14 @@
 package gateway
 
 import (
+	"errors"
+	"fmt"
 	"net/http"
+	"time"
 
 	"github.com/yetone/magpie/internal/gwmw"
 	"github.com/yetone/magpie/internal/masking"
+	"github.com/yetone/magpie/internal/maskrec"
 	"github.com/yetone/magpie/internal/provider"
 	"github.com/yetone/magpie/internal/settings"
 )
@@ -30,19 +34,43 @@ func redactedHits(w http.ResponseWriter, body []byte) (http.ResponseWriter, []by
 		b []byte
 		h maskHits
 	}
+	began := time.Now()
 	o, err := gwmw.Safely(func() out {
 		if t, ok := m.(gwmw.Teller); ok {
 			b, hits := t.JSONHits(body)
-			return out{b, maskHits{len(hits), hits}}
+			return out{b, hitsOf(hits)}
 		}
 		b, n := m.JSON(body)
 		return out{b, maskHits{n: n}}
 	})
-	if err != nil || o.h.n == 0 {
+	o.h.took = time.Since(began)
+	if err == nil {
+		err = blocked(o.h)
+	}
+	if err != nil {
 		return w, body, func() {}, maskHits{}, err
 	}
+	if o.h.n == 0 { // only values sent as written: told, nothing to put back
+		return w, body, func() {}, o.h, nil
+	}
 	rw, done := m.Writer(w)
+	done = toldBack(rw, done, &o.h)
 	return rw, o.b, done, o.h, nil
+}
+
+// toldBack is done, which then tells the request's record what rw put
+// back in the answer, where rw counts it and the request was recorded.
+func toldBack(rw http.ResponseWriter, done func(), h *maskHits) func() {
+	c, ok := rw.(interface{ Put() map[string]int })
+	if !ok {
+		return done
+	}
+	key := new(int64)
+	h.key = key
+	return func() {
+		done()
+		maskrec.Restored(*key, c.Put())
+	}
 }
 
 // redactedPrompt masks a parsed image or video prompt before any vendor
@@ -56,10 +84,14 @@ func redactedPrompt(w http.ResponseWriter, prompt string) (http.ResponseWriter, 
 // redactedPromptHits is redactedPrompt with what it swapped.
 func redactedPromptHits(w http.ResponseWriter, prompt string) (http.ResponseWriter, string, func(), maskHits, error) {
 	m, masked, h, err := maskTextHits(prompt)
-	if err != nil || h.n == 0 {
+	if err != nil {
 		return w, prompt, func() {}, maskHits{}, err
 	}
+	if h.n == 0 {
+		return w, prompt, func() {}, h, nil
+	}
 	rw, done := m.Writer(w)
+	done = toldBack(rw, done, &h)
 	return rw, masked, done, h, nil
 }
 
@@ -81,18 +113,70 @@ func maskTextHits(s string) (gwmw.Masker, string, maskHits, error) {
 		s string
 		h maskHits
 	}
+	began := time.Now()
 	o, err := gwmw.Safely(func() out {
 		if t, ok := m.(gwmw.Teller); ok {
 			got, hits := t.TextHits(s)
-			return out{got, maskHits{len(hits), hits}}
+			return out{got, hitsOf(hits)}
 		}
 		got, n := m.Text(s)
 		return out{got, maskHits{n: n}}
 	})
+	o.h.took = time.Since(began)
+	if err == nil {
+		err = blocked(o.h)
+	}
 	if err != nil {
 		return nil, s, maskHits{}, err
 	}
 	return m, o.s, o.h, nil
+}
+
+// hitsOf are a Teller's hits, counting the places masked: a value the
+// user set to warn about goes as written, so it is told, not counted.
+func hitsOf(hits []gwmw.Hit) maskHits {
+	h := maskHits{hits: hits}
+	for _, x := range hits {
+		if x.Action != "warn" {
+			h.n++
+		}
+	}
+	return h
+}
+
+// maskBlocked is a request held back: it has a value of a kind the user
+// set to block (Settings › Privacy). It names the kind and the value's
+// hint, never the value.
+type maskBlocked struct{ hit gwmw.Hit }
+
+func (e maskBlocked) Error() string {
+	one := fmt.Sprintf("%d characters", e.hit.Len)
+	if e.hit.Head != "" {
+		one = e.hit.Head + "…, " + one
+	}
+	return fmt.Sprintf("magpie held this request back: Settings › Privacy blocks %s, and it has one (%s). Nothing was sent.", e.hit.Kind, one)
+}
+
+// blocked is the error for hits with a value to hold the request back
+// for, recorded as a request held back; nil without one.
+func blocked(h maskHits) error {
+	for _, x := range h.hits {
+		if x.Action == "block" {
+			noteBlocked(h)
+			return maskBlocked{x}
+		}
+	}
+	return nil
+}
+
+// maskStatus is the status a request masking failed for gets: 400 for
+// one held back, which sent again is held back again, 503 for a masker
+// that couldn't mask it.
+func maskStatus(err error) int {
+	if errors.As(err, new(maskBlocked)) {
+		return http.StatusBadRequest
+	}
+	return http.StatusServiceUnavailable
 }
 
 // restored is s with what a masker masked before put back; s when none
