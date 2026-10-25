@@ -64,7 +64,17 @@ func init() {
 		if application.InvokeSyncWithResult(appFrontmost) {
 			fail("%s: magpie is frontmost before the icon is clicked; the test can't tell", how)
 		}
-		application.InvokeSync(func() { w.Show().Focus() }) // the icon clicked
+		// Sample focus in the same main-thread turn as the request. Another
+		// app (including a browser regression) can take the keyboard during
+		// the activation observation below; that is not a panel failure.
+		var focused, sessionKeys bool
+		application.InvokeSync(func() {
+			w.Show().Focus() // the icon clicked
+			focused = w.IsFocused()
+			if !focused {
+				sessionKeys = sessionKeysPanels()
+			}
+		})
 		waitFor(how+": the panel shows", func() bool { return application.InvokeSyncWithResult(func() bool { return windowOpen(w) }) })
 		// activation is asked for and comes a moment later: give it time
 		time.Sleep(500 * time.Millisecond)
@@ -79,8 +89,8 @@ func init() {
 		// active key, a plain titled one either (#2450). A click on the
 		// icon is input, which this test can't make, so where a plain one
 		// isn't made key the check can't tell.
-		if !application.InvokeSyncWithResult(w.IsFocused) {
-			if application.InvokeSyncWithResult(sessionKeysPanels) {
+		if !focused {
+			if sessionKeys {
 				fail("%s: the panel shown doesn't take the keyboard", how)
 			}
 			fmt.Printf("panel space: %s: not checked that it takes the keyboard: this session makes no non-activating panel key\n", how)

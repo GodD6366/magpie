@@ -1318,7 +1318,8 @@ func appendRawJSON(dst []byte, raw json.RawMessage, escapeHTML bool) ([]byte, bo
 
 // appendCompactJSON is encoding/json's appendCompact of src, a valid JSON
 // value: without the space between its tokens, and with <, >, & and
-// U+2028, U+2029 escaped when escapeHTML, as json.Marshal writes them.
+// U+2028, U+2029 escaped as the active encoding/json implementation does.
+// With jsonv2, JS separators are escaped even when HTML escaping is off.
 // Those are only ever in a string, where a valid value's space is too, so
 // strings are copied whole, or looked through for those alone.
 func appendCompactJSON(dst, src []byte, escapeHTML bool) []byte {
@@ -1327,9 +1328,9 @@ func appendCompactJSON(dst, src []byte, escapeHTML bool) []byte {
 		switch c := src[i]; {
 		case c == '"':
 			j := skipJSONString(src, i)
-			if escapeHTML {
+			if escapeHTML || rawJSONEscapesJS {
 				dst = append(dst, src[start:i]...)
-				dst = appendHTMLEscaped(dst, src[i:j])
+				dst = appendHTMLEscaped(dst, src[i:j], escapeHTML)
 				start = j
 			}
 			i = j
@@ -1344,13 +1345,13 @@ func appendCompactJSON(dst, src []byte, escapeHTML bool) []byte {
 	return append(dst, src[start:]...)
 }
 
-// appendHTMLEscaped is s with <, >, & and U+2028, U+2029 as \u escapes.
-func appendHTMLEscaped(dst, s []byte) []byte {
+// appendHTMLEscaped escapes JS separators and, when requested, <, > and &.
+func appendHTMLEscaped(dst, s []byte, escapeHTML bool) []byte {
 	const hex = "0123456789abcdef"
 	start := 0
 	for i := 0; i < len(s); i++ {
 		switch c := s[i]; {
-		case c == '<' || c == '>' || c == '&':
+		case escapeHTML && (c == '<' || c == '>' || c == '&'):
 			dst = append(dst, s[start:i]...)
 			dst = append(dst, '\\', 'u', '0', '0', hex[c>>4], hex[c&0xF])
 			start = i + 1

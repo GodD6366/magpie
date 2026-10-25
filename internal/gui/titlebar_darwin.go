@@ -122,7 +122,7 @@ static NSEvent *firstPress(NSEvent *e) {
 }
 
 // Whether AppKit gives this program the design of macOS 26, where a toolbar
-// gives a window larger corners: from macOS 26, for a program linked against
+// gives a window larger corners: on macOS 26, for a program linked against
 // the macOS 26 SDK or a later one, unless its Info.plist asks for the earlier
 // design (UIDesignRequiresCompatibility). Each is read at run time. The SDK is
 // the one the program names, which depends on the toolchain that linked it:
@@ -133,7 +133,9 @@ static NSEvent *firstPress(NSEvent *e) {
 // run on earlier ones too, and on a Mac with macOS 26 the check would be
 // compiled away.
 static BOOL designOf26(void) {
-	if (![NSProcessInfo.processInfo isOperatingSystemAtLeastVersion:(NSOperatingSystemVersion){26, 0, 0}]) return NO;
+	// macOS 27 gives plain and toolbar windows the same corners again.
+	// Keep its native toolbar instead of applying macOS 26's workaround.
+	if (NSProcessInfo.processInfo.operatingSystemVersion.majorVersion != 26) return NO;
 	id compat = [NSBundle.mainBundle objectForInfoDictionaryKey:@"UIDesignRequiresCompatibility"];
 	if ([compat respondsToSelector:@selector(boolValue)] && [compat boolValue]) return NO;
 	const struct mach_header_64 *h = _NSGetMachExecuteHeader();
