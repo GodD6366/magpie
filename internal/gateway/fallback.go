@@ -239,7 +239,12 @@ func perKeyBarred(p provider.Provider, model string, from provider.Protocol) (ou
 	}
 	keys := p.KeysOn()
 	serves := p.Serving(model) // the lists read once, not once a key (@NetRozee on X)
-	var unlisted []candidate
+	// a key on a plan of its own whose models leave this one out
+	// (KeyAccount.Plan): the Agent Plan's key is never sent the pay as
+	// you go's deepseek-v4-1-flash-261017, while a key whose plan has it
+	// can take it (yckonnnn on X)
+	planHas := p.PlanServing(model)
+	var unlisted, planless []candidate
 	var noURL provider.Protocol
 	for i, k := range keys {
 		q := p.WithKey(k)
@@ -257,6 +262,10 @@ func perKeyBarred(p provider.Provider, model string, from provider.Protocol) (ou
 			barred = append(barred, candidate{p: q, model: model, rest: rest, rank: i})
 			continue
 		}
+		if !planHas(k) {
+			planless = append(planless, candidate{p: q, model: model, rest: rest, rank: i})
+			continue
+		}
 		if !serves(k) {
 			// the vendor lists the model to another key only
 			unlisted = append(unlisted, candidate{p: q, model: model, rest: rest, rank: i})
@@ -266,6 +275,13 @@ func perKeyBarred(p provider.Provider, model string, from provider.Protocol) (ou
 	}
 	if len(out) == 0 {
 		out, unlisted = unlisted, nil // no key lists it: try them all the same
+	}
+	if len(out) == 0 {
+		// no key's plan has it as magpie knows the plans: a model the
+		// vendor added since, tried on them all the same. Else a key
+		// whose plan lacks it is never asked, not even after the others
+		// refused it: its endpoint has no such model either
+		out = planless
 	}
 	if len(out) == 0 && len(barred) > 0 {
 		return nil, nil, nil, barred
@@ -645,7 +661,7 @@ func capHeld(p, acct provider.Provider, model string, now time.Time) *capHold {
 	}
 	a := acct.Account
 	caps := provider.HoldCaps(p, a.Agent, a.User)
-	if a.Agent == "codex" && freeOnChatGPT(model) {
+	if a.Agent == "codex" && freeOnChatGPT(model, a.Plan) {
 		// a call ChatGPT counts in no window spends nothing a usage cap
 		// keeps (#1593); credits set not to be spent still hold it at
 		// 100%, as nothing says the backend answers it there
@@ -914,22 +930,32 @@ func restingOf(c candidate) (Rest, bool) {
 // quotaHeld is, when every candidate of cs is a key resting out of its
 // allowance or its credit — refused with a 429 or a 402 for it, the
 // vendor's words kept — the rest of the first, and when the first of them
-// is back: asked before then, each would be refused the same (#1772). A
+// is asked again: asked before then, each would be refused the same
+// (#1772). A key whose rest magpie guessed the length of, the vendor and
+// the user naming no time, is asked again all the same after its first
+// refusal, and a minute on after the next (Rest.asksAt): zoecats on Discord, a local aggregator said "quota
+// exhausted" for the moment it switched upstreams, and every request,
+// the agent's retry first, was answered from its 15-minute rest. A
 // subscription account isn't held so: its resets may be spent for it
 // (autoReset), and its windows are read again as it is planned.
 func quotaHeld(cs []candidate) (Rest, time.Time, bool) {
 	var first Rest
 	var back time.Time
+	now := time.Now()
 	for i, c := range cs {
 		r, ok := restingOf(c)
 		if !ok || c.p.Account != nil || r.Why != failQuota && r.Why != failCredit || !quotaStatus(r.Status) || r.said == "" {
 			return Rest{}, time.Time{}, false
 		}
+		at := r.asksAt(now)
+		if !now.Before(at) {
+			return Rest{}, time.Time{}, false
+		}
 		if i == 0 {
 			first = r
 		}
-		if back.IsZero() || r.Until.Before(back) {
-			back = r.Until
+		if back.IsZero() || at.Before(back) {
+			back = at
 		}
 	}
 	return first, back, len(cs) > 0
@@ -940,17 +966,18 @@ func quotaStatus(status int) bool {
 	return status == http.StatusTooManyRequests || status == http.StatusPaymentRequired
 }
 
-// soonestBack is when the first of cs is back from its rest; false when
-// one of them isn't resting.
+// soonestBack is when the first of cs is back from its rest, or asked
+// again before it is (Rest.asksAt); false when one of them isn't resting.
 func soonestBack(cs []candidate) (time.Time, bool) {
 	var back time.Time
+	now := time.Now()
 	for _, c := range cs {
 		r, ok := restingOf(c)
 		if !ok {
 			return time.Time{}, false
 		}
-		if back.IsZero() || r.Until.Before(back) {
-			back = r.Until
+		if at := r.asksAt(now); back.IsZero() || at.Before(back) {
+			back = at
 		}
 	}
 	return back, !back.IsZero()
@@ -1011,7 +1038,40 @@ var restingUntil = struct {
 	sync.Mutex
 	m    map[string]time.Time
 	note map[string]Rest // why each rests
-}{m: map[string]time.Time{}, note: map[string]Rest{}}
+	// lifted is when each rest was lifted before its time — by hand
+	// (Unrest), or its windows renewed — by the key it rested by: the
+	// kept routes still say it rested, and the Routing page reads this
+	// (TraceState.Lifted) to stop showing a rest lifted since it was
+	// found, from whichever page lifted it (zoecats on Discord: Try now
+	// in the provider's editor left Routing at 429 until a restart)
+	lifted map[string]time.Time
+}{m: map[string]time.Time{}, note: map[string]Rest{}, lifted: map[string]time.Time{}}
+
+// liftedLocked notes that the rest by key was lifted now, with
+// restingUntil held. A lift older than any rest can be is let go.
+func liftedLocked(key string, now time.Time) {
+	for k, at := range restingUntil.lifted {
+		if now.Sub(at) > longestMonthly {
+			delete(restingUntil.lifted, k)
+		}
+	}
+	restingUntil.lifted[key] = now
+}
+
+// liftedRests is when each rest lifted before its time was lifted, by
+// the key it rested by.
+func liftedRests() map[string]time.Time {
+	restingUntil.Lock()
+	defer restingUntil.Unlock()
+	if len(restingUntil.lifted) == 0 {
+		return nil
+	}
+	out := make(map[string]time.Time, len(restingUntil.lifted))
+	for k, at := range restingUntil.lifted {
+		out[k] = at
+	}
+	return out
+}
 
 func (s *Server) resting(id string) bool {
 	_, ok := restOf(id)
@@ -1148,8 +1208,13 @@ func promptRefused(status int, body []byte) bool {
 // custom tool turned away (customToolRefusal, DeepSeek's "Unsupported
 // custom tool: 'exec'", #2656) where no translation took it in. A
 // request missing what every API requires ("field required") or too long
-// for the model isn't one.
-var shapeWords = regexp.MustCompile(`(?i)failed to deserialize|unknown (item |content |input )?(type|variant|field|parameter)|unknown_parameter|unrecognized (request argument|field|parameter)|extra (inputs|fields) are not permitted|additional properties are not allowed|schema exceeds the maximum (nesting )?depth|schema[^"]{0,60}\bnesting depth\b`)
+// for the model isn't one. Google's refusal of a function declaration's
+// schema, which points at it (GenerateContentRequest.tools[0].
+// function_declarations[17].parameters.properties[batch].items: missing
+// field, plugins#375), is the same kind as OpenCode Go's: its subset of
+// JSON Schema is its own, and another vendor's model took the reporter's
+// same tools.
+var shapeWords = regexp.MustCompile(`(?i)failed to deserialize|unknown (item |content |input )?(type|variant|field|parameter)|unknown_parameter|unrecognized (request argument|field|parameter)|extra (inputs|fields) are not permitted|additional properties are not allowed|schema exceeds the maximum (nesting )?depth|schema[^"]{0,60}\bnesting depth\b|function_declarations\[\d+\]\.parameters\b`)
 
 // unsaidWords are Command Code's Provider API turning a request away with
 // nothing but a trace id: {"message":"invalid request error trace_id:
@@ -1768,7 +1833,7 @@ func (h *holdWriter) pass() {
 	}
 	dst := h.w.Header()
 	for k, v := range h.header {
-		if k != resetsHeader && k != refusedHeader && k != zdrHeader { // magpie's own notes, for restAfter and settle
+		if k != resetsHeader && k != refusedHeader && k != zdrHeader && k != answeredThereHeader { // magpie's own notes, for restAfter and settle
 			dst[k] = v
 		}
 	}
@@ -2173,7 +2238,7 @@ func (h *holdWriter) keepAlive() {
 		}
 		dst := h.w.Header()
 		for k, v := range src {
-			if k != resetsHeader && k != refusedHeader && k != zdrHeader && k != "Content-Length" {
+			if k != resetsHeader && k != refusedHeader && k != zdrHeader && k != answeredThereHeader && k != "Content-Length" {
 				dst[k] = slices.Clone(v)
 			}
 		}

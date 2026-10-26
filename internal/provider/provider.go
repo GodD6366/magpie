@@ -80,6 +80,8 @@ type Provider struct {
 	KeyProtocol Protocol `json:"keyProtocol,omitempty"`
 	// KeyWeight is the first key's weight (see KeyAccount.Weight).
 	KeyWeight int `json:"keyWeight,omitempty"`
+	// KeyPlan is the first key's plan (see KeyAccount.Plan).
+	KeyPlan string `json:"keyPlan,omitempty"`
 
 	// Base URLs, one per protocol the vendor serves natively. magpie appends
 	// the usual paths: chat/responses bases end in /v1 (OpenAI style),
@@ -195,6 +197,12 @@ type Provider struct {
 	// still stands over it. RestCapOff (-1): no rest at all after a
 	// failure that says nothing of why, a rate limit's as the gateway's own.
 	RestCap int `json:"restCap,omitempty"`
+	// LimitRestOff keeps its keys and accounts asked when the vendor says
+	// they are out of quota or answers 429 (zoecats on Discord: a local
+	// aggregator says "quota exhausted" for a moment while it switches
+	// upstreams, and a rest of half an hour held every request back until
+	// magpie restarted). Off by default: such a refusal rests it as ever.
+	LimitRestOff bool `json:"limitRestOff,omitempty"`
 
 	// PriceRate is what the provider charges against the official price
 	// (ITea312, #819): a relay that bills 0.8× or 1.5× of it. It scales the
@@ -431,6 +439,10 @@ type Provider struct {
 	// Account is set when the provider is an agent the user signed in to
 	// (see account.go); it is derived, never stored.
 	Account *Account `json:"-"`
+
+	// keyView is set on p.WithKey(k): p as that one key is asked with,
+	// at its plan, whose keys no longer tell plans apart (plansMixed)
+	keyView bool
 }
 
 type file struct {
@@ -654,17 +666,7 @@ var AllBuilt atomic.Int64
 func allProviders() []Provider {
 	AllBuilt.Add(1)
 	f := load()
-	stored := f.Providers
-	picks := map[string]Provider{}
-	var out []Provider
-	for _, p := range stored {
-		p = normalize(p)
-		if !hasEndpoint(p) {
-			picks[p.ID] = p
-			continue
-		}
-		out = append(out, p)
-	}
+	out, picks := ownOf(f)
 	for _, a := range Accounts() {
 		if _, taken := find(out, a.ID); taken || picks[a.ID].Hidden {
 			continue
@@ -679,6 +681,21 @@ func allProviders() []Provider {
 		out = append(out, a)
 	}
 	return ordered(out, f.Order)
+}
+
+// ownOf is f's providers of the user's own, and the model picks it keeps
+// for the signed-in accounts by id.
+func ownOf(f file) (own []Provider, picks map[string]Provider) {
+	picks = map[string]Provider{}
+	for _, p := range f.Providers {
+		p = normalize(p)
+		if !hasEndpoint(p) {
+			picks[p.ID] = p
+			continue
+		}
+		own = append(own, p)
+	}
+	return own, picks
 }
 
 // withPicks is the signed-in account a with what the user set on its
@@ -734,23 +751,33 @@ func Find(id string) (*Provider, error) {
 }
 
 func findIn(all []Provider, id string) (*Provider, error) {
+	if p := lookIn(all, id); p != nil {
+		return p, nil
+	}
+	return nil, fmt.Errorf("no provider %q — magpie providers lists them%s", id, readElsewhere())
+}
+
+// lookIn is findIn without its error, which looks on disk for where else
+// this magpie's files may be (readElsewhere): a request's model not found
+// among the providers asked it twice, for nothing (#3394).
+func lookIn(all []Provider, id string) *Provider {
 	q := strings.ToLower(strings.TrimSpace(id))
 	// an id before a name: a provider of the user's called WorkBuddy isn't
 	// the workbuddy subscription
 	if i := slices.IndexFunc(all, func(p Provider) bool { return p.ID == q }); i >= 0 {
-		return &all[i], nil
+		return &all[i]
 	}
 	for _, p := range all {
 		if strings.ToLower(p.Name) == q {
-			return &p, nil
+			return &p
 		}
 	}
 	for _, p := range all {
 		if slices.Contains(p.Was, q) {
-			return &p, nil
+			return &p
 		}
 	}
-	return nil, fmt.Errorf("no provider %q — magpie providers lists them%s", id, readElsewhere())
+	return nil
 }
 
 // readElsewhere says, for a provider not found, that this magpie reads its
@@ -1005,7 +1032,7 @@ func AddCopy(p Provider, from string) (string, error) {
 		return "", fmt.Errorf("%s is a signed-in account, which can't be copied", src.Name)
 	}
 	if p.Key == "" {
-		p.Key, p.KeyName, p.KeyProtocol, p.KeyWeight = src.Key, src.KeyName, src.KeyProtocol, src.KeyWeight
+		p.Key, p.KeyName, p.KeyProtocol, p.KeyWeight, p.KeyPlan = src.Key, src.KeyName, src.KeyProtocol, src.KeyWeight, src.KeyPlan
 		p.Keys = slices.Clone(src.Keys)
 		p.Routing, p.Sink, p.Affinity = src.Routing, src.Sink, src.Affinity
 	}
@@ -1248,7 +1275,7 @@ func normalize(p Provider) Provider {
 		// in for neither that token nor a project, and the provider as
 		// found still saves
 		p.Chat, p.Responses, p.Anthropic, p.Gemini, p.Decide = "", "", "", "", ""
-		p.Key, p.KeyName, p.Keys, p.KeyProtocol, p.KeyWeight = "", "", nil, "", 0
+		p.Key, p.KeyName, p.Keys, p.KeyProtocol, p.KeyWeight, p.KeyPlan = "", "", nil, "", 0, ""
 	}
 	p.remoteMagpieEndpoints()
 	for _, u := range []*string{&p.Chat, &p.Responses, &p.Anthropic, &p.Gemini, &p.Decide, &p.Website, &p.KeysURL} {

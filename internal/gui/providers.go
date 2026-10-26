@@ -104,6 +104,9 @@ type providerJSON struct {
 	// may be, being the user's own and not a preset's or a sign-in's
 	InsecureTLS      bool `json:"insecureTLS"`
 	TakesInsecureTLS bool `json:"takesInsecureTLS"`
+	// asked as usual after a quota refusal or a 429, never set aside for
+	// it (provider.LimitRestOff)
+	LimitRestOff bool `json:"limitRestOff"`
 	// Codex's compaction asked of it as Codex sent it, its sealed item
 	// back as it came (provider.NativeCompaction, #1099); CarriesCompaction: its
 	// wire can carry it, so the editor offers it
@@ -594,7 +597,7 @@ func providerInfoWith(p provider.Provider, agents []agentUse, desktop map[string
 		ID: p.ID, Name: p.Name, Icon: p.Icon, Preset: p.Preset, Host: p.Host(),
 		Chat: p.Chat, Responses: p.Responses, Anthropic: p.Anthropic, Gemini: p.Gemini, Decide: p.Decide, BaseAPI: p.BaseAPI, ModelTest: p.ModelTest(), TestsAs: p.TestClients(), DecideTest: p.AsksDecideModels(), MarksKinds: p.MarksKinds(),
 		Catalog: p.Catalog, Website: p.Website, KeysURL: p.KeysURL,
-		Proxy: p.Proxy, AccountProxies: p.AccountProxies, AccountModels: p.AccountModels, AccountCaps: p.AccountCaps, AccountWindowCaps: p.AccountWindowCaps, AccountNames: p.AccountNames, Headers: p.Headers, ExtraBody: p.ExtraBody, Searches: p.Searches, Cline: p.ClinePinnable(), PinUpstream: p.PinUpstream, Unredacted: p.Unredacted, InsecureTLS: p.InsecureTLS, TakesInsecureTLS: p.TakesInsecureTLS(), NativeCompaction: p.NativeCompaction, CarriesCompaction: p.CarriesCompaction(), PassUserAgent: p.PassUserAgent, OwnClient: p.OwnClient(), AuthHeader: p.AuthHeader, BothAuth: p.BothAuth(), BalanceURL: p.BalanceURL, BalancePath: p.BalancePath, BalanceMethod: p.BalanceMethod, ModelsURL: p.ModelsURL,
+		Proxy: p.Proxy, AccountProxies: p.AccountProxies, AccountModels: p.AccountModels, AccountCaps: p.AccountCaps, AccountWindowCaps: p.AccountWindowCaps, AccountNames: p.AccountNames, Headers: p.Headers, ExtraBody: p.ExtraBody, Searches: p.Searches, Cline: p.ClinePinnable(), PinUpstream: p.PinUpstream, Unredacted: p.Unredacted, InsecureTLS: p.InsecureTLS, TakesInsecureTLS: p.TakesInsecureTLS(), LimitRestOff: p.LimitRestOff, NativeCompaction: p.NativeCompaction, CarriesCompaction: p.CarriesCompaction(), PassUserAgent: p.PassUserAgent, OwnClient: p.OwnClient(), AuthHeader: p.AuthHeader, BothAuth: p.BothAuth(), BalanceURL: p.BalanceURL, BalancePath: p.BalancePath, BalanceMethod: p.BalanceMethod, ModelsURL: p.ModelsURL,
 		Ready: p.Ready(), Chosen: p.Picks(), Models: []modelJSON{}, Agents: []providerAgent{},
 		Fallback: p.Fallback, Routing: p.Routing, Sink: p.Sink, Affinity: p.Affinity, KeepLogin: p.KeepLogin, KeepLoginAs: p.KeepLoginAs, SwitchOnly: p.SwitchOnly, Unlisted: p.Unlisted, NoModels: p.ServesNone(), Off: p.Off, Contexts: p.Contexts,
 		MaxConcurrency: p.MaxConcurrency, PluginConcurrency: p.PluginConcurrency(), PriceRate: p.PriceRate,
@@ -1134,10 +1137,14 @@ func providerRoutes(mux *http.ServeMux, w Windows) {
 		writeJSON(rw, map[string]string{"icon": icon})
 	})
 	mux.HandleFunc("GET /api/icons/{name}", func(rw http.ResponseWriter, r *http.Request) {
-		f := provider.IconFile(r.PathValue("name"))
+		// a big picture comes scaled to what the window draws (#909)
+		f, ctype := provider.IconServed(r.PathValue("name"))
 		if f == "" {
 			http.NotFound(rw, r)
 			return
+		}
+		if ctype != "" {
+			rw.Header().Set("Content-Type", ctype)
 		}
 		// an SVG is only ever drawn as an image, never run
 		rw.Header().Set("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'")
@@ -1154,6 +1161,9 @@ func providerRoutes(mux *http.ServeMux, w Windows) {
 			// host is taken unchecked (#2383); a save that leaves it out
 			// keeps it
 			InsecureTLS *bool `json:"insecureTLS"`
+			// LimitRestOff is whether a quota refusal or a 429 leaves it
+			// asked as usual; a save that leaves it out keeps it
+			LimitRestOff *bool `json:"limitRestOff"`
 			// MaxConcurrency is how many requests each of its keys or
 			// accounts has out at once: a number (0 none), null for what
 			// its plugin says or none; a save that leaves it out keeps it
@@ -1476,6 +1486,9 @@ func providerRoutes(mux *http.ServeMux, w Windows) {
 				if req.InsecureTLS != nil {
 					in.InsecureTLS = *req.InsecureTLS
 				}
+				if req.LimitRestOff != nil {
+					in.LimitRestOff = *req.LimitRestOff
+				}
 				add := provider.Add
 				if req.CopyOf != "" {
 					add = func(p provider.Provider) (string, error) { return provider.AddCopy(p, req.CopyOf) }
@@ -1507,6 +1520,11 @@ func providerRoutes(mux *http.ServeMux, w Windows) {
 					in.InsecureTLS = *req.InsecureTLS
 				} else if old != nil {
 					in.InsecureTLS = old.InsecureTLS
+				}
+				if req.LimitRestOff != nil {
+					in.LimitRestOff = *req.LimitRestOff
+				} else if old != nil {
+					in.LimitRestOff = old.LimitRestOff
 				}
 				if keepCC && old != nil {
 					in.MaxConcurrency = old.MaxConcurrency
@@ -1627,7 +1645,7 @@ func providerRoutes(mux *http.ServeMux, w Windows) {
 						in.Contexts = old.Contexts // a save that doesn't say
 					}
 					if in.Key == old.Key {
-						in.KeyName, in.KeyProtocol, in.KeyWeight = old.KeyName, old.KeyProtocol, old.KeyWeight
+						in.KeyName, in.KeyProtocol, in.KeyWeight, in.KeyPlan = old.KeyName, old.KeyProtocol, old.KeyWeight, old.KeyPlan
 					}
 					// what the editor doesn't show, set from the CLI or the
 					// TUI, is kept: its tag, website and key page, and on a
@@ -2105,6 +2123,7 @@ func providerRoutes(mux *http.ServeMux, w Windows) {
 			Refs               []string
 			Protocol           provider.Protocol
 			Weight             int
+			Plan               string
 		}
 		var added, had, removed int
 		if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
@@ -2123,6 +2142,10 @@ func providerRoutes(mux *http.ServeMux, w Windows) {
 			err = provider.SetKeyProtocol(in.ID, in.Ref, in.Protocol)
 		case "weight":
 			err = provider.SetKeyWeight(in.ID, in.Ref, in.Weight)
+		case "plan":
+			// the plan a key is for (KeyAccount.Plan): its endpoints and
+			// its models are that plan's
+			err = provider.SetKeyPlan(in.ID, in.Ref, in.Plan)
 		case "use":
 			err = provider.UseKey(in.ID, in.Ref)
 		case "remove":
@@ -2149,8 +2172,8 @@ func providerRoutes(mux *http.ServeMux, w Windows) {
 		// models a key sees is known only from its own list, and an off
 		// key's isn't asked (#76), so until then a relay that hands out a
 		// key per group would send the key nothing, or everything
-		if a := r.PathValue("action"); a == "add" || a == "import" || a == "on" {
-			if p, err := provider.Find(in.ID); err == nil && p.Ready() && len(p.KeysOn()) > 1 {
+		if a := r.PathValue("action"); a == "add" || a == "import" || a == "on" || a == "plan" {
+			if p, err := provider.Find(in.ID); err == nil && p.Ready() && (len(p.KeysOn()) > 1 || a == "plan") {
 				ctx, cancel := context.WithTimeout(r.Context(), 8*time.Second)
 				p.Fetch(ctx)
 				cancel()
@@ -2317,9 +2340,15 @@ func providerRoutes(mux *http.ServeMux, w Windows) {
 		_ = json.NewDecoder(r.Body).Decode(&in)
 		// and System Settings' Login Items, where Open at login is allowed
 		// again: that one pane, not System Settings' scheme at large
-		if strings.HasPrefix(in.URL, "https://") || strings.HasPrefix(in.URL, "http://") || strings.HasPrefix(in.URL, agent.CindyScheme) || strings.HasPrefix(in.URL, agent.LodyScheme) || in.URL == autostart.LoginItemsURL {
+		if strings.HasPrefix(in.URL, "https://") || strings.HasPrefix(in.URL, "http://") || strings.HasPrefix(in.URL, agent.CindyScheme) || strings.HasPrefix(in.URL, agent.LodyScheme) || strings.HasPrefix(in.URL, agent.AionUiScheme) || in.URL == autostart.LoginItemsURL {
+			open := w.OpenURL
+			if strings.HasPrefix(in.URL, agent.LodyScheme) {
+				// Lody on Linux is run with the link, which xdg-open
+				// turned away (agent.OpenLody)
+				open = func(u string) error { return agent.OpenLody(u, w.OpenURL) }
+			}
 			// Open again on a sign-in says why it didn't open (#2043)
-			if err := w.OpenURL(in.URL); err != nil {
+			if err := open(in.URL); err != nil {
 				fail(rw, err)
 				return
 			}
@@ -2338,7 +2367,7 @@ func providerRoutes(mux *http.ServeMux, w Windows) {
 // project is.
 func typed(p, in provider.Provider, proxy *string, insecureTLS *bool) provider.Provider {
 	if k := strings.TrimSpace(in.Key); k != "" && k != p.Key {
-		p.Key, p.KeyName, p.KeyProtocol, p.KeyWeight = k, "", "", 0
+		p.Key, p.KeyName, p.KeyProtocol, p.KeyWeight, p.KeyPlan = k, "", "", 0, ""
 	}
 	if v := in.Vertex.Normal(); v != nil && p.IsVertex() && v.Project != "" {
 		p.Vertex = v

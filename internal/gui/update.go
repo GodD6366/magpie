@@ -267,6 +267,36 @@ func (u *updater) freshen() {
 	}
 }
 
+// An answer of "latest" is about the moment the feed was asked, and magpie
+// releases many times a day: Settings' Version row said 已是最新 on
+// v0.1.1402 with v0.1.1517 out (RickyWei on Discord, Windows), the answer
+// of a check made while 1402 was the newest and never made again (automatic
+// checks off, or once a day). So it is shown only while younger than
+// freshAfter. When the Version row is drawn (GET /api/update?fresh=1) an
+// older one is asked again, with automatic updates on; with them off the
+// row says so, and its Check asks.
+
+// latestStale is whether the state is a "latest" older than freshAfter.
+// The caller holds u.mu.
+func (u *updater) latestStale() bool {
+	return u.state == "latest" && time.Since(u.asked) >= freshAfter
+}
+
+// refreshLatest asks the feed again when the Version row is drawn over a
+// stale "latest", unless automatic updates are off. It doesn't wait for
+// the answer: the row shows checking, and reads again.
+func (u *updater) refreshLatest(s settings.Settings) {
+	if s.NoAutoUpdate {
+		return
+	}
+	u.mu.Lock()
+	stale := u.latestStale()
+	u.mu.Unlock()
+	if stale && u.begin() {
+		go u.run()
+	}
+}
+
 // begin marks a check as under way, unless one is. One with a version
 // already downloaded checks too: a newer one out since takes its place,
 // so the restart goes straight to the latest.
@@ -296,6 +326,13 @@ func (u *updater) run() {
 	rel, err := update.LatestIn(ctx, lang)
 	u.mu.Lock()
 	defer u.mu.Unlock()
+	// the feed names an older version than the one found before: Settings'
+	// Update channel went to Stable since (ssharpcc on X). What was
+	// downloaded from every version isn't put in, and the version found
+	// is the feed's again, as if never found.
+	if err == nil && u.latest != nil && update.Newer(u.latest.Version, rel.Version) {
+		u.staged, u.latest = "", nil
+	}
 	// a version downloaded on a click stays the one restarted into while
 	// downloads wait for a click: a newer one out since isn't fetched
 	if u.staged != "" && u.latest != nil && (err != nil || !update.Newer(rel.Version, u.latest.Version) || hold) {
@@ -463,6 +500,9 @@ func (u *updater) jsonIn(lang string) updateJSON {
 		}
 	}
 	j := updateJSON{State: u.state, Current: Version, Error: u.err, Retry: u.retry}
+	if u.latestStale() {
+		j.State = "" // not asked lately: no claim to be up to date
+	}
 	if u.state == "error" {
 		j.Mirror = u.mirror
 	}
@@ -529,6 +569,9 @@ func (u *updater) relang(version, lang string) {
 
 func updateRoutes(mux *http.ServeMux, w Windows) {
 	mux.HandleFunc("GET /api/update", func(rw http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("fresh") == "1" { // the Version row
+			updates.refreshLatest(settings.Load())
+		}
 		writeJSON(rw, updates.jsonIn(askedLang(r)))
 	})
 	// notes: what changed in every release after this one up to the update,

@@ -39,6 +39,10 @@ type Part struct {
 	MediaType string
 	Data      string // base64
 	URL       string
+	// Detail is an image's detail as the client asked for it (low, high,
+	// auto, or Responses' original), which a Chat or Responses upstream
+	// is given back (chatDetail, responsesDetail)
+	Detail string
 
 	// tool_call
 	ID   string
@@ -161,6 +165,11 @@ type Request struct {
 	// leanPrompt has the Claude bridge give the caller's instructions as
 	// the run's system prompt, in place of Claude Code's (ClaudeLeanPrompt).
 	leanPrompt bool
+	// envElsewhere: the caller's instructions name a working directory the
+	// Claude bridge's run is not in (a client on another computer, or in
+	// Windows with Claude Code in WSL), so the run's own prompt describes
+	// another machine than the one the tools run on (envElsewhereNote).
+	envElsewhere bool
 
 	Model      string
 	System     string
@@ -222,7 +231,8 @@ type Request struct {
 	// was sent, null and all, when the request is built again for a
 	// Responses upstream, whose answer to a value it doesn't take
 	// (invalid_access_program) is the client's to read; no other API takes
-	// it (magpie-releases#18).
+	// it (magpie-releases#18). Only OpenAI's upstreams are sent it
+	// (keepsAccessPrograms, #3172).
 	AccessPrograms json.RawMessage
 	// Metadata is an Anthropic client's metadata (Claude Code's user_id),
 	// which goes on as it was sent when the request is built again for an
@@ -755,6 +765,7 @@ func toolOutput(raw json.RawMessage) (string, []Part) {
 			URL       string `json:"url"`
 		} `json:"source"`
 		ImageURL json.RawMessage `json:"image_url"`
+		Detail   string          `json:"detail"` // a Responses input_image's
 	}
 	if len(raw) == 0 || raw[0] != '[' || decodeJSON(raw, &blocks) != nil {
 		return text, nil
@@ -770,15 +781,19 @@ func toolOutput(raw json.RawMessage) (string, []Part) {
 			}
 		case "input_image", "image_url":
 			var u string
+			detail := b.Detail
 			if decodeJSON(b.ImageURL, &u) != nil {
 				var o struct {
-					URL string `json:"url"`
+					URL    string `json:"url"`
+					Detail string `json:"detail"`
 				}
 				decodeJSON(b.ImageURL, &o)
-				u = o.URL
+				u, detail = o.URL, o.Detail
 			}
 			if u != "" {
-				images = append(images, imagePart(u))
+				im := imagePart(u)
+				im.Detail = detail
+				images = append(images, im)
 			}
 		}
 	}

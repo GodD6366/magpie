@@ -7,12 +7,14 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"html"
 	"io"
 	"log"
 	"net/http"
 	"regexp"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/tidwall/gjson"
@@ -100,32 +102,47 @@ func (s *Server) codexBackend(w http.ResponseWriter, r *http.Request) {
 			writeError(w, provider.Responses, 400, err.Error())
 			return
 		}
+		// a turn of the conversation's own: the model its side calls may
+		// follow (codexFollowTo)
+		kind := requestCallKind(r.Header, requestSessionMetadata(r.Header, body))
+		s.codexLeads.saw(r, kind, model)
 		// a thread's title, where Settings sends it (#705) — the request
 		// still on Codex's own model, through its sign-in, when it says
 		// nothing of them
 		if rest == "/responses" {
-			if to := codexTitlesTo(r.Header, body, false); to != "" {
+			session := func() string { return s.codexSideSession(r, body) }
+			if to := codexTitlesTo(r.Header, body, false, session); to != "" {
 				s.codexTitle(w, r, body, to)
 				return
 			}
-			if to := codexDescriptionsTo(r.Header, body, false); to != "" {
+			if to := codexDescriptionsTo(r.Header, body, false, session); to != "" {
 				s.codexDescription(w, r, body, to)
 				return
 			}
-			if to := codexSummariesTo(r.Header, body, false); to != "" {
+			if to := codexSummariesTo(r.Header, body, false, session); to != "" {
 				s.codexSummary(w, r, body, to)
 				return
 			}
-			if to := codexPredictionsTo(r.Header, body, false); to != "" {
+			if to := codexPredictionsTo(r.Header, body, false, session); to != "" {
 				s.codexPrediction(w, r, body, to)
 				return
 			}
 			// a subagent on one of Codex's own models, put on the model
 			// set for Codex's subagents, a ChatGPT account's in magpie;
 			// the request on the model asked for when it can't be, the
-			// trace saying why (codexUpstreamOn, serve)
+			// trace saying why (codexUpstreamOn, serve). One with nothing
+			// set for it, a subagent's or a memory call,
+			// on the model its conversation is on when that is one of
+			// magpie's, not on the ChatGPT sign-in (codexFollowTo)
 			if !strings.Contains(model, "/") {
-				pick := codexSubagentPick(r, agentOf(r), requestCallKind(r.Header, requestSessionMetadata(r.Header, body)), model, body)
+				pick := codexSubagentPick(r, agentOf(r), kind, model, body)
+				if to := s.codexFollowTo(r, agentOf(r), kind, model, body); to != "" && pick == nil {
+					if usage.PurposeOf(kind) == "kind:collab_spawn" {
+						pick = &SubagentPick{Asked: model, To: to}
+					} else {
+						body, model = withModel(body, to), to
+					}
+				}
 				r = withSubagentPick(r, pick)
 				if pick.Moved() {
 					body, model = withModel(body, pick.To), pick.To
@@ -150,6 +167,11 @@ func (s *Server) codexBackend(w http.ResponseWriter, r *http.Request) {
 			if rest == "/responses/compact" {
 				writeError(w, provider.Responses, 400, "/responses/compact is not supported for Magpie models; use a compaction_trigger on /responses")
 				return
+			}
+			if kind == "guardian" || isMemoryKind(kind) {
+				// an auto-review or a memory call, at an effort the
+				// model takes (codexSideEffort)
+				body = codexSideEffort(body, model)
 			}
 			// a sealed subagent task goes to a ChatGPT account the model
 			// or group has, or is turned away (serve, sealedReader)
@@ -272,16 +294,16 @@ func sealedTaskError(model, lead, earlier string) string {
 }
 
 // sealedWayOut is the way to subagents on any model from a lead on
-// Codex's own models (#2245): Settings' "Codex subagents on any model"
-// (settings.CodexAgentsV1, #141) has the lead hand its subagents their
-// tasks as text. Off, the refusal names it; on, a thread still sealing
-// its tasks is on V2 all the same: begun before it was on, or held there
-// by Codex's own features.multi_agent_v2.
+// Codex's own models (#2245): "Codex subagents on any model", in Codex's
+// settings on the Agents page (settings.CodexAgentsV1, #141), has the
+// lead hand its subagents their tasks as text. Off, the refusal names
+// it; on, a thread still sealing its tasks is on V2 all the same: begun
+// before it was on, or held there by Codex's own features.multi_agent_v2.
 func sealedWayOut() string {
 	if settings.Load().CodexAgentsV1 {
-		return ` "Codex subagents on any model" is on in magpie's Settings, but this thread runs Codex's multi-agent V2, whose tasks are sealed: it began before the setting was turned on, or Codex's own features.multi_agent_v2 is on in its config. Start a new thread, with features.multi_agent_v2 off.`
+		return ` "Codex subagents on any model" is on in Codex's settings on magpie's Agents page, but this thread runs Codex's multi-agent V2, whose tasks are sealed: it began before the setting was turned on, or Codex's own features.multi_agent_v2 is on in its config. Start a new thread, with features.multi_agent_v2 off.`
 	}
-	return ` For subagents on any model while the lead is on a ChatGPT model, turn on "Codex subagents on any model" in magpie's Settings and start a new thread: the lead then hands its subagents their tasks as text.`
+	return ` For subagents on any model while the lead is on a ChatGPT model, turn on "Codex subagents on any model" in Codex's settings on magpie's Agents page and start a new thread: the lead then hands its subagents their tasks as text.`
 }
 
 // sealedTaskItself says what a sealed task is (#1855): spawn_agent's
@@ -880,7 +902,7 @@ func (s *Server) codexUpstreamOn(w http.ResponseWriter, r *http.Request, rest st
 	if r.Method == http.MethodPost {
 		var unmask func()
 		var err error
-		w, body, unmask, maskedHits, err = redactedHits(w, body)
+		w, body, unmask, maskedHits, err = redactedHits(r.Context(), w, body)
 		defer unmask()
 		if err != nil {
 			writeError(w, provider.Responses, maskStatus(err), err.Error())
@@ -1208,7 +1230,7 @@ func (s *Server) codexUpstreamOn(w http.ResponseWriter, r *http.Request, rest st
 			end(res.StatusCode, res.Status, 0, 0)
 			return
 		}
-		if rest == "/responses" && res.StatusCode >= 400 {
+		if (rest == "/responses" || rest == "/responses/compact") && res.StatusCode >= 400 {
 			msg, _ := io.ReadAll(io.LimitReader(res.Body, 1<<20))
 			res.Body = io.NopCloser(bytes.NewReader(msg))
 			if overload && codexBusy(res.StatusCode, msg) && s.codexFallsBack(modelOf(body), body) {
@@ -1219,10 +1241,11 @@ func (s *Server) codexUpstreamOn(w http.ResponseWriter, r *http.Request, rest st
 				s.codexFallBack(w0, r, body0, kept)
 				return
 			}
-			if len(bytes.TrimSpace(msg)) == 0 {
+			if said, ok := codexSaidNothing(rest, modelOf(body), codexWho(base, on), res, msg); ok {
 				// a failure with nothing said of it, which Codex shows as
-				// "Unknown error" alone (#409): said where the turn went
-				said := codexFailedEmpty(modelOf(body), res.Status)
+				// "Unknown error" alone (#409), or a web page Codex shows
+				// as its markup: said where the turn, or the compaction
+				// (outrageous_piglet on Discord), went
 				failWith(res.StatusCode, said)
 				s.record(Call{Time: start, From: provider.Responses, To: provider.Responses, Model: modelOf(body),
 					Provider: "openai", Agent: agentOf(r), Kind: callKind(r.Header), Status: res.StatusCode,
@@ -1562,6 +1585,51 @@ func codexFailedEmpty(model, status string) string {
 		"(provider/model, or set it in magpie's Agents view), or try again later"
 }
 
+// codexWho names who a request relayed to OpenAI went to: Codex's own
+// sign-in, its API key, or one of magpie's ChatGPT accounts (on).
+func codexWho(base string, on *provider.Provider) string {
+	switch {
+	case on != nil && on.Account != nil && on.Account.User != "":
+		return "OpenAI (" + on.Account.User + ")"
+	case base == codexAPIBase:
+		return "OpenAI's API"
+	}
+	return "OpenAI"
+}
+
+// codexSaidNothing is what Codex is told of a failure OpenAI answered a
+// turn or a compaction with that it can't show: an empty body, which
+// Codex shows as "unexpected status 502 Bad Gateway: Unknown error"
+// (#409, outrageous_piglet on Discord: a compaction), or a web page in
+// place of an API error, which it shows as markup. ok is false for an
+// error Codex reads as it came.
+func codexSaidNothing(rest, model, who string, res *http.Response, msg []byte) (string, bool) {
+	t := bytes.TrimSpace(msg)
+	page := len(t) > 0 && (htmlStart.Match(t) || strings.HasPrefix(strings.ToLower(res.Header.Get("Content-Type")), "text/html"))
+	if len(t) > 0 && !page {
+		return "", false
+	}
+	if rest == "/responses" && len(t) == 0 && who == "OpenAI" {
+		return codexFailedEmpty(model, res.Status), true
+	}
+	what := "this turn"
+	if rest == "/responses/compact" {
+		what = "this compaction"
+	}
+	said := " and said nothing more"
+	if page {
+		said = " with a web page in place of an API error"
+		if m := pageTitle.FindSubmatch(msg); m != nil {
+			if title := strings.Join(strings.Fields(html.UnescapeString(string(m[1]))), " "); title != "" {
+				said += " (“" + clipRunes(title, 120) + "”)"
+			}
+		}
+	}
+	return who + " answered " + what + " for " + model + " " + res.Status + said +
+		". " + model + " is one of Codex's own models, which goes to OpenAI, not to a provider in magpie; try again later, " +
+		"or pick one of magpie's models in Codex (provider/model, or set it in magpie's Agents view)", true
+}
+
 // apiKey reports whether Codex signed in with an API key rather than a
 // ChatGPT account.
 func apiKey(h http.Header) bool {
@@ -1677,40 +1745,162 @@ func copyHeaders(dst, src http.Header) {
 // them, held magpie's answer past that (#539). A var so tests can say.
 var codexModelsWait = 3 * time.Second
 
+// codexListFor is how long the backend's list is handed out again without
+// asking it; past that it is still handed out at once while it is asked
+// again (#3734). A var so tests can say.
+var codexListFor = time.Minute
+
+// codexListFetch bounds one ask of the backend, which goes on past
+// codexModelsWait for the callers after.
+const codexListFetch = 30 * time.Second
+
+// codexLists is the backend's last list for each sign-in. Twenty Codex
+// app-servers asked it at once, each on its own and each given up at
+// codexModelsWait, so a backend slower than that never got a list through
+// and Codex fell back to its own metadata, without tool_search for
+// magpie's groups, and inlined every Apps tool: ~500K tokens a turn
+// (#3734, 1,906 timeouts in a day).
+var codexLists = struct {
+	sync.Mutex
+	at map[string]*codexListed
+	// asking is the asks going, for tests to wait on
+	asking sync.WaitGroup
+}{at: map[string]*codexListed{}}
+
+type codexListed struct {
+	body []byte // the list as the backend said it, nil for none yet
+	etag string
+	got  time.Time
+	// deny is a 401 or 403 the last ask got, Codex's to see
+	deny     *http.Response
+	denyBody []byte
+	// asked is closed when the ask going ends; nil when none is
+	asked chan struct{}
+}
+
+// codexListKey is whose list it is: the backend's, the account's (a
+// token renewed is the same account), the version Codex says.
+func codexListKey(r *http.Request) string {
+	who := r.Header.Get("chatgpt-account-id")
+	if who == "" {
+		who = r.Header.Get("Authorization")
+	}
+	return provider.CodexBase + "\x00" + who + "\x00" + r.URL.RawQuery
+}
+
+// codexBackendList is the backend's model list for r's sign-in: the last
+// one asked when it is fresh, or at once while it is asked again; else
+// what an ask brings within codexModelsWait. One ask at a time for each
+// sign-in, whoever is waiting on it. body is nil when there is none;
+// deny, when the backend refused the sign-in.
+func (s *Server) codexBackendList(r *http.Request) (body []byte, etag string, deny *http.Response, denyBody []byte) {
+	key := codexListKey(r)
+	codexLists.Lock()
+	e := codexLists.at[key]
+	if e == nil {
+		e = &codexListed{}
+		codexLists.at[key] = e
+	}
+	if e.body != nil && time.Since(e.got) < codexListFor {
+		defer codexLists.Unlock()
+		return e.body, e.etag, nil, nil
+	}
+	if e.asked == nil {
+		// a refusal an ask before had is no answer for this one
+		e.asked, e.deny, e.denyBody = make(chan struct{}), nil, nil
+		codexLists.asking.Add(1)
+		go s.askCodexList(r.Context(), r.Header.Clone(), r.URL.RawQuery, e, e.asked)
+	}
+	asked, stale := e.asked, e.body != nil
+	codexLists.Unlock()
+	if !stale {
+		t := time.NewTimer(codexModelsWait)
+		select {
+		case <-asked:
+		case <-t.C:
+		case <-r.Context().Done():
+		}
+		t.Stop()
+	}
+	codexLists.Lock()
+	defer codexLists.Unlock()
+	return e.body, e.etag, e.deny, e.denyBody
+}
+
+// askCodexList asks the backend for its list into e, past the request
+// that started it, and closes done.
+func (s *Server) askCodexList(rctx context.Context, h http.Header, query string, e *codexListed, done chan struct{}) {
+	defer codexLists.asking.Done()
+	var body, denyBody []byte
+	var etag string
+	var deny *http.Response
+	defer func() {
+		codexLists.Lock()
+		if body != nil {
+			e.body, e.etag, e.got, e.deny, e.denyBody = body, etag, time.Now(), nil, nil
+		} else if deny != nil {
+			// a sign-in to renew: the next caller waits on the backend
+			// again and sees it, nothing stale handed out meanwhile
+			e.body, e.deny, e.denyBody = nil, deny, denyBody
+		}
+		e.asked = nil
+		codexLists.Unlock()
+		close(done)
+	}()
+	u := provider.CodexBase + "/models"
+	if query != "" {
+		u += "?" + query
+	}
+	ctx, cancel := context.WithTimeout(provider.ViaSignedIn(context.WithoutCancel(rctx), "codex"), codexListFetch)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+	if err != nil {
+		return
+	}
+	copyHeaders(req.Header, h)
+	// the whole list, shared by every caller, whatever one of them had
+	for _, k := range []string{"Accept-Encoding", "If-None-Match", "If-Modified-Since"} {
+		req.Header.Del(k)
+	}
+	res, err := s.client.Do(req)
+	if err != nil {
+		return
+	}
+	b, _ := io.ReadAll(io.LimitReader(res.Body, 16<<20))
+	res.Body.Close()
+	var list struct {
+		Models []any `json:"models"`
+	}
+	if res.StatusCode < 300 && json.Unmarshal(b, &list) == nil && list.Models != nil {
+		body, etag = b, res.Header.Get("ETag")
+		// the versions as the backend says them, before any is stamped
+		// (see codexcat.V1)
+		codexcat.Remember(list.Models)
+	} else if res.StatusCode == 401 || res.StatusCode == 403 {
+		deny, denyBody = &http.Response{StatusCode: res.StatusCode, Header: res.Header}, b
+	}
+}
+
 // codexModels is the ChatGPT backend's model list for this sign-in, with
 // magpie's models after it. Should the backend not answer, or not in
 // time, Codex's last list of its own stands in.
 func (s *Server) codexModels(w http.ResponseWriter, r *http.Request) {
 	var own []any
-	etag := ""
-	u := provider.CodexBase + "/models"
-	if r.URL.RawQuery != "" {
-		u += "?" + r.URL.RawQuery
+	body, etag, deny, denyBody := s.codexBackendList(r)
+	if deny != nil {
+		// a sign-in to renew is Codex's to see
+		w.Header().Set("Content-Type", deny.Header.Get("Content-Type"))
+		w.WriteHeader(deny.StatusCode)
+		w.Write(denyBody)
+		return
 	}
-	ctx, cancel := context.WithTimeout(provider.ViaSignedIn(r.Context(), "codex"), codexModelsWait)
-	defer cancel()
-	if req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil); err == nil {
-		copyHeaders(req.Header, r.Header)
-		req.Header.Del("Accept-Encoding")
-		if res, err := s.client.Do(req); err == nil {
-			var list struct {
-				Models []any `json:"models"`
-			}
-			b, _ := io.ReadAll(io.LimitReader(res.Body, 16<<20))
-			res.Body.Close()
-			if res.StatusCode < 300 && json.Unmarshal(b, &list) == nil {
-				own, etag = list.Models, res.Header.Get("ETag")
-				// the versions as the backend says them, before any is
-				// stamped below (see codexcat.V1)
-				codexcat.Remember(own)
-			} else if res.StatusCode == 401 || res.StatusCode == 403 {
-				// a sign-in to renew is Codex's to see
-				w.Header().Set("Content-Type", res.Header.Get("Content-Type"))
-				w.WriteHeader(res.StatusCode)
-				w.Write(b)
-				return
-			}
+	if body != nil {
+		// each caller's own copy: what follows writes into the entries
+		var list struct {
+			Models []any `json:"models"`
 		}
+		json.Unmarshal(body, &list)
+		own = list.Models
 	}
 	// what follows reads the providers seven times over (the catalog, the
 	// codex provider's picks and windows, the list's tag): held, they are
@@ -1811,9 +2001,10 @@ func (s *Server) codexModels(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	// and the auto-review model the user picked (#938)
+	autoReview := codexcat.AutoReviewModel()
 	for _, m := range own {
 		if o, ok := m.(map[string]any); ok {
-			codexcat.AutoReview(o)
+			codexcat.AutoReview(o, autoReview)
 		}
 	}
 	// a Codex here for account failover alone, not connected to magpie,
@@ -2548,6 +2739,33 @@ func forVendor(p provider.Provider, body []byte) []byte {
 	return nb
 }
 
+// keepsAccessPrograms says a Responses request to p goes with its top-level
+// access_programs, the Cyber program a request asks the model under
+// (OpenAI's Daybreak, magpie-releases#18): to the ChatGPT backend, to
+// OpenAI's API, to another magpie (whose own upstream decides), and to a
+// relay that takes Codex's requests as Codex sent them (CodexAsSent). Codex
+// itself sends the field to nobody else: only with a ChatGPT sign-in, or an
+// API key on its provider named "openai" (codex-rs cyber_access_program.rs,
+// for_auth and for_provider), which is how it comes to magpie. OpenCode Go
+// answers it, for DeepSeek and GLM, with a 503 "Endpoint is unavailable"
+// that says nothing of the field (#3172), and no other vendor has a program
+// to read in it.
+func keepsAccessPrograms(p provider.Provider, in http.Header) bool {
+	return p.Account != nil && p.Account.Agent == "codex" ||
+		strings.HasSuffix(p.Host(), "openai.com") ||
+		p.IsRemoteMagpie() ||
+		p.CodexAsSent && p.Account == nil && fromCodex(in)
+}
+
+// withoutAccessPrograms is body without its top-level access_programs, the
+// rest byte for byte (withoutTopMember).
+func withoutAccessPrograms(body []byte) []byte {
+	if !bytes.Contains(body, []byte(`"access_programs"`)) {
+		return body
+	}
+	return withoutTopMember(body, "access_programs")
+}
+
 // forVendorChanges reports whether forVendor has anything to leave out of
 // body, read as it reads it, without decoding the conversation: Codex
 // sends what the rewrite looks for by name in every request, and its
@@ -2584,7 +2802,7 @@ func userMessage(text string) map[string]any { return codexsummary.UserMessage(t
 //
 // A provider that answers the summary 404 — a relay that serves the
 // conversation turn by turn but not the summary of it, "Upstream request
-// failed" (#866) — or 400 for an item of it it doesn't have (#1008) is
+// failed" (#866) — or 405 or 501 (lacksEndpoint), or 400 for an item of it it doesn't have (#1008) is
 // asked once more with the conversation as plain text, none of its items'
 // ids or sealed reasoning in it; when that fails too the summary is
 // magpie's own, the conversation's user messages and last reply,
@@ -2593,7 +2811,8 @@ func userMessage(text string) map[string]any { return codexsummary.UserMessage(t
 // Discord): the same long history failed so on every account and model,
 // and as plain text was summarised — and one it breaks off with that
 // refusal after the reply began, HTTP 200 and an error event (#1270). Any
-// other failure (401, 429, 500) goes back to Codex as it came.
+// other failure (401, 429, 500) goes back to Codex with its status, said
+// as the compaction's, with who answered it (compactFailed).
 //
 // The summary is asked for whole (askWhole): a reply that breaks off, or
 // ends incomplete, is a failure the next account or member answers, as
@@ -2628,7 +2847,7 @@ func (s *Server) codexCompact(w http.ResponseWriter, r *http.Request, body []byt
 	}
 	rec, res, err := ask(body)
 	local := ""
-	if first := rec.status; first == http.StatusNotFound || itemNotFound(rec) || upstreamFailed(rec) || protectionRefused(first, rec.body.Bytes()) ||
+	if first := rec.status; lacksEndpoint(first) || itemNotFound(rec) || upstreamFailed(rec) || protectionRefused(first, rec.body.Bytes()) ||
 		err != nil && protectionWords.MatchString(err.Error()) {
 		who, msg := compactFailure(body, rec)
 		if err != nil {
@@ -2649,13 +2868,18 @@ func (s *Server) codexCompact(w http.ResponseWriter, r *http.Request, body []byt
 		}
 	}
 	if rec.status >= 400 {
-		_, msg := compactFailure(body, rec)
+		// said as the compaction's failure, with who answered it: a bare
+		// "Fake: 502 Bad Gateway" read as Codex's own, and a body with
+		// nothing in it as "Unknown error" (outrageous_piglet on Discord);
+		// the vendor's code, param and Retry-After go with it
+		who, msg := compactFailure(body, rec)
 		s.compactFails.failed(key, rec.status, msg)
 		for k, vs := range rec.header {
-			w.Header()[k] = vs
+			if k != "Content-Length" && k != "Content-Type" {
+				w.Header()[k] = vs
+			}
 		}
-		w.WriteHeader(rec.status)
-		w.Write(rec.body.Bytes())
+		writeVendorError(w, provider.Responses, rec.status, compactFailed(who, rec.status, msg), rec.body.Bytes())
 		return
 	}
 	if err == nil && local == "" && res.Status == "incomplete" {
@@ -2722,6 +2946,24 @@ func (s *Server) codexCompact(w http.ResponseWriter, r *http.Request, body []byt
 	if f, ok := w.(http.Flusher); ok {
 		f.Flush()
 	}
+}
+
+// compactFailed is what Codex is told of a summary request that failed:
+// that it was the compaction's, who answered it and what they said —
+// never nothing, which Codex shows as "Unknown error".
+func compactFailed(who string, status int, msg string) string {
+	if strings.TrimSpace(msg) == "" {
+		msg = "nothing more"
+	}
+	return fmt.Sprintf("compaction: %s answered the summary request %d %s: %s", who, status, http.StatusText(status), msg)
+}
+
+// lacksEndpoint is a status saying the provider has no summary request to
+// answer at that address: 404, 405 (a relay that takes GETs there) or 501.
+// The summary is asked again as plain text, and made without a model when
+// that fails too, as for a relay's 404 (#866).
+func lacksEndpoint(status int) bool {
+	return status == http.StatusNotFound || status == http.StatusMethodNotAllowed || status == http.StatusNotImplemented
 }
 
 // upstreamFailed is a relay's own word that the provider behind it turned
