@@ -137,8 +137,12 @@ func TestServeWSLListensBesideLoopback(t *testing.T) {
 	t.Cleanup(func() { cancel(); <-done; srv.Close() })
 
 	at := "http://" + net.JoinHostPort("::1", Port()) + "/"
+	// Probe the listener with a new connection each time. Closing a listener
+	// does not close requests already accepted on a keep-alive connection.
+	tr := &http.Transport{DisableKeepAlives: true}
+	t.Cleanup(tr.CloseIdleConnections)
+	c := &http.Client{Transport: tr, Timeout: time.Second}
 	answers := func() bool {
-		c := &http.Client{Timeout: time.Second}
 		res, err := c.Get(at)
 		if err != nil {
 			return false
