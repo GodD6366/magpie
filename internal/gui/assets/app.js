@@ -1414,7 +1414,8 @@ function expandLink(a) {
   const b = el("button", "ag-link" + (open ? " open" : ""));
   b.type = "button";
   b.setAttribute("aria-expanded", String(open));
-  b.append(el("span", "", open ? t("Collapse") : a.id === "claude" ? t("Tiers") : a.models && !listsMenu(a) ? t("Models {n}", { n: a.models.shown }) : t("Details")));
+  // it opens more than models; their count is in the status line
+  b.append(el("span", "", open ? t("Collapse") : t("Details")));
   if (!open) {
     b.append(el("span", "chev", svg(CHEV_R, 10, 1.6)));
   }
@@ -4252,9 +4253,9 @@ async function renderUpdateBadge() {
   };
   const restart = async () => {
     b.classList.add("busy");
-    label.textContent = t("Restarting…");
+    label.textContent = t("Updating…");
     // an answer means it didn't: the password prompt dismissed, the swap
-    // failed, or a newer version is out and downloading first
+    // failed, or a newer version is out and downloading first (dawnmarch7429)
     const a = await api("update/install", installFrom()).catch(() => ({}));
     if (!a) return backAsNew(u.current);
     if (a) {
@@ -19628,6 +19629,9 @@ function renderSettings() {
   row(t("Gateway URL"), t("the address every agent is pointed at"), gw, copyBtn(gw, t("Gateway URL")));
   // MAGPIE_PUBLIC_URL, where other machines reach it (#1551)
   if (s.publicURL && gw !== s.publicURL) row(t("Public address"), t("MAGPIE_PUBLIC_URL: where other computers reach the gateway, with a gateway key"), s.publicURL, copyBtn(s.publicURL, t("Public address"))).id = "publicURLRow";
+  const site = el("button", "text", t("Open"));
+  site.onclick = () => api("open", { url: "https://usemagpie.ai" }).catch(() => {});
+  row(t("Website"), t("downloads, docs and what's new"), "usemagpie.ai", site);
   const join = el("button", "discord");
   join.innerHTML = DISCORD_SVG;
   join.append(el("span", "", t("Join Discord")));
