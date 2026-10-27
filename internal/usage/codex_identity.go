@@ -244,26 +244,84 @@ func codexChunkResponsePairs(gateways, locals []*rowChunk, duplicateLocal map[ro
 	return pairs, compactions
 }
 
+// foldIDs are each chunk's Codex log calls by a hash of their response
+// id, kept by the chunk's serial (foldCodexRows). A page polled while one
+// session was live decoded every session file of the period again to
+// hash the same ids: ~40 MB a poll of today's page, and as much again
+// for Codex's effort.
+var foldIDs struct {
+	sync.Mutex
+	by   map[uint64]*foldedIDs
+	turn uint64
+}
+
+type foldedIDs struct {
+	// each call's hash shifted left by foldIndexBits, and its index in
+	// the bits that frees: calls whose hash is the same are told apart by
+	// their ids after, so a shortened hash only reads a few more rows
+	calls []uint64
+	turn  uint64 // the fold that used it last
+}
+
+const foldIndexBits = 24
+
+var foldSeed = maphash.MakeSeed()
+
+// foldKept is how many folds a chunk's ids outlive the last that read
+// them: the page's and Codex effort's are of different chunks.
+const foldKept = 4
+
+// foldHashing, in tests, is told each chunk foldCodexRows reads ids from.
+var foldHashing func(*rowChunk)
+
 func foldCodexRows(locals []*rowChunk) map[rowRef]bool {
 	// The calls are found by a hash of their response id, not the id: a map
 	// keyed by every Codex call's id held each decoded chunk's strings. Calls
 	// whose hash is the same are told apart by their ids after.
-	seed := maphash.MakeSeed()
 	first := map[uint64]rowRef{}
 	again := map[uint64][]rowRef{}
 	rows := lentRows() // an id is kept as its hash
 	defer rows.release()
+	foldIDs.Lock()
+	foldIDs.turn++
+	turn := foldIDs.turn
+	known := make(map[*rowChunk]*foldedIDs, len(locals))
 	for _, chunk := range locals {
-		open := rows.of(chunk)
-		for i := range open.Rows {
-			id := open.Strings[open.text(&open.Rows[i], rowResponseID)]
-			if id == "" {
-				continue
+		if f := foldIDs.by[chunk.serial]; chunk.serial != 0 && f != nil {
+			f.turn = turn
+			known[chunk] = f
+		}
+	}
+	foldIDs.Unlock()
+	var made map[uint64]*foldedIDs
+	for _, chunk := range locals {
+		f := known[chunk]
+		if f == nil {
+			if foldHashing != nil {
+				foldHashing(chunk)
 			}
-			if row := open.row(i); !isCodexRow(row) || row.Source != "log" {
-				continue
+			f = &foldedIDs{turn: turn}
+			open := rows.of(chunk)
+			for i := range open.Rows {
+				id := open.Strings[open.text(&open.Rows[i], rowResponseID)]
+				if id == "" {
+					continue
+				}
+				if row := open.row(i); !isCodexRow(row) || row.Source != "log" {
+					continue
+				}
+				f.calls = append(f.calls, maphash.String(foldSeed, id)<<foldIndexBits|uint64(i))
 			}
-			ref, h := rowRef{chunk, i}, maphash.String(seed, id)
+			if chunk.serial != 0 && len(open.Rows) < 1<<foldIndexBits {
+				if made == nil {
+					made = map[uint64]*foldedIDs{}
+				}
+				f.calls = slices.Clip(f.calls)
+				made[chunk.serial] = f
+			}
+		}
+		for _, call := range f.calls {
+			ref, h := rowRef{chunk, int(call & (1<<foldIndexBits - 1))}, call>>foldIndexBits
 			if f, ok := first[h]; !ok {
 				first[h] = ref
 			} else {
@@ -274,6 +332,19 @@ func foldCodexRows(locals []*rowChunk) map[rowRef]bool {
 			}
 		}
 	}
+	foldIDs.Lock()
+	if foldIDs.by == nil {
+		foldIDs.by = map[uint64]*foldedIDs{}
+	}
+	for serial, f := range made {
+		foldIDs.by[serial] = f
+	}
+	for serial, f := range foldIDs.by {
+		if f.turn+foldKept < foldIDs.turn {
+			delete(foldIDs.by, serial)
+		}
+	}
+	foldIDs.Unlock()
 	var refs []rowRef
 	for _, hashed := range again {
 		refs = append(refs, hashed...)
@@ -390,7 +461,25 @@ type effortEntry struct {
 	have     bool
 	building chan struct{} // closed when the build under way ends
 	used     int64
+	at       time.Time // when the kept answer's build began
 }
+
+// effortFresh is how long an answer stands before a change is built into
+// it. Codex and Claude Code write to their session files all the time, so
+// nearly every 15 s Sessions poll found the history changed and built the
+// ledger of all of it again: over a real history that was ~2.5 GB
+// allocated and ~1 s of CPU every 3.5 minutes for this answer alone. A
+// thread's consumption a minute behind is still the thread's; the page's
+// own rows and totals are read as they change.
+var effortFresh = time.Minute
+
+// effortBehind: once an answer is past effortFresh and the history
+// changed, the ask that finds it is told it while the next is built behind
+// it. The build is the ledger of all history, and made inside the
+// Sessions page's request it held that poll 0.8 to 1.3 s every minute a
+// Codex or Claude Code was working; the next poll has the change. Only a
+// period's first answer, or one from another home, is waited for.
+var effortBehind = true
 
 // effortBuilt, in tests, is told each time CodexModelEffort reads the ledger.
 var effortBuilt func()
@@ -400,6 +489,15 @@ func CodexModelEffort(p Period) map[string][]sessions.ModelEffort {
 	if LogCalls != nil { // synthetic logs carry no state to key on
 		return codexModelEffort(codexEffortRows(p, Clock(), LogCalls))
 	}
+	codexEffort.Lock()
+	if e := codexEffort.periods[p]; e != nil && e.have && e.root == requestRoot() && time.Since(e.at) < effortFresh {
+		codexEffort.built++
+		e.used = codexEffort.built
+		value := e.value
+		codexEffort.Unlock()
+		return cloneEffort(value) // read before the state is: that is most of an unchanged ask's cost
+	}
+	codexEffort.Unlock()
 	now := Clock()
 	st := readRequestState(now)
 	codexEffort.Lock()
@@ -426,15 +524,27 @@ func CodexModelEffort(p Period) map[string][]sessions.ModelEffort {
 	}
 	done := make(chan struct{})
 	e.building = done
+	if effortBehind && e.have && e.root == st.root {
+		value := e.value
+		codexEffort.Unlock()
+		go buildEffort(e, st, p, now, done)
+		return cloneEffort(value)
+	}
 	codexEffort.Unlock()
-	var value map[string][]sessions.ModelEffort
+	return cloneEffort(buildEffort(e, st, p, now, done))
+}
+
+// buildEffort builds p's answer under st into e, and closes done when it
+// is kept.
+func buildEffort(e *effortEntry, st requestState, p Period, now time.Time, done chan struct{}) (value map[string][]sessions.ModelEffort) {
+	began := time.Now()
 	defer func() {
 		codexEffort.Lock()
 		e.building = nil
 		if value != nil {
 			// kept under the state read before the build: a call written
 			// while it ran changes the state, and the next ask builds again
-			e.key, e.root, e.value, e.have = st.key, st.root, value, true
+			e.key, e.root, e.value, e.have, e.at = st.key, st.root, value, true, began
 		}
 		codexEffort.Unlock()
 		close(done)
@@ -444,8 +554,7 @@ func CodexModelEffort(p Period) map[string][]sessions.ModelEffort {
 	if effortBuilt != nil {
 		effortBuilt()
 	}
-	value = codexEffortOfIndex(st, p, now)
-	return cloneEffort(value)
+	return codexEffortOfIndex(st, p, now)
 }
 
 // codexEffortRows are the rows of ledgerOfAt(p, Filter{}, now, reader) that
@@ -569,7 +678,9 @@ func (groups effortSums) add(row *Row) {
 	key := modelEffortKey{row.Model, row.Effort}
 	entry := byModel[key]
 	if entry == nil {
-		entry = &effortTotal{value: sessions.ModelEffort{Model: row.Model, Effort: row.Effort}, priced: true}
+		// the row's strings can be lent (visitActors): what is kept is a copy
+		key = modelEffortKey{strings.Clone(row.Model), strings.Clone(row.Effort)}
+		entry = &effortTotal{value: sessions.ModelEffort{Model: key.model, Effort: key.effort}, priced: true}
 		byModel[key] = entry
 	}
 	entry.priced = entry.priced && row.Priced

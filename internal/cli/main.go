@@ -85,7 +85,7 @@ const usage = `magpie — one place to pick every agent's model
                                   or only the models ticked for it, a new one off until it is ticked
   magpie search [add <api> <key>|rm <api>]   Tavily, Brave, Exa, Firecrawl, You.com, DeepSeek or SearXNG for web search when no provider can search
   magpie groups                   routing groups: several models agents pick as one, group/<id>
-  magpie group add <name> models=<m1>,<m2> [routing=smart|order|rotate|usage|pace] [stays=auto|session|turn|off]
+  magpie group add <name> models=<m1>,<m2> [routing=smart|order|rotate|usage|pace|weight|free|fast] [stays=auto|session|turn|off]
   magpie group <id> | set <id> k=v… | rm <id>   show, change or remove one (magpie group help for more)
   magpie accounts [agent] [--json]  every subscription magpie knows, with each one's allowance used and when it resets
   magpie accounts add <agent>     sign in to one more Claude, ChatGPT or Google (Gemini CLI, Antigravity) subscription
@@ -265,6 +265,11 @@ func run(args []string) error {
 		agent.SyncCatalogSettled()
 		catalog.Changed = was
 	}()
+	// what a shell's agy runs (agy_cli.go): every argument after run is
+	// agy's, --help too, and nothing is moved or started first
+	if ok, err := agyCmd(args); ok {
+		return err
+	}
 	// before anything is read, moved or started: --help on any command
 	// prints its usage and does nothing else
 	if helpAsked(args) {
@@ -475,6 +480,13 @@ func run(args []string) error {
 		return claudeCodeCmd(args[1:])
 	}
 
+	// the agent of a plugin that is gone (deleted on disk) is no agent
+	// here, but what magpie stashed of its file puts it back (#3810)
+	if len(args) == 2 && strings.EqualFold(args[1], "default") {
+		if g, ok, err := agent.RestoreGone(args[0]); ok {
+			return goneDefault(args[0], g, err)
+		}
+	}
 	a, err := agent.Find(args[0])
 	if err != nil {
 		return err
@@ -652,6 +664,27 @@ func disconnect(a *agent.Agent) error {
 		if n := a.Notice(); n != "" {
 			fmt.Println(muted.Render("  ↻ " + n))
 		}
+	}
+	return nil
+}
+
+// goneDefault says what `magpie <id> default` did for the agent of a
+// plugin that is gone.
+func goneDefault(id string, g agent.Gone, err error) error {
+	for _, p := range g.Put {
+		fmt.Println(green.Render("✓"), bold.Render(id), muted.Render(p))
+	}
+	for _, p := range g.Off {
+		fmt.Println(green.Render("✓"), bold.Render(id), muted.Render(p+": magpie was out of it already"))
+	}
+	if len(g.Put) > 0 {
+		fmt.Println(muted.Render("  its plugin is gone; disconnected from magpie, back to what it had before"))
+	}
+	if g.PluginOff != "" {
+		fmt.Println(green.Render("✓"), bold.Render(g.PluginOff), muted.Render("is not on magpie: its plugin is off, and magpie put back what it had when the plugin was turned off"))
+	}
+	if err != nil {
+		return fmt.Errorf("%s's plugin is gone, and magpie couldn't put its config back: %w", id, err)
 	}
 	return nil
 }

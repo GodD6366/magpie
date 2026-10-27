@@ -101,6 +101,7 @@ line; agents connected to magpie lose it when it quits.
 | Pi           | `~/.pi/agent/settings.json`       | model           |
 | StepCode     | `~/.stepcode/config.toml` (+ `models.json`; `$STEP_CODING_AGENT_DIR`, `$STEPCODE_CONFIG_DIR`) | model |
 | MothX        | `~/.mothx/settings.json` (`$MOTHX_DIR`; `%APPDATA%\mothx` on Windows) | model, thinking (`defaultProvider`/`defaultModel`/`defaultThinkingLevel`; magpie as the provider `magpie` beside the user's own, `openai-chat` with `thinkingFormat: "openai"`) |
+| PenguinHarness | `~/.penguin/data/default_project/.project_config.toml` (`$PENGUIN_HOME`, `$PENGUIN_PROJECT_ID`; the same on Windows) | model (`default_model`; magpie as `[providers.magpie]`, `openai-responses`, and its models as `[[models]]` entries of that provider) |
 | Aside        | `~/.aside/u/0/settings.json` (+ `models.json`; the first account, the only one magpie wires) | model, effort, fast, standard, deep, visual, image |
 | OmO (omo-ai) | `~/.omo/agent/settings.json` (+ `models.json`; `$OMO_CODING_AGENT_DIR`, `$SENPI_CODING_AGENT_DIR`) | model |
 | Prime Agent  | `~/.prime/agent/settings.json` (+ `models.json`; `$PRIME_AGENT_CODING_AGENT_DIR`) | model, thinking (Pi's fields; its key `magpie-prime-agent` names it, since its requests carry no User-Agent; the global settings alone, `allowedModels` and `subagentDefaultModel` left as they are) |
@@ -144,6 +145,7 @@ line; agents connected to magpie lose it when it quits.
 | Raycast      | `~/.config/raycast/ai/providers.yaml` in the user's folder, on Mac and Windows | provider (a `magpie` entry in Raycast AI's Custom Providers, magpie's models in its model picker; Raycast Pro; the user's providers, `tools` and comments kept) |
 | Kiro Crew    | `~/.kiro/crew/config.json` (`$KIROCREW_HOME`; `config.local.json` over it is left alone) | provider, harness (`agent.acp_backend`, and `agent.member_acp_backend` for a harness that can dispatch: an agent connected to magpie, so its models are magpie's: the one Crew is set to is connected along with it when it isn't yet, and disconnected with it again; the user's value is put back on Disconnect) |
 | OpenPencil   | `openpencil/settings.json` in the config folder: `~/Library/Application Support` (macOS), `$XDG_CONFIG_HOME` or `~/.config` (Linux), `%APPDATA%` (Windows) | provider (a `magpie` entry in its `builtin_agents`, magpie's models in its chat's model picker; the user's entries and settings kept; refused while OpenPencil runs, as it writes the file back when it quits) |
+| NewMax       | `newmax.db` (SQLite, the row `app` of its `settings` table) in `$NEWMAX_USER_DATA_DIR`, else `~/.newmax` (every OS) | provider (a `magpie-gateway` entry in its `providers` and `providerOrder`, magpie's models in its model picker; the rest of the row kept byte for byte; refused while NewMax runs, as it writes its settings back whenever one changes) |
 | T3 Code      | `~/.t3/userdata/settings.json` (`$T3CODE_HOME/userdata`) | provider (a `magpie` provider instance on Claude Code, magpie's models as its custom models) |
 | OpenHanako   | `~/.hanako/provider-catalog.json` + `agents/<id>/config.yaml` (`$HANA_HOME`; its local API while it runs) | model (the primary agent's; magpie's models as a provider) |
 | AtomCode     | `~/.atomcode/config.toml` (`$ATOMCODE_HOME`) | model, effort (a `magpie` provider account, one model table per catalog model as its own sign-in writes) |
@@ -151,7 +153,7 @@ line; agents connected to magpie lose it when it quits.
 | Alma         | Alma's local API (`localhost:23001`, while Alma runs; alma-server's data in `$ALMA_DATA_DIR`, `$XDG_DATA_HOME/alma` or `~/.local/share/alma` on Linux) | model (Alma's default; magpie's models as a provider), and Image Generation's model when it is Auto: the one magpie draws with |
 | Lody | Its own confirmation dialog (`lody://provider/import`) | adds selected Claude, Codex, Pi, DSH, Kimi Code, Grok and Bub Providers on the local machine; no settings edited by magpie |
 
-Provider-scoped agents (OpenCode, OpenClaw, MiMo Code, DevEco Code, Pi, OmO, StepCode, MothX, Aside, Goose, Crush, omp, Hermes Agent) take `provider/model`.
+Provider-scoped agents (OpenCode, OpenClaw, MiMo Code, DevEco Code, Pi, OmO, StepCode, MothX, PenguinHarness, Aside, Goose, Crush, omp, Hermes Agent) take `provider/model`.
 Only agents that are installed or configured are shown.
 
 ### Notes on some agents
@@ -165,6 +167,10 @@ The optional real CLI verification test is run with `MAGPIE_TEST_STEPCODE_BIN=/p
 #### MothX
 
 MothX (oschina/mothx, formerly vibecoding) is configured via [`mothx.go`](../internal/agent/mothx.go). Magpie writes its provider `magpie` into `providers` in MothX's global `settings.json` (`$MOTHX_DIR`, else `%APPDATA%\mothx` on Windows, else `~/.mothx`) and sets `defaultProvider`, `defaultModel` and `defaultThinkingLevel`. The provider uses `openai-chat` with `thinkingFormat: "openai"`, so a thinking level goes out as `reasoning_effort` for every model; without it MothX guesses Qwen's or DeepSeek's thinking fields from a model id. What the user adds to magpie's block (headers, a `thinkingFormat` of their own) stays. The key `magpie-mothx` names it, and so does its User-Agent (`Vibecoding Client/<version>`). A project's `.mothx/settings.json` overlays the global one and is left alone. MothX reads its settings at start-up, so restart open `mothx` sessions after a change. Disconnect puts `settings.json` back byte for byte when nothing else changed in it; when MothX or the user changed it meanwhile (its `/model` and `/statusline … global` write the whole file), Disconnect takes out only magpie's provider, its pick and a `providers` object it left empty.
+
+#### PenguinHarness
+
+PenguinHarness (Prism-Shadow/penguin-harness, the `penguin` command, npm `@prismshadow/penguin-cli`) is configured via [`penguin.go`](../internal/agent/penguin.go). It keeps each Project's models in `<root>/<project>/.project_config.toml`, the root being `$PENGUIN_HOME`, else `~/.penguin/data` on every system, and the Project the CLI works in `$PENGUIN_PROJECT_ID`, else `default_project`. Magpie writes `[providers.magpie]` (`openai-responses`, so a thinking level goes out as `reasoning.effort`; the key `magpie-penguin` names it), one `[[models]]` entry per model of magpie's with its name, window, reply cap, whether it reads images and its price, and points `default_model` at one. The user's own models, the command policy and the rest stay. Penguin's server reads the file again when it changes, so no restart is needed; a sync with nothing new leaves the file alone. A file magpie made is private (0600), as Penguin keeps its own, and goes again on Disconnect; otherwise Disconnect takes out magpie's provider, its entries and a vision model among them, and puts back the user's own default. Its User-Agent is the OpenAI SDK's, so usage names it by its key. Installed with `curl -fsSL https://penguin.ooo/install.sh | sh` (`irm https://penguin.ooo/install.ps1 | iex` on Windows); an install.sh tarball updates with `penguin update --yes`, an npm one with npm.
 
 #### Reasonix Studio
 
@@ -1103,8 +1109,11 @@ Ready-made middleware, under Plugins › Discover › Gateway middleware
 with the same JSON: `param-override` (`param_override`), `model-map`
 (`model_mapping`), `system-prompt`, `word-guard` (sensitive words) and
 `think-tags` (strip `<think>…</think>`, or `thinking_to_content`), and
-`antigravity-cloak`, which keeps the words Antigravity turns Claude Code's
-system prompt away for out of what it sends Antigravity alone. A
+`antigravity-cloak`, which keeps words Antigravity turns a system prompt
+away for out of what it sends Antigravity alone (magpie itself already
+breaks up the lines it knows of: Codex's, Claude Code's, Hermes' earlier
+persona; `magpie provider set antigravity prompt=as-written` turns that
+off). A
 middleware's entry in the community `registry.json` has
 `"kind": "middleware"` and no `providers`.
 
@@ -1461,7 +1470,11 @@ is lost at its reset) or `weight` (each model takes its share of the
 requests by its weight, smoothly interleaved: `weight=claude/claude-opus-5-5=3`
 gives it three requests for every one a model left at weight 1 takes; a
 weight is 1 to 1000, `weight=` alone clears them all, and a group in the
-group counts as one member, `weight=group/fast=2`). A key has no allowance to weigh, so it goes by its
+group counts as one member, `weight=group/fast=2`). `fast` (speed first; also `fastest`, `speed`) sends each request to
+the member that answered fastest lately, by the time to its first token
+and how fast it wrote: compare the same model on several API channels and
+the quickest goes first. `magpie provider set <id> routing=fast` does the
+same for one provider's keys. A key has no allowance to weigh, so it goes by its
 order or by what magpie sent it lately — except a sub2api key its owner gave
 a 5-hour, day or 7-day limit: with the provider's Balance URL set to the
 relay's `/v1/usage`, its card shows those windows and routing weighs it by
@@ -1649,6 +1662,18 @@ each of these groups ordered by the share used.
   among them the one magpie sent the fewest tokens lately goes first. A
   Claude account not known goes first once, as in Smart; another unknown
   account counts as a fresh week.
+- **Speed first**: the account, key or group member that answered this
+  model fastest lately first. magpie keeps, in memory, how long each one's
+  streamed answers took to their first token and how many tokens a second
+  they wrote after it, newer answers counting more (a 20-minute
+  half-life), and ranks them by the time a 200-token reply would take.
+  Those within a tenth of each other count as alike and keep their order.
+  One with no answer in the last hour isn't measured: one request in five
+  goes to such a one, so a channel that was slow once is tried again. One
+  resting after a failure goes behind the others, as in any routing.
+  Replies that aren't streamed tell no speed, and a restart starts the
+  measuring over. The Routing page says why the first went first:
+  "answered fastest lately — first token in 0.8s, 62 tokens a second".
 
 The routings besides Smart are the built-in plugin `rotation` (Routing
 strategies in Plugins › Built-in). It stays on while a provider or group is
@@ -1671,6 +1696,7 @@ depends on the routing:
 | Smart | Only between accounts whose windows all renew in the same hours, or whose shares used are equal. |
 | Least used first | Only between accounts with the same share used and the same tokens sent lately. |
 | Weekly pace | Only between accounts in the same pace band that magpie sent the same tokens lately, in practice none since magpie started. |
+| Speed first | Only between those within a tenth of each other's speed, and among those not measured lately. |
 
 For Claude Code and Codex, *Make first* also signs the agent in to that
 account, because the account the agent is signed in to is first. With
@@ -2302,6 +2328,27 @@ the API key goes to `~/.gemini/.env`. Picking a catalog model points
 `GOOGLE_GEMINI_BASE_URL` at the gateway (which speaks the Gemini API), sets
 `auth` to API key with the gateway token, and names the model in
 `settings.json`; a native model puts the previous auth back.
+
+**Antigravity CLI** (`agy`) takes the gateway, its key and the model only
+from how it is started. Picking a catalog model (`magpie agy <model>`)
+puts a function named `agy` in a marked block (`# >>> magpie agy >>>`) of
+your shell profiles: `.zshrc`, the bash profile a terminal reads, and
+`config.fish` (the PowerShell profiles on Windows). In a new terminal,
+plain `agy` then runs `magpie agy run`, which starts the real agy with the
+gateway, the key and `--model` (yours wins when you give one); off magpie
+it starts agy untouched. A terminal open already takes the command the
+Launch row copies. Stepping out (`magpie agy default`) takes the block out
+again. `magpie agy env` prints what `agy run` adds.
+
+agy installed in a WSL distro is listed as Antigravity CLI · WSL
+<distro>, found by `~/.gemini/antigravity-cli` or the `agy` command there.
+A catalog model puts the same marked `agy` function in the distro's
+`~/.bashrc`, `~/.zshrc` and `~/.config/fish/config.fish` (each one that is
+there, plus the one for your login shell in the distro's `/etc/passwd`).
+There is no magpie inside the distro, so this function reads the model
+from `settings.json` itself. It names the gateway at the address the
+distro reaches it on: Windows' address under NAT, which a sync rewrites
+when WSL comes back on another one.
 
 ### Import links
 

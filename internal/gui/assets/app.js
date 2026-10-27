@@ -93,6 +93,18 @@ const modelFavorites = new Set(Array.isArray(savedModelFavorites) ? savedModelFa
 const favoriteKey = (o) => o.ref || o.value;
 const isFavorite = (o) => modelFavorites.has(favoriteKey(o)) || modelFavorites.has(o.value);
 
+// The reads the page asks for again and again and mostly finds the same
+// (writeJSONSame in api.go): the tag of the answer last read goes with the
+// next ask, and an answer that is the same comes back with no body and is
+// the object read before. The Sessions tab's ~8 MB list was read, parsed and
+// compared every 15 s over a long history.
+const sameReads = new Map();
+const readsSame = (path) => /^sessions(\?|$)|^sessions\/stats\?/.test(path);
+// each such answer's tag: two answers with tags are the same only when they
+// are one object, so the Sessions tab needn't compare ~8 MB to know
+const readTags = new WeakMap();
+const sameRead = (a, b) => a === b || !(readTags.has(a) && readTags.has(b)) && JSON.stringify(a) === JSON.stringify(b);
+
 // heads, when given, is shown the answer's headers (loadQuotas' X-Magpie-Reading);
 // signal, when given, cancels the request (a read the reader moved on from)
 async function api(path, body, heads, signal) {
@@ -102,13 +114,16 @@ async function api(path, body, heads, signal) {
   // reaches the default omp row (#1187). Only # is encoded: ? = & stay a
   // query string, which encodeURIComponent would turn into a 404.
   path = path.replace(/#/g, "%23");
+  const same = body === undefined && readsSame(path);
+  const had = same ? sameReads.get(path) : undefined;
   const res = await fetch("/api/" + path, {
     method: body === undefined ? "GET" : "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: had ? { "Content-Type": "application/json", "X-Magpie-Had": had.tag } : { "Content-Type": "application/json" },
     body: body === undefined ? undefined : JSON.stringify(body),
     signal,
   });
   heads?.(res.headers);
+  if (had && res.ok && res.headers.get("X-Magpie-Same")) return had.data;
   if (res.status === 204) return null;
   // a body that isn't JSON (a proxy's or a plain http.Error) is the error
   // itself, not WebKit's "did not match the expected pattern"
@@ -171,6 +186,16 @@ async function api(path, body, heads, signal) {
   // the accounts it names, for Hide accounts to know them (#568); a
   // session's or a library's words aren't looked through
   if (data && typeof data === "object" && !/^(sessions|library|skills|plugins|market)/.test(path)) noteAccounts(data);
+  // a list changed since the one the page has (writeJSONRows in api.go):
+  // only its new rows are sent, and [from, count] for each run of the old
+  const delta = had && res.headers.get("X-Magpie-Delta");
+  const was = delta && had.data?.[delta];
+  if (Array.isArray(was) && Array.isArray(data?.[delta])) data[delta] = data[delta].flatMap((r) => Array.isArray(r) ? was.slice(r[0], r[0] + r[1]) : [r]);
+  const tag = same && res.headers.get("X-Magpie-Tag");
+  if (tag) {
+    sameReads.set(path, { tag, data });
+    if (data && typeof data === "object") readTags.set(data, tag);
+  }
   return data;
 }
 
@@ -2058,7 +2083,12 @@ function connectPanel(a, { fields, fieldBtn }) {
     const cp = el("button", "ag-quiet", t("Copy"));
     cp.type = "button";
     cp.onclick = () => copy(a.launch, t("Launch command"), null, t("Copied — run it to start {name} on magpie", { name: a.name }));
-    kv(t("Start it with"), line(code(a.launch), cp));
+    // a function magpie gave the user's shells starts it (agy): typed in a
+    // new terminal; the command is for one open before
+    if (a.typed) {
+      kv(t("Start it with"), line(code(a.typed), el("span", "ag-hint", t("in a new terminal"))));
+      kv(t("In a terminal open now"), line(code(a.launch), cp));
+    } else kv(t("Start it with"), line(code(a.launch), cp));
   }
   // the files magpie changed, and the way back
   const foot = el("div", "ag-foot");
@@ -3255,7 +3285,11 @@ async function openAgentModels(a, anchor, ev) {
     groups.sort((x, y) => (y.name === ROUTING_GROUPS) - (x.name === ROUTING_GROUPS));
   };
   regroup();
-  const shut = new Set(groups.filter((g) => groups.length > 1 && g.models.length > 8 && !g.models.some((m) => m.inUse)).map((g) => g.name));
+  // folding is for telling providers apart: routing groups don't count,
+  // so a group switched on never folds away the one provider's models
+  // (shiqi_40904 on Discord)
+  const providers = groups.filter((g) => g.name !== ROUTING_GROUPS).length;
+  const shut = new Set(groups.filter((g) => providers > 1 && g.models.length > 8 && !g.models.some((m) => m.inUse)).map((g) => g.name));
   // with a few providers, a rail of them down the left: one picked shows
   // its models alone, so a long list is one click away rather than a
   // scroll down past the others (蓝猫 on Discord); a search looks in all
@@ -3870,7 +3904,9 @@ function launchButton(a) {
   const b = el("button", "field extra launch");
   b.type = "button";
   b.append(svg(LAUNCH_GLYPH, 13, 1.5));
-  b.title = t("{name} takes magpie only from its environment · click to copy the command that starts it:", { name: a.name }) + "\n" + a.launch;
+  b.title = (a.typed
+    ? t("Type {command} in a new terminal to start {name} on magpie · click to copy the command for a terminal open now:", { command: a.typed, name: a.name })
+    : t("{name} takes magpie only from its environment · click to copy the command that starts it:", { name: a.name })) + "\n" + a.launch;
   b.setAttribute("aria-label", b.title);
   b.onclick = (ev) => {
     ev.stopPropagation();
@@ -11619,11 +11655,12 @@ const ROUTINGS = [
   ["pace", "Weekly pace", "Each request goes to the subscription with the most of its week left per hour until it renews — the one with the most to lose at its reset — so less of each week is lost at its reset; one at 90% or more waits until the others can't answer. A key goes by the tokens it served in the last hours."],
   ["weight", "By weight", "Requests spread over the keys by the weight set beside each: a key weighing 3 takes three requests for every one a key weighing 1 takes, evenly over a few requests. One that fails is passed over while it rests, and the others share its requests; a conversation stays with its key as Stays says."],
   ["free", "Free first", "Requests go to what costs nothing first: the models their vendor serves at no cost to this subscription's allowance or credits, in their listed order, and only when those can't answer to one that spends them. Nothing that cost nothing is left unused."],
+  ["fast", "Speed first", "Requests go to the one that has answered this model fastest lately, by its time to the first token and how fast it writes; those within a tenth of each other keep their listed order. One not measured lately gets one request in five, so it is measured again, and one that fails is passed over while it rests."],
 ];
 // the routings besides Smart are the built-in plugin rotation's
 // (plugins/rotation): off, their options leave the page, as anything marked
 // data-feature does, and Smart is left — one in use keeps it on
-const ROTATION = new Set(["order", "rotate", "usage", "pace", "weight", "free"]);
+const ROTATION = new Set(["order", "rotate", "usage", "pace", "weight", "free", "fast"]);
 // jsRoutings: the routings JS gateway plugins serve now ("<plugin>/<name>",
 // settings' jsRoutings, plugins/middleware's), and saved, a routing none
 // serves now, shown as it is: its pool is tried in its listed order
@@ -15517,8 +15554,12 @@ function renderQuotas(lazy) {
       // what was left over time, against an even burn (#651)
       const curve = !brief && !sub.error && quotaCurve(sub);
       if (curve) card.append(curve);
-      // WorkBuddy's credits, day by day, as magpie counted them (#568)
-      if (!brief && !history && sub.daily && !sub.error) card.append(creditDays(sub));
+      // the account's credits, day by day, as magpie counted them (#568):
+      // each pool on its own, named when there are several (#3321)
+      if (!brief && !history && sub.daily && !sub.error) {
+        const pools = [sub.daily, ...(sub.moreDaily || [])];
+        for (const d of pools) card.append(creditDays(d, pools.length > 1));
+      }
       // what is left besides the windows, under them
       if (!history && sub.balance && sub.windows?.length && !sub.error) card.append(balanceRow(sub, "What is left on the account besides its windows", false));
       // the balance over time, and when it runs out at that pace
@@ -15915,13 +15956,15 @@ async function moveUsage(key, to) {
   }
 }
 
-// creditDays: the credits an account used each day of the period, as
-// magpie counted them from its readings of the vendor's meter, which tells
-// only what the cycle has used so far — a bar a day, and the period's sum;
-// a day before magpie first read it is not known rather than nothing.
-function creditDays(sub) {
+// creditDays: the credits (or money, in its unit's currency) one of an
+// account's windows used each day of the period, as magpie counted them
+// from its readings of the vendor's meter, which tells only what the cycle
+// has used so far — a bar a day, and the period's sum; a day before magpie
+// first read it is not known rather than nothing. named: the window's name
+// beside the head, for a card with several.
+function creditDays(daily, named) {
   const box = el("div", "credit-days");
-  const { since, days } = sub.daily;
+  const { since, days, window: pool, unit } = daily;
   const by = new Map(days.map((d) => [d.day, d.used]));
   const key = (d) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
   const today = new Date();
@@ -15939,11 +15982,11 @@ function creditDays(sub) {
     d.setDate(d.getDate() - i);
     list.push({ day: key(d), date: d, used: by.get(key(d)) || 0, known: key(d) >= since });
   }
-  const num = (v) => (Math.round(v * 100) / 100).toLocaleString(intlLang());
+  const num = (v) => { try { if (unit) return new Intl.NumberFormat(intlLang(), { style: "currency", currency: unit.toUpperCase() }).format(v); } catch {} return (Math.round(v * 100) / 100).toLocaleString(intlLang()); };
   const dayName = (d) => d.toLocaleDateString(intlLang(), { month: "short", day: "numeric" });
   const sum = list.reduce((a, d) => a + d.used, 0);
   const head = el("div", "cd-head");
-  const name = el("span", "", t("Credits used per day"));
+  const name = el("span", "", t(unit ? "Spent per day" : "Credits used per day") + (named && pool ? " · " + t(pool) : ""));
   name.title = t("Counted from magpie's readings of the vendor's meter, since {date}: what is used while magpie isn't reading it is counted on the day it next does", { date: dayName(new Date(since + "T12:00:00")) });
   head.append(name, el("b", "", n > 1 ? t("{n} in {days} days", { n: num(sum), days: n }) : range && range.to !== key(today) ? t("{n} on {date}", { n: num(sum), date: dayName(last) }) : t("{n} today", { n: num(sum) })));
   box.append(head);
@@ -15955,7 +15998,7 @@ function creditDays(sub) {
       const fill = el("i");
       fill.style.height = d.known && peak ? Math.max(d.used ? 6 : 0, 100 * d.used / peak).toFixed(1) + "%" : "0%";
       b.append(fill);
-      b.title = d.known ? t("{date}: {n} credits", { date: dayName(d.date), n: num(d.used) }) : t("{date}: not counted — magpie began counting on {since}", { date: dayName(d.date), since: dayName(new Date(since + "T12:00:00")) });
+      b.title = d.known ? t(unit ? "{date}: {n} spent" : "{date}: {n} credits", { date: dayName(d.date), n: num(d.used) }) : t("{date}: not counted — magpie began counting on {since}", { date: dayName(d.date), since: dayName(new Date(since + "T12:00:00")) });
       bars.append(b);
     }
     box.append(bars);
@@ -16512,7 +16555,10 @@ function planSpan(q) {
 // though the tab hides it, until the panel is put away or the tab left.
 let panelArranging = false, panelPeek = "";
 if (mode === "panel") document.addEventListener("visibilitychange", () => {
-  if (document.hidden && (panelPeek || panelArranging)) { panelPeek = ""; panelArranging = false; renderPanelQuota(); }
+  if (!document.hidden) return;
+  // an account its eye showed is hidden again once the panel is put away
+  window.hideAccounts?.closed();
+  if (panelPeek || panelArranging) { panelPeek = ""; panelArranging = false; renderPanelQuota(); }
 });
 
 // The tray panel is four tabs over the one page: the agents, the allowances
@@ -17153,7 +17199,11 @@ function panelQuotaCard(q) {
   if (q.balanceCard) card.dataset.balCard = q.balanceCard;
   // by the name the user gave the account, or the key plan it stands
   // in for (#1515), before the account itself
-  card.append(el("span", "pq-user", q.alias || q.user || q.name));
+  // and its eye while Hide accounts is on, as on the Usage page (yogurt36)
+  const who = el("span", "pq-who");
+  who.append(el("span", "pq-user", q.alias || q.user || q.name));
+  if ((q.user || q.alias) && window.hideAccounts) who.append(hideAccounts.eye(q.user || q.alias));
+  card.append(who);
   card.title = [q.name, q.alias, q.user, q.seat && q.seat !== q.alias && "≡ " + q.seat, q.plan, q.until ? planTerm(q) : "", q.balance && t("Balance") + " " + q.balance].filter(Boolean).join(" · ");
   if (q.error) {
     card.classList.add("err");
@@ -21893,7 +21943,8 @@ function privacyModelRow(box, why) {
     const who = el("div", "who"), val = el("div", "val");
     who.append(name(), el("div", "sub", pmSub(m)));
     if (m?.supported || m?.installed) {
-      if (m.downloading) {
+      if (m.models?.length > 1) val.append(pmPick(m, (id) => act("pick", id)));
+      if (pmBusy(m)) {
         const c = el("button", "text", t("Cancel"));
         c.onclick = () => act("cancel");
         val.append(c);
@@ -21910,19 +21961,42 @@ function privacyModelRow(box, why) {
     clearTimeout(pmTimer);
     // a download's progress, and where pf-serve runs once it has started
     const starting = m?.on && m.installed && !m.running && !m.failed && tries++ < 30;
-    if (m?.downloading || starting) pmTimer = setTimeout(load, 1000);
+    if (pmBusy(m) || starting) pmTimer = setTimeout(load, 1000);
   };
   const load = () => api("privacy-model").then((m) => { pmState = m; draw(m); }).catch(() => {});
-  const act = (doing) => { tries = 0; api("privacy-model", { do: doing }).then((m) => { pmState = m; draw(m); }).catch((e) => { status(t(e.message), "err"); load(); }); };
+  const act = (doing, model) => { tries = 0; api("privacy-model", { do: doing, model }).then((m) => { pmState = m; draw(m); }).catch((e) => { status(t(e.message), "err"); load(); }); };
   draw(pmState);
   load();
+}
+// the local models to pick from (pii.Models), by the app's menu: what
+// each is, its size and whether it is downloaded
+const PM_MODELS = { "astrlink-guard": ["AstrLink Guard", "Chinese and English, few false alarms in code"], "privacy-filter": ["Privacy Filter", "OpenAI's, masks more ordinary values in code"] };
+// pmBusy is the model downloading (the one picked while another masks, too)
+const pmBusy = (m) => (m?.models || []).find((x) => x.downloading) || (m?.downloading ? m : null);
+function pmPick(m, pick) {
+  const b = el("button", "sess-pick pm-model");
+  b.type = "button";
+  b.setAttribute("aria-haspopup", "menu");
+  b.setAttribute("aria-expanded", "false");
+  b.title = t("The local model");
+  b.append(el("span", "", (PM_MODELS[m.model] || [m.model])[0]), svg(CHEV, 11, 1.6));
+  b.onclick = (e) => {
+    e.stopPropagation();
+    if (b.classList.contains("open")) return closeProtoMenu();
+    const opts = (m.models || []).map((x) => ({ v: x.model, name: (PM_MODELS[x.model] || [x.model])[0], literalName: true,
+      note: !x.supported && !x.installed ? t("Not available on this system yet") : t(PM_MODELS[x.model]?.[1] || "") + " · " + fmtBytes(x.size) + (x.installed ? " · " + t("downloaded") : "") }));
+    openProtoMenu(b, opts, m.model, (v) => v !== m.model && pick(v), "The local model", "sess-menu", "right");
+  };
+  return b;
 }
 function pmSub(m) {
   const about = t("Names, addresses and passwords no rule can find, found by a model that runs on this computer");
   if (!m) return about;
   if (!m.supported && !m.installed) return t("Not available on this system yet");
-  if (m.downloading) return t("Downloading the model: {done} of {total}", { done: fmtBytes(m.done), total: fmtBytes(m.total) });
-  if (m.error) return t("The download stopped: {error}", { error: m.error });
+  const d = pmBusy(m);
+  if (d) return t("Downloading the model: {done} of {total}", { done: fmtBytes(d.done), total: fmtBytes(d.total) });
+  const bad = (m.models || []).find((x) => x.error) || (m.error ? m : null);
+  if (bad) return t("The download stopped: {error}", { error: bad.error });
   if (m.on && m.failed) return t("The model didn't answer, so requests are held back: {error}", { error: m.failed });
   if (m.on && m.running) {
     if (m.gpu) return t("On, on the GPU ({device})", { device: m.device });
@@ -22784,6 +22858,10 @@ async function renderUpdate(r, u) {
     case "error":
       // the reason in sight: "timed out" says try a proxy, a 404 says wait
       sub.textContent = t(u.latest ? "Couldn't download {v}" : "Couldn't check for updates", { v: u.latest }) + (u.error ? " · " + u.error.replace(/^Get "[^"]*": /, "") : "");
+      // the network broke it off, after the tries download makes by itself
+      // (AIMetaPhD on X: an EOF from GitHub's asset host, with its whole
+      // signed address): what happened and what to do, in the app's words
+      if (u.network && u.latest) sub.textContent = t("{v}'s download broke off, a network problem. Click Check to try again, or download it from the release page", { v: u.latest });
       sub.title = u.error || "";
       if (u.error) sub.classList.add("wraps");
       // through a mirror (#893): it's the mirror's failing — it didn't
@@ -23028,11 +23106,12 @@ function keyboardFocus(e) {
 // macOS 13's WebKit (16.6) may scroll a view under a wheel or a coast it never
 // tells the page of: every scroll was put back, the page shook and only the
 // bar's drag moved it (issenn). Three put back the same way in a second, no
-// click holding, are the reader's: given back, and so is each one after
-// that goes on the same way within a second. Code scrolls once; not a run.
+// redraw under a click's hold (h) moving them, are the reader's: given back,
+// and so is each one after that goes on the same way within a second. Code
+// scrolls once; not a run.
 let putBack = [], run = null; // { v, by: px put back, at, h: held }, the last second's
-function puttingBack(v, from) {
-  const by = from - v.scrollTop, at = performance.now(), d = Math.sign(by), h = held?.v === v;
+function puttingBack(v, from, h) {
+  const by = from - v.scrollTop, at = performance.now(), d = Math.sign(by);
   putBack = putBack.filter((p) => at - p.at < 1000);
   if (Math.abs(by) < 1) return;
   putBack.push({ v, by, at, h });
@@ -23247,13 +23326,26 @@ function standIn(h) {
     if (s && s !== c[0] && s.tagName === c[0].tagName && s.classList[0] === c[0].classList[0] && atRest(s)) { c[0] = s; return c; }
   }
 }
+// where the held parts are in the page, and how tall it is: what the hold
+// left (h.lay), and a redraw changes, a scroll not. Only parts that scroll
+// with the page and are in it: one drawn again (the Usage page's tabs, the
+// agents' list under an agent opened or closed) or stuck to the view's edge
+// (Settings' tabs, sticky) read as moved at every scroll, and for the hold's
+// 4s every scroll was put back (issennknight on macOS 13)
+const scrolls = (n, v) => { for (; n && n !== v; n = n.parentElement) if (/sticky|fixed/.test(getComputedStyle(n).position)) return false; return !!n; };
+function laid(h) {
+  const at = [];
+  for (const [n] of h.chain) if (at.length < 3 && n.isConnected && n.offsetParent && scrolls(n, h.v)) at.push([n, onScreen(n, h.v) + h.v.scrollTop]);
+  return { sh: h.v.scrollHeight, at };
+}
+const redrawn = (h) => !h.lay || Math.abs(h.v.scrollHeight - h.lay.sh) >= 1.5 || h.lay.at.some(([n, y]) => !n.isConnected || !(Math.abs(onScreen(n, h.v) + h.v.scrollTop - y) < 1.5));
 function hold(h) {
   // held by what can be seen: an empty part (a row's value with nothing in it
   // yet) has no height, so "moved by less than half its height" below never
   // held, and Add to PATH on Settings' About slid the view 11px off its top
   // once the page was a little taller than the window (#2296)
   const a = h.chain.find(([n]) => atRest(n) && n.offsetHeight) || h.chain.find(([n]) => atRest(n)) || (h.chain.some(([n]) => n.isConnected) ? null : standIn(h));
-  if (!a) return;
+  if (!a) { h.lay = laid(h); return; }
   const v = h.v, d = onScreen(a[0], v) - a[1];
   if (Math.abs(d) >= 1) {
     let want = v.scrollTop + d;
@@ -23284,6 +23376,7 @@ function hold(h) {
   }
   fitRoom(v);
   readerLeaves(v);
+  h.lay = laid(h);
 }
 let holding = false; // one frame loop, whatever the clicks
 // A window made wider or narrower lays the whole page out again, the sidebar
@@ -23365,9 +23458,14 @@ for (const v of document.querySelectorAll(".view")) {
     if (panning?.v === v) readerScrolls(250);
     if (performance.now() < purposeUntil || barDrag === v) { fitRoom(v); readerLeaves(v); scrolledFrom.set(v, document.activeElement); return; }
     const from = v.scrollTop;
+    // a click's hold takes what a redraw moved; a scroll with the page laid
+    // out as the hold left it is put back as at rest, so the reader's run
+    // is theirs a click before it too (issennknight: a profile opened, then
+    // wheeled through, held still for 4s)
+    const h = held?.v === v && redrawn(held);
     if (held?.v === v) hold(held);
     else backToReader(v);
-    puttingBack(v, from);
+    puttingBack(v, from, h);
   }, { passive: true });
 }
 
@@ -24399,7 +24497,11 @@ setInterval(renderPluginDot, 15 * 60 * 1000);
 const accountNames = new Set();
 // generic words an account can't be named, lest every one of them on the
 // page is hidden
-const NOT_ACCOUNTS = new Set(["default", "own", "desktop", "account", "main", "local", "unknown", "none", "free", "pro"]);
+// "api key" and "signed in" are what magpie calls a plugin's account that
+// has no name (pluginLabels), "(2)" after one a second such: words of a
+// sentence too, a plugin's summary among them (outloudvi on Discord: Kiro's
+// "…or an API key" blurred)
+const NOT_ACCOUNTS = new Set(["default", "own", "desktop", "account", "main", "local", "unknown", "none", "free", "pro", "api key", "signed in"]);
 function noteAccount(s) {
   if (typeof s !== "string") return;
   s = s.trim();
@@ -24451,7 +24553,7 @@ window.noteAccounts = noteAccounts;
       if (q.alias && q.alias !== q.seat) all.add(q.alias.trim());
     }
     for (const a of state?.agents || []) for (const n of [a.id, a.name]) if (n) not.add(String(n).toLowerCase());
-    return [...all].filter((n) => n.length >= 2 && !IS_EMAIL.test(n) && !not.has(n.toLowerCase())).sort((a, b) => b.length - a.length);
+    return [...all].filter((n) => n.length >= 2 && !IS_EMAIL.test(n) && !not.has(n.toLowerCase().replace(/ \(\d+\)$/, ""))).sort((a, b) => b.length - a.length);
   }
   let findKey = null, find = EMAIL;
   // finder is the pattern of everything to hide now: an address, or a name
@@ -24469,7 +24571,9 @@ window.noteAccounts = noteAccounts;
   // an address always is
   const WORD = /[A-Za-z0-9_]/, JOIN = /[-.]/;
   const joined = (s, i, step) => WORD.test(s[i] || "") || (JOIN.test(s[i] || "") && WORD.test(s[i + step] || ""));
-  // accounts shown while the rest stay hidden, this window's only (yogurt36)
+  // accounts shown while the rest stay hidden (yogurt36), this page's
+  // only: the window and the tray panel are pages of their own, so one
+  // shown in either never shows in the other
   const shown = new Set(), low = (x) => String(x).trim().toLowerCase();
   function* hits(s, re) {
     re.lastIndex = 0; // matchAll starts where the pattern's last test ended
@@ -24630,8 +24734,9 @@ window.noteAccounts = noteAccounts;
       };
       return b;
     },
-    // the window closed (hideMain): every account hidden again
-    closed: () => { shown.clear(); redraw(); },
+    // the window closed (hideMain) or the panel put away: every account
+    // hidden again
+    closed: () => { if (shown.size) { shown.clear(); redraw(); } },
     on: () => masked,
     set: (on) => setMasked(on),
     follow: (personal) => { if (chosen === null && personal !== masked) setMasked(personal, true); },
