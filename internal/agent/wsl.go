@@ -298,7 +298,7 @@ var wslKinds = []wslKind{
 					if codexFailover() {
 						return append(group("OpenAI", options(ownCodex(), "")), viaMagpie("codex", "")...)
 					}
-					return append(group("OpenAI", options(ownCodex(), "")), viaMagpieFor("codex", "")...)
+					return append(codexInMagpie(group("OpenAI", options(ownCodex(), ""))), viaMagpieFor("codex", "")...)
 				}
 			case "effort":
 				return func(cur map[string]string) []Option {
@@ -349,7 +349,7 @@ var wslKinds = []wslKind{
 			case "model":
 				// whether it has a base URL of its own is the distro's file
 				return func(cur map[string]string) []Option {
-					return append(group("Claude Code", claudeOwn(cur["model"], nil)), claudeViaMagpie(false)...)
+					return append(group("Claude Code", claudeOwn(cur["model"], nil, catalog.Provider("anthropic"))), claudeViaMagpie(false)...)
 				}
 			case "effort":
 				return nil

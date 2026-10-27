@@ -106,18 +106,26 @@ type Settings struct {
 	// (redact.Options.Shape; Charles Cao on X). RedactModelName is the
 	// local model picked (pii.PrivacyFilter, pii.AstrLinkGuard); "" for
 	// none picked, which pii.Choose reads. It is this computer's, as
-	// RedactModel is.
-	Redact          bool            `json:"redact,omitempty"`
-	RedactShape     bool            `json:"redactShape,omitempty"`
-	RedactModel     bool            `json:"redactModel,omitempty"`
-	RedactModelName string          `json:"redactModelName,omitempty"`
-	RedactPersonal  bool            `json:"redactPersonal,omitempty"`
-	RedactKinds     map[string]bool `json:"redactKinds,omitempty"`
-	RedactWords     []string        `json:"redactWords,omitempty"`
+	// RedactModel is. RedactModelScore is each model's threshold the user
+	// set, by its id: masking drops what the model is less sure of (an
+	// AstrLink Guard user on X found 0.85 to 0.95 right for it). A model
+	// not in it has its own default (pii.Model.MinScore); this
+	// computer's too.
+	Redact           bool               `json:"redact,omitempty"`
+	RedactModelScore map[string]float64 `json:"redactModelScore,omitempty"`
+	RedactShape      bool               `json:"redactShape,omitempty"`
+	RedactModel      bool               `json:"redactModel,omitempty"`
+	RedactModelName  string             `json:"redactModelName,omitempty"`
+	RedactPersonal   bool               `json:"redactPersonal,omitempty"`
+	RedactKinds      map[string]bool    `json:"redactKinds,omitempty"`
+	RedactWords      []string           `json:"redactWords,omitempty"`
 	// RedactWordsAnyCase matches RedactWords in any case (ZoeCats on
 	// Discord); off, the default, a word is matched as written.
-	RedactWordsAnyCase bool          `json:"redactWordsAnyCase,omitempty"`
-	RedactRules        []redact.Rule `json:"redactRules,omitempty"`
+	RedactWordsAnyCase bool `json:"redactWordsAnyCase,omitempty"`
+	// RedactWordsWhole matches RedactWords only as whole words (acmilan_
+	// on Discord); off, the default, a word is found inside longer ones too.
+	RedactWordsWhole bool          `json:"redactWordsWhole,omitempty"`
+	RedactRules      []redact.Rule `json:"redactRules,omitempty"`
 	// RedactActions is what is done with a value of a kind (redact.Hit's
 	// Kind: API_KEY, EMAIL, a rule's own…) other than masking it, where
 	// the user chose: redact.Warn sends it as written and records it,
@@ -509,7 +517,8 @@ type Settings struct {
 	CodexTitles string `json:"codexTitles,omitempty"`
 	// CodexDescriptions is where the request Codex makes for a thread's
 	// description (thread_description: its own hidden turn, on Codex's own
-	// model through its ChatGPT sign-in) goes: "" as Codex sends it, or a
+	// model through its ChatGPT sign-in) goes: "" as Codex sends it, "off"
+	// answered by magpie with no description and sent nowhere, or a
 	// model's id (provider/model, group/<id>) that writes it. It is not
 	// CodexTitles: a description asks for {"description"} alone.
 	CodexDescriptions string `json:"codexDescriptions,omitempty"`
@@ -1116,7 +1125,7 @@ func (s *Settings) KeepOwn(cur Settings) {
 	s.LAN, s.AllowIPs = cur.LAN, cur.AllowIPs
 	s.FetchPrivate = cur.FetchPrivate
 	s.SessionTerminal = cur.SessionTerminal
-	s.RedactModel, s.RedactModelName = cur.RedactModel, cur.RedactModelName
+	s.RedactModel, s.RedactModelName, s.RedactModelScore = cur.RedactModel, cur.RedactModelName, cur.RedactModelScore
 	s.ClaudeRunsMost = cur.ClaudeRunsMost
 	s.RequestArchiveLocal, s.RequestArchiveLocalMB = cur.RequestArchiveLocal, cur.RequestArchiveLocalMB
 }
@@ -1449,6 +1458,28 @@ func SetRedactModelName(name string) error {
 	return save(s, false)
 }
 
+// SetRedactModelScore keeps score as the local model id's threshold; 0
+// is back to the model's own.
+func SetRedactModelScore(id string, score float64) error {
+	fileMu.Lock()
+	defer fileMu.Unlock()
+	s := load()
+	m := maps.Clone(s.RedactModelScore)
+	if m == nil {
+		m = map[string]float64{}
+	}
+	if score == 0 {
+		delete(m, id)
+	} else {
+		m[id] = score
+	}
+	if len(m) == 0 {
+		m = nil
+	}
+	s.RedactModelScore = m
+	return save(s, false)
+}
+
 // UseRedactModel turns the local masking model on as name, the model
 // the user picked, once that model is downloaded.
 func UseRedactModel(name string) error {
@@ -1560,8 +1591,8 @@ func save(s Settings, recording bool) error {
 		return fmt.Errorf("the model for Codex's titles must be a model's id such as openai/gpt-5-mini, or off, not %q", s.CodexTitles)
 	}
 	s.CodexDescriptions = strings.TrimSpace(s.CodexDescriptions)
-	if s.CodexDescriptions != "" && !strings.Contains(s.CodexDescriptions, "/") {
-		return fmt.Errorf("the model for Codex's descriptions must be a model's id such as openai/gpt-5-mini, not %q", s.CodexDescriptions)
+	if s.CodexDescriptions != "" && s.CodexDescriptions != "off" && !strings.Contains(s.CodexDescriptions, "/") {
+		return fmt.Errorf("the model for Codex's descriptions must be a model's id such as openai/gpt-5-mini, or off, not %q", s.CodexDescriptions)
 	}
 	s.CodexPredictions = strings.TrimSpace(s.CodexPredictions)
 	if s.CodexPredictions != "" && s.CodexPredictions != "off" && !strings.Contains(s.CodexPredictions, "/") {

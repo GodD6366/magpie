@@ -25,6 +25,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/yetone/magpie/internal/catalog"
 	"github.com/yetone/magpie/internal/provider"
 	"github.com/yetone/magpie/internal/routes"
 	"github.com/yetone/magpie/internal/usage"
@@ -215,7 +216,8 @@ var (
 	// exceeded", "reached"): as magpie words an upstream error, with
 	// "rate_limit_error" for its type, every such 429 was, and rested a
 	// quarter of an hour rather than a minute (#153).
-	rateWords = regexp.MustCompile(`(?i)rate.?limit|too many requests|per.?(second|sec|minute|min)\b|\b[rt]pm\b|频率|太频繁`)
+	// "Frequency limit" is the English of 频率 (zoecats on Discord).
+	rateWords = regexp.MustCompile(`(?i)rate.?limit|frequency.?limit|too many requests|per.?(second|sec|minute|min)\b|\b[rt]pm\b|频率|太频繁`)
 	// plannedWords: a 429 that says the plan's own allowance is used, rate
 	// words or not — a day's free requests, say, or a sub2api key's own
 	// 5-hour, day or 7-day limit ("api key 7天限额已用完", sent as
@@ -338,38 +340,9 @@ const reloopedError = "the model's reasoning was stuck in a loop before it said 
 // over HTTP (proxyconnect) or SOCKS (socks connect).
 var proxyDown = regexp.MustCompile(`proxyconnect |socks connect `)
 
-// wordsOf is an error body as its words are matched: a JSON body that
-// escapes what isn't ASCII as \uXXXX (Python's json.dumps does by default)
-// has its strings decoded and put after it, one to a line, so "用量",
-// "频率" or "将在 … 重置" are read whether the vendor escaped them or not
-// (#1669). Any other body is matched as it is.
-func wordsOf(body []byte) []byte {
-	if !bytes.Contains(body, []byte(`\u`)) {
-		return body
-	}
-	var v any
-	if json.Unmarshal(body, &v) != nil {
-		return body
-	}
-	out := append([]byte(nil), body...)
-	var walk func(any)
-	walk = func(x any) {
-		switch x := x.(type) {
-		case string:
-			out = append(append(out, '\n'), x...)
-		case map[string]any:
-			for _, y := range x {
-				walk(y)
-			}
-		case []any:
-			for _, y := range x {
-				walk(y)
-			}
-		}
-	}
-	walk(v)
-	return out
-}
+// wordsOf is catalog.Words: an error body as its words are matched, with
+// the strings of a JSON body that escapes what isn't ASCII decoded (#1669).
+func wordsOf(body []byte) []byte { return catalog.Words(body) }
 
 // failure says why a reply failed.
 func failure(status int, body []byte) string {
@@ -403,6 +376,15 @@ func failure(status int, body []byte) string {
 		// English one as a rate limit, and each rested its own fallback
 		// (#1669)
 		return failQuota
+	case status == 429 && !creditWords.Match(body) && backSoon(body):
+		// back within a wait a provider's patience can cover, as it says
+		// itself, whatever else it says: a LAN aggregator's "Usage has
+		// exceeded the frequency limit. … Your usage limit for the
+		// original model will reset in 1 minutes." read as a plan used up
+		// ("usage limit") and went to the agent at once, never waited
+		// for (zoecats on Discord). A limit that says it is back in
+		// hours stays out of quota below
+		return failRate
 	case status == 429 && rateWords.Match(body) && !plannedWords.Match(body):
 		return failRate
 	case status >= 500 && quotaCodes.Match(body), status < 500 && usedUpWords.Match(body), status == 429 && plannedWords.Match(body):
@@ -796,7 +778,7 @@ var resetsInWords = regexp.MustCompile(`(?i)\bresets? in (?:(\d+)\s*d(?:ays?)?\b
 var quotaResetAfter = regexp.MustCompile(`(?i)\bquota will reset after ((?:\d+h)?(?:\d+m)?(?:\d+(?:\.\d+)?s)?)`)
 
 // resetsAfter is how long the refusal says until it is back
-// (resetsInWords, quotaResetAfter), held to longestWritten. Zero when it
+// (resetsInWords, quotaResetAfter, soonWords), held to longestWritten. Zero when it
 // doesn't say.
 func resetsAfter(body []byte) time.Duration {
 	body = wordsOf(body)
@@ -808,7 +790,52 @@ func resetsAfter(body []byte) time.Duration {
 			return d
 		}
 	}
-	return 0
+	return soonWritten(body)
+}
+
+// soonWords: a refusal that says in seconds, or in Chinese minutes, how
+// long until it is back: "try again in 30 seconds", "retry after 20s",
+// "resets in 45 secs", "请 1 分钟后重试", "30秒后再试". The English minutes,
+// hours and days are resetsInWords' and tryAgainIn's.
+var soonWords = regexp.MustCompile(`(?i)\b(?:resets? (?:in|after)|try again in|retry (?:in|after))\s*(\d+(?:\.\d+)?)\s*(?:s|secs?|seconds?)\b|(\d+)\s*(秒|分钟)钟?\s*(?:之?后)`)
+
+// soonest is the longest a refusal may say it is back in for a 429 to be
+// a rate limit waited out, not a plan used up: as long as a provider's
+// patience can be set to wait (provider.PatienceLongest).
+const soonest = time.Duration(provider.PatienceLongest) * time.Second
+
+// soonWritten is the seconds, or Chinese minutes, a refusal says until it
+// is back (soonWords). Zero when it doesn't say.
+func soonWritten(body []byte) time.Duration {
+	m := soonWords.FindSubmatch(body)
+	switch {
+	case m == nil:
+		return 0
+	case len(m[1]) > 0:
+		n, _ := strconv.ParseFloat(string(m[1]), 64)
+		return time.Duration(n * float64(time.Second))
+	}
+	n, _ := strconv.Atoi(string(m[2]))
+	if string(m[3]) == "分钟" {
+		return time.Duration(n) * time.Minute
+	}
+	return time.Duration(n) * time.Second
+}
+
+// backIn is how long a refusal says in words until it is back: resetsAfter,
+// or a "try again in" (tryAgainIn). Zero when it doesn't say.
+func backIn(body []byte) time.Duration {
+	body = wordsOf(body)
+	if d := resetsAfter(body); d > 0 {
+		return d
+	}
+	return spanWritten(tryAgainIn.FindSubmatch(body))
+}
+
+// backSoon says a refusal says it is back within soonest.
+func backSoon(body []byte) bool {
+	d := backIn(body)
+	return d > 0 && d <= soonest
 }
 
 // clineModelLimited says c, a provider whose requests reach Cline's API,
@@ -1488,6 +1515,7 @@ type left struct {
 	// (Allowance.Fullest), zero when not known
 	fullest time.Time
 	soon    []time.Time // renews as Smart ranks them (Allowance.Renewal)
+	lapse   time.Time   // when the soonest of what is left is lost (Allowance.Lapse)
 	pace    float64     // weekly pace: share of its week left per hour until it renews
 	due     time.Time   // when the window that pace went by renews; zero when not known
 	// restarts: when an auto-used reset starts its windows again
@@ -1573,7 +1601,7 @@ func weighRouted(p provider.Provider, cs []candidate, model string, from provide
 			pc, due := a.Pace(c.model, now)
 			amt, of, unit := a.Count(c.model, now)
 			rs := a.Restarts(now)
-			wg.lefts[c.allowanceKey()] = left{used: u, renews: r, fullest: a.Fullest(c.model, now), soon: a.Renewal(c.model, now), pace: pc, due: due, amount: amt, of: of, unit: unit,
+			wg.lefts[c.allowanceKey()] = left{used: u, renews: r, fullest: a.Fullest(c.model, now), soon: a.Renewal(c.model, now), lapse: a.Lapse(c.model, now), pace: pc, due: due, amount: amt, of: of, unit: unit,
 				restarts: rs, dueRestart: !rs.IsZero() && due.Equal(rs), credits: spendsCredits(c.p, a)} // one not known counts as unused
 		}
 	}
@@ -1595,7 +1623,7 @@ func weighRouted(p provider.Provider, cs []candidate, model string, from provide
 			pace = provider.FreshPace
 		}
 		seats[i] = routes.Seat{Key: c.rest, Account: c.p.Account != nil, Known: known, Learns: learns(c, wg.lefts),
-			Used: l.used, Soon: l.soon, Pace: pace, Weight: keyWeight(c), Resting: resting(c), Tokens: routed.used[c.restKey()].now(now), Credits: l.credits}
+			Used: l.used, Soon: l.soon, Lapse: l.lapse, Pace: pace, Weight: keyWeight(c), Resting: resting(c), Tokens: routed.used[c.restKey()].now(now), Credits: l.credits}
 	}
 	routed.Unlock()
 	if st.ByUse {

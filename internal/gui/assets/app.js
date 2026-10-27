@@ -1370,6 +1370,16 @@ function connectLine(a, kind) {
     return line;
   }
   line.classList.add("on");
+  // Codex on magpie while its ChatGPT account is used up: the line says
+  // until when, the hover (and the row opened) what is off till then
+  if (a.appOut) {
+    const o = a.appOut;
+    if (o.stuck) say(t("On magpie · quit and reopen the {agent} app to send", { agent: a.name }), "wait");
+    else if (o.until) say(t("On magpie until {when} · ChatGPT allowance used up", { when: resetClock(new Date(o.until)) }));
+    else say(t("On magpie until the reset · ChatGPT allowance used up"));
+    words.title = appOutSaid(a);
+    return line;
+  }
   if (a.appRestart) {
     say(t("Connected · restart {agent} to use it", { agent: a.name }), "wait");
     line.append(appRestart(a));
@@ -1886,6 +1896,19 @@ function appReopen(bundle) {
   return go;
 }
 
+// appOutSaid: why Codex is on magpie while its ChatGPT account is used up,
+// and what of the Codex app is off till the reset (the app turns its
+// ChatGPT side off with magpie its provider, and greys Send without)
+function appOutSaid(a) {
+  const o = a.appOut || {};
+  let s = o.user
+    ? t("{user}'s ChatGPT allowance is used up, so magpie serves {agent}'s turns until it resets.", { user: o.user, agent: a.name })
+    : t("{agent}'s ChatGPT allowance is used up, so magpie serves its turns until it resets.", { agent: a.name });
+  s += " " + t("Till then the {agent} app's ChatGPT side is off: cloud tasks, its usage meter and Log out. It all comes back on its own at the reset.", { agent: a.name });
+  if (o.stuck) s += " " + t("magpie couldn't restart the {agent} app's app-server: quit the app and open it again to send.", { agent: a.name });
+  return s;
+}
+
 // appRestart: a desktop app running on what it read before magpie's last
 // change (agent.AppBehind) is quit and opened again
 function appRestart(a) {
@@ -1967,6 +1990,12 @@ function connectPanel(a, { fields, fieldBtn }) {
         if (c.kind === "app" && a.id === "codex" && c.bundle) l.append(appReopen(c.bundle));
         parts.push(l);
       }
+    }
+    // on magpie while its ChatGPT account is used up, and what is off
+    if (a.appOut) {
+      const w = line(el("span", "ag-dot"), el("span", "", appOutSaid(a)));
+      w.classList.add("ag-warn", "ag-app-out");
+      parts.unshift(w);
     }
     kv(t("In {agent}", { agent: a.name }), ...parts);
   } else if (menuFromList(a)) {
@@ -3156,11 +3185,12 @@ function closeAgentModels() {
   // was put back comes with the state
   if (m.hidden) for (const f of m.a.fields || []) f.options = f.options.filter((o) => !o.ref || !m.hidden.has(o.ref) || o.value === f.value);
   // the agent's own, left out, go as the server leaves them out
-  // (agent.Picks): from a picker of magpie's models, but its default and
-  // the one it is set to
+  // (agent.Picks): from a picker of magpie's models, but its default, the
+  // one it is set to and those magpie's list shows it too (served: Codex's
+  // ChatGPT models)
   if (m.ownHidden) {
     for (const f of m.a.fields || []) {
-      if (f.options.some((o) => o.ref)) f.options = f.options.filter((o) => o.ref || !o.value || o.value === f.value);
+      if (f.options.some((o) => o.ref)) f.options = f.options.filter((o) => o.ref || o.served || !o.value || o.value === f.value);
     }
   }
   // the agents' pickers list what's left once the writes are in
@@ -12005,6 +12035,7 @@ let justAdded = ""; // the account that just came in, to greet it
 // through
 async function startSignIn(agent, risky, site, o = {}) {
   if (signingOpen()) api("signin/" + signing.id + "/cancel", {}).catch(() => {});
+  if (signing?.behind) api("signin/" + signing.behind + "/cancel", {}).catch(() => {});
   // an account Google may suspend is added only once that is said
   if (subOf(agent)?.risk && !risky) {
     signing = { agent, state: "risk", forUser: o.user, picked: o.proxy };
@@ -12301,6 +12332,7 @@ function renderStepPlan(sp, id) {
 
 function cancelSignIn() {
   if (signing?.id) api("signin/" + signing.id + "/cancel", {}).catch(() => {});
+  if (signing?.behind) api("signin/" + signing.behind + "/cancel", {}).catch(() => {});
   signing = null;
   renderProviders();
 }
@@ -13033,7 +13065,6 @@ function renderAccounts(a, p) {
   const pv = a.agent === "codex" ? providers || {} : {};
   if (pv.codexDaemon) list.append(renderCodexDaemon(pv.codexDaemon));
   if (pv.codexApp) list.append(renderCodexApp(pv.codexApp));
-  if (pv.codexAppOut) list.append(renderCodexAppOut(pv.codexAppOut));
   if (signing?.agent === a.agent) list.append(renderSigning(sub));
   else {
     const add = el("button", "acc add");
@@ -13093,22 +13124,18 @@ function codexNote(cls, n, s) {
   return box;
 }
 
-// renderCodexAppOut: the account the Codex app is on ran out, which greys
-// its Send for magpie's models too till it reopens: magpie reopens it on
-// macOS once idle (reopening), else the user does.
-function renderCodexAppOut(out) {
-  return codexNote(" app-out", t("The Codex app can't send on {user}'s used-up account", { user: out.user }), out.reopening
-  ? t("magpie serves its turns now, but the app reads that only as it opens. magpie quits it and opens it again once no turn is running.")
-  : t("magpie serves its turns now, but the app reads that only as it opens. Quit it and open it again to send."));
-}
-
 // Accounts brought in from another tool's export instead of signing in
 // again: the files' text (or what is pasted) goes to magpie, which checks
 // each account with the vendor before keeping it, and says what became of
 // each. What is read stays here only until it is sent; the box masks it.
+// A sign-in waiting for its browser's address is kept behind the import
+// rather than canceled: that address pasted into the import box finishes
+// it there (LuvLetter, magpie in Docker, pasted it into this box instead of
+// the sign-in's Callback URL field), and closing the box ends it.
 function startImport(agent) {
-  if (signingOpen()) api("signin/" + signing.id + "/cancel", {}).catch(() => {});
-  signing = { agent, state: "import", text: "", files: [] };
+  const behind = signingOpen() && signing.pasteCallback ? signing.id : signing?.behind;
+  if (signingOpen() && signing.id !== behind) api("signin/" + signing.id + "/cancel", {}).catch(() => {});
+  signing = { agent, state: "import", text: "", files: [], behind };
   renderProviders();
   document.querySelector(".signing.import textarea")?.focus();
 }
@@ -13119,14 +13146,15 @@ async function runImport(agent) {
   const names = signing.files.map((f) => f.name);
   if (signing.text.trim()) { files.push(signing.text); names.push(t("The pasted text")); }
   if (!files.length) return;
-  signing = { agent, state: "importing", names };
+  const behind = signing.behind;
+  signing = { agent, state: "importing", names, behind };
   renderProviders();
   try {
     const r = await api("signin/import", { agent, files });
     if (signing?.agent !== agent) return;
     providers = r.providers;
     const added = r.results.filter((x) => x.status === "added" || x.status === "updated");
-    signing = { agent, state: "imported", results: r.results, names };
+    signing = { agent, state: "imported", results: r.results, names, behind };
     delete loginUsage[agent];
     const p = providers.providers.find((x) => x.account?.agent === agent);
     if (p && added.length) {
@@ -13141,7 +13169,7 @@ async function runImport(agent) {
     renderAgents();
   } catch (e) {
     if (signing?.agent !== agent) return;
-    signing = { agent, state: "import", text: "", files: [], error: e.message };
+    signing = { agent, state: "import", text: "", files: [], error: e.message, behind };
     renderProviders();
   }
 }
@@ -19299,7 +19327,7 @@ function renderCLI(r) {
   const paint = (v) => {
     sub.textContent = v.stuck === "translocated" ? t("macOS runs magpie from a temporary copy until it is moved to Applications: move it there first")
       : v.stuck === "read-only" ? t("magpie runs from its disk image: copy it to Applications first")
-      : v.ours ? t("In a new terminal, magpie runs this app: {path}", { path: v.command }) + (v.shim && v.command === v.shim ? " (" + t("which runs {name}", { name: exeName(v.exe) }) + ")" : "")
+      : v.ours ? t("In a new terminal, magpie runs this app: {path}", { path: v.command }) + (/\.(cmd|com)$/i.test(v.command || "") ? " (" + t("which runs {name}", { name: exeName(v.exe) }) + ")" : "")
       : v.command ? t("In a new terminal, magpie runs another copy: {path}", { path: v.command }) + (v.version ? " (" + v.version + ")" : "")
       : t("A new terminal can't find the magpie command");
     add.hidden = v.ours || !v.dir || !!v.stuck;
@@ -19595,9 +19623,11 @@ function renderSettings() {
   // portable (a data folder beside magpie, #508): everything is in there
   row(t("Config folder"), s.portable ? t("Portable: everything magpie keeps, in the data folder beside it") : t("providers, profiles and these settings"), s.dir, copyBtn(s.dir, t("Path")), open);
   renderCLI(row(t("Command line"), t("Checking your shells…"), ""));
-  row(t("Gateway URL"), t("the address every agent is pointed at"), s.gateway, copyBtn(s.gateway, t("Gateway URL")));
+  // served to other machines (magpie web), the one they reach (noahhrreion)
+  const gw = web && s.publicURL || s.gateway;
+  row(t("Gateway URL"), t("the address every agent is pointed at"), gw, copyBtn(gw, t("Gateway URL")));
   // MAGPIE_PUBLIC_URL, where other machines reach it (#1551)
-  if (s.publicURL) row(t("Public address"), t("MAGPIE_PUBLIC_URL: where other computers reach the gateway, with a gateway key"), s.publicURL, copyBtn(s.publicURL, t("Public address"))).id = "publicURLRow";
+  if (s.publicURL && gw !== s.publicURL) row(t("Public address"), t("MAGPIE_PUBLIC_URL: where other computers reach the gateway, with a gateway key"), s.publicURL, copyBtn(s.publicURL, t("Public address"))).id = "publicURLRow";
   const join = el("button", "discord");
   join.innerHTML = DISCORD_SVG;
   join.append(el("span", "", t("Join Discord")));
@@ -20957,7 +20987,8 @@ function modelOpt(x) {
 }
 
 // renderCodexDescriptions picks the model for descriptions independently
-// of titles; an empty setting preserves Codex's requested model.
+// of titles; an empty setting preserves Codex's requested model, off
+// answers with no description.
 function renderCodexDescriptions(s) {
   const models = s.titleModels || [];
   const named = (id) => {
@@ -20968,10 +20999,12 @@ function renderCodexDescriptions(s) {
   const b = el("button", "rt-cond on");
   b.type = "button";
   b.setAttribute("aria-label", t("Codex thread descriptions"));
-  if (v) b.append(icon(models.find((x) => x.id === v)?.icon || "generic"), el("span", "", named(v)));
+  if (v === "off") b.append(el("span", "", t("Off")));
+  else if (v) b.append(icon(models.find((x) => x.id === v)?.icon || "generic"), el("span", "", named(v)));
   else b.append(icon("generic"), el("span", "", t(SAME_SESSION)));
   b.onclick = (ev) => openPicker({ id: "", name: "", fields: [] }, { key: "codexDescriptions", label: "model", value: v, options: [
     { value: "", label: t(SAME_SESSION), note: t("as Codex sends them when the session is on Codex’s own model"), icon: "generic", reset: true },
+    { value: "off", label: t("Off"), note: t("no description, nothing sent"), reset: true },
     ...models.map(modelOpt)],
   onPick: (id) => {
     if (id === v) return;
@@ -21892,6 +21925,8 @@ function renderRedact(s, keep) {
   // plain words, matched as written unless the user asks for any case
   row(t("Masked words in any case"), t("A word also matches in other capitals: Nightjar masks NIGHTJAR and nightjar too"),
     onOff(s.redactWordsAnyCase, (redactWordsAnyCase) => savePrefs({ ...keep, redactWordsAnyCase }))).id = "redactWordsAnyCaseRow";
+  row(t("Whole words only"), t("A word is not masked inside a longer one: ABC masks ABC and 'ABC' but not XABCD, and 123456 not 0.123456"),
+    onOff(s.redactWordsWhole, (redactWordsWhole) => savePrefs({ ...keep, redactWordsWhole }))).id = "redactWordsWholeRow";
   renderRedactRules(s, row);
   renderMaskActions(s);
   renderMaskTry(s);
@@ -21922,12 +21957,15 @@ function renderRedact(s, keep) {
 // privacyModelRow: the local masking model (internal/pii), downloaded when
 // it is turned on and then asked beside the rules. Its state is its own
 // (privacy-model): read when the row is drawn, and each second while it
-// downloads or starts.
+// downloads or starts. Under it, once the model can run, its threshold
+// (pmScore).
 let pmState = null, pmTimer = 0;
 function privacyModelRow(box, why) {
   const r = el("div", "row pref" + (why ? " pm-wait" : ""));
   r.id = "privacyModelRow";
   box.append(r);
+  const sr = el("div", "row pref");
+  sr.id = "pmScoreRow";
   const name = () => { const n = el("div", "name", t("Find with a local model")); n.append(el("span", "badge new", t("New"))); return n; };
   // nothing is masked: the model has nothing to find more of
   if (why) {
@@ -21958,13 +21996,21 @@ function privacyModelRow(box, why) {
       val.append(segs([["off", t("Off")], ["on", t("On")]], m.on || m.downloading ? "on" : "off", (v) => act(v)));
     }
     r.replaceChildren(who, val);
+    if (m && (m.supported || m.installed) && m.defaultScore) {
+      const sw = el("div", "who");
+      sw.append(el("div", "name", t("Confidence threshold")), el("div", "sub", t("What the model is less sure of goes as written. Higher masks less, with fewer false alarms")));
+      const sv = el("div", "val");
+      sv.append(pmScore(m, (score) => act("score", m.model, score)));
+      sr.replaceChildren(sw, sv);
+      if (!sr.isConnected) r.after(sr);
+    } else sr.remove();
     clearTimeout(pmTimer);
     // a download's progress, and where pf-serve runs once it has started
     const starting = m?.on && m.installed && !m.running && !m.failed && tries++ < 30;
     if (pmBusy(m) || starting) pmTimer = setTimeout(load, 1000);
   };
   const load = () => api("privacy-model").then((m) => { pmState = m; draw(m); }).catch(() => {});
-  const act = (doing, model) => { tries = 0; api("privacy-model", { do: doing, model }).then((m) => { pmState = m; draw(m); }).catch((e) => { status(t(e.message), "err"); load(); }); };
+  const act = (doing, model, score) => { tries = 0; api("privacy-model", { do: doing, model, score }).then((m) => { pmState = m; draw(m); }).catch((e) => { status(t(e.message), "err"); load(); }); };
   draw(pmState);
   load();
 }
@@ -21986,6 +22032,27 @@ function pmPick(m, pick) {
     const opts = (m.models || []).map((x) => ({ v: x.model, name: (PM_MODELS[x.model] || [x.model])[0], literalName: true,
       note: !x.supported && !x.installed ? t("Not available on this system yet") : t(PM_MODELS[x.model]?.[1] || "") + " · " + fmtBytes(x.size) + (x.installed ? " · " + t("downloaded") : "") }));
     openProtoMenu(b, opts, m.model, (v) => v !== m.model && pick(v), "The local model", "sess-menu", "right");
+  };
+  return b;
+}
+// pmScore picks the model's threshold (privacy-model's score) by the
+// app's menu: its default, or one of PM_SCORES
+const PM_SCORES = [0.5, 0.6, 0.7, 0.8, 0.85, 0.9, 0.95];
+function pmScore(m, pick) {
+  const cur = m.minScore === m.defaultScore ? "0" : String(m.minScore);
+  const b = el("button", "sess-pick pm-score");
+  b.type = "button";
+  b.setAttribute("aria-haspopup", "menu");
+  b.setAttribute("aria-expanded", "false");
+  b.title = t("Confidence threshold");
+  b.append(el("span", "", String(m.minScore)), svg(CHEV, 11, 1.6));
+  b.onclick = (e) => {
+    e.stopPropagation();
+    if (b.classList.contains("open")) return closeProtoMenu();
+    const note = (s) => s === PM_SCORES[0] ? "Masks the most" : s === PM_SCORES.at(-1) ? "Masks the least" : "";
+    const opts = [{ v: "0", name: t("Default ({score})", { score: m.defaultScore }), literalName: true, note: note(m.defaultScore) },
+      ...PM_SCORES.filter((s) => s !== m.defaultScore).map((s) => ({ v: String(s), name: String(s), literalName: true, note: note(s) }))];
+    openProtoMenu(b, opts, cur, (v) => v !== cur && pick(Number(v)), "Confidence threshold", "sess-menu", "right");
   };
   return b;
 }
@@ -22418,293 +22485,6 @@ function editRedactRule(r, n, row) {
   if (d.err) head.querySelector(".sub").classList.add("err");
 }
 
-// renderPort: the gateway's address on this computer (Magic_zero on Discord:
-// 3425 taken by another program, or one easier to tell apart). Only its
-// port, 1024 up, is typed here; magpie moves its gateway there and every
-// agent it connected with it, or says why it can't (another program has
-// it). MAGPIE_ADDR, a whole host:port, comes first and the field shows it,
-// off (Chicring on Discord: the row was titled a port while it showed one).
-let portDraft = { value: null, err: "" };
-// portSays is the gateway's word on a port it couldn't take, in the page's
-// language: it says the port, so it is matched rather than looked up
-function portSays(m) {
-  let x;
-  if ((x = /^port (\d+) is in use by another program/.exec(m))) return t("Port {p} is in use by another program: pick another one", { p: x[1] });
-  if ((x = /^another magpie serves the gateway at (\S+):/.exec(m))) return t("Another magpie serves the gateway at {url}: set its port there, or quit it first", { url: x[1] });
-  if (/from 1024 to 65535/.test(m)) return t("A port is a number from 1024 to 65535");
-  return t(m);
-}
-function renderPort(s) {
-  const box = $("#portList");
-  const r = el("div", "row pref port-row");
-  const who = el("div", "who");
-  who.append(el("div", "name", t("Gateway address")));
-  const sub = el("div", "sub");
-  const d = portDraft;
-  const now = s.addrEnv ? "" : String(s.port || 3425);
-  const field = input(d.value ?? now, "3425");
-  field.className = "words gateway-port";
-  field.inputMode = "numeric";
-  field.setAttribute("aria-label", t("Gateway address"));
-  const save = el("button", "text", t("Apply"));
-  if (s.addrEnv) {
-    field.value = s.addrEnv;
-    field.disabled = save.disabled = true;
-    sub.textContent = t("MAGPIE_ADDR={addr} sets the gateway’s whole address, host:port: unset it to set the port here", { addr: s.addrEnv });
-  } else if (d.err) {
-    sub.textContent = d.err;
-    sub.classList.add("err");
-  } else sub.textContent = t("Only the port is set here, 1024 to 65535; MAGPIE_ADDR=host:port sets the whole address instead. Agents magpie connected move with it. Now {url}", { url: s.gateway || "" });
-  who.append(sub);
-  save.onclick = () => {
-    const p = Number(field.value.trim());
-    if (!Number.isInteger(p) || p < 1024 || p > 65535) {
-      d.value = field.value; d.err = t("A port is a number from 1024 to 65535");
-      return renderPort(s);
-    }
-    if (p === (s.port || 3425)) { d.value = null; d.err = ""; return renderPort(s); }
-    save.disabled = true;
-    writingPrefs(api("settings/port", { port: p }).then((res) => res.settings && (prefs = res.settings, res)))
-      .then((res) => {
-        portDraft = { value: null, err: "" };
-        const n = res.port?.moved?.length || 0;
-        if (res.port?.error) status(res.port.error, "err");
-        else status(n ? t("Gateway on port {p}; {n} agents moved with it", { p, n }) : t("Gateway on port {p}", { p }), "ok", 2500);
-        renderSettings();
-      })
-      .catch((e) => { d.value = field.value; d.err = portSays(e.message); status(d.err, "err"); renderSettings(); });
-  };
-  field.oninput = () => { d.value = field.value; };
-  field.onkeydown = (e) => { e.stopPropagation(); if (e.key === "Enter") save.onclick(); if (e.key === "Escape") { portDraft = { value: null, err: "" }; renderPort(s); } };
-  const val = el("div", "val");
-  val.append(field, save);
-  r.append(who, val);
-  box.replaceChildren(r); // swapped whole: the list is never laid out empty
-}
-
-// renderBareIds: Model ids without the provider (settings.bareModelIDs,
-// love1sbug on X, moving from CLIProxyAPI): the gateway's /v1/models
-// lists each model by its own id as well, gpt-5.6-sol beside
-// codex/gpt-5.6-sol. Posted on its own; off by default.
-function renderBareIds(s) {
-  $("#bareIdsSegs").replaceChildren(segs([[false, t("Off")], [true, t("On")]], !!s.bareModelIDs, (on) =>
-    writingPrefs(api("settings/bare-ids", { on })).then((ns) => { prefs = state.settings = ns; renderSettings(); })
-      .catch((e) => { status(t(e.message), "err"); renderSettings(); })));
-}
-
-// renderCORS: the web pages whose scripts may call the gateway from a
-// browser (#1051), by origin — a row to add one, and one row each to take
-// it away. A page listed calls with a gateway key; none listed, no page
-// can read what the gateway answers, as before.
-let corsDraft = { value: "", err: "" };
-// corsSays is the gateway's word on an origin it didn't take, in the
-// page's language
-function corsSays(m) {
-  if (/wildcard/.test(m)) return t("Name each origin: a wildcard would let every web page use magpie");
-  if (/is not an (extension's )?origin/.test(m)) return t("Write an origin as http://localhost:3000 or https://app.example.com, or a browser extension's as chrome-extension://, moz-extension:// or safari-web-extension:// followed by its ID");
-  return t(m);
-}
-function renderCORS(s) {
-  const box = $("#corsList");
-  box.replaceChildren();
-  const origins = s.corsOrigins || [];
-  const d = corsDraft;
-  const set = (next, done) => writingPrefs(api("settings/cors", { origins: next }))
-    .then((ns) => { prefs = ns; d.err = ""; done?.(); renderSettings(); status(t("Saved"), "ok", 1500); })
-    .catch((e) => { d.err = corsSays(e.message); status(d.err, "err"); renderSettings(); });
-  const field = input(d.value, "http://localhost:3000");
-  field.className = "words rule-match";
-  field.setAttribute("aria-label", t("Web page origin"));
-  field.autocomplete = "off";
-  field.spellcheck = false;
-  const add = el("button", "text", t("Add"));
-  add.onclick = () => {
-    d.value = field.value.trim();
-    if (!d.value) return field.focus();
-    set([...origins, d.value], () => { corsDraft = { value: "", err: "" }; });
-  };
-  field.oninput = () => { d.value = field.value; };
-  field.onkeydown = (e) => { e.stopPropagation(); if (e.key === "Enter") add.onclick(); };
-  const r = el("div", "row pref rule-row");
-  const who = el("div", "who");
-  who.append(el("div", "name", t("Web pages that may call magpie")),
-    el("div", "sub" + (d.err ? " err" : ""), d.err || t("Scripts on these origins can call the gateway from a browser, each request with a gateway key from Gateway. A page from any other site is refused; pages on this computer are not")));
-  const val = el("div", "val rule-add");
-  val.append(field, add);
-  r.append(who, val);
-  box.append(r);
-  for (const o of origins) {
-    const row = el("div", "row pref cors-origin"); // an extension's id runs long: wrapped, never cut
-    const w = el("div", "who");
-    w.append(el("div", "name", o));
-    const x = el("button", "text", t("Remove"));
-    x.onclick = () => set(origins.filter((v) => v !== o));
-    const v = el("div", "val");
-    v.append(x);
-    row.append(w, v);
-    box.append(row);
-  }
-}
-
-// renderAllow: the addresses other computers may reach magpie from at
-// all (lc on Discord: magpie in Docker on a public host), as IPs and CIDR
-// ranges, under Share on local network — a row to add one, and one row
-// each to take it away. None listed lets every address in, with a gateway
-// key, as before; this computer is always let in. MAGPIE_ALLOW_IPS, where
-// set, is the list, shown and not edited here.
-// A list that would shut out the page saving it names the address magpie
-// sees the page from (Mathresearcher on Discord: which address?), and
-// offers to add it to the list that was refused; behind Docker or a proxy
-// that is the proxy's, not the user's computer's (gateway.peerAddr).
-let allowDraft = { value: "", err: "", addr: "", tried: null };
-function allowSays(m) {
-  if (/is not an IP address/.test(m)) return t("Write an address as 203.0.113.7, or a range as 10.0.0.0/8 or 2001:db8::/32");
-  const out = /shut out (\S+), the address/.exec(m);
-  if (out) return t("That list leaves out {addr}, the address magpie sees this page open from: add it first, or this page can’t reach magpie", { addr: out[1] });
-  if (/MAGPIE_ALLOW_IPS/.test(m)) return t("MAGPIE_ALLOW_IPS sets this list; change it there");
-  return t(m);
-}
-function renderAllow(s) {
-  const box = $("#allowList");
-  box.replaceChildren();
-  const env = s.allowIPsEnv || "";
-  if (!s.lan && !s.onNetwork && !env) return;
-  const list = env ? (s.allowIPsFromEnv || []) : (s.allowIPs || []);
-  const d = allowDraft;
-  const set = (next, done) => writingPrefs(api("settings/allowips", { ips: next }))
-    .then((ns) => { prefs = ns; d.err = d.addr = ""; d.tried = null; done?.(); renderSettings(); status(t("Saved"), "ok", 1500); })
-    .catch((e) => {
-      d.err = allowSays(e.message);
-      d.addr = /shut out (\S+), the address/.exec(e.message)?.[1] || "";
-      d.tried = d.addr ? { next, done } : null;
-      status(d.err, "err"); renderSettings();
-    });
-  const r = el("div", "row pref rule-row");
-  const who = el("div", "who");
-  const sub = d.err || (env ? t("Set by MAGPIE_ALLOW_IPS. Other computers reach magpie only from these addresses, even with a gateway key; this computer always can")
-    : t("Other computers reach magpie only from these addresses or ranges (CIDR), even with a gateway key; this computer always can. None listed lets every address in"));
-  who.append(el("div", "name", t("Allowed addresses")), el("div", "sub" + (d.err ? " err" : ""), sub));
-  // the address the refusal named, added to the list that was refused in
-  // one click
-  if (d.err && d.addr && d.tried && !env) {
-    const fix = el("button", "text allow-fix", t("Add {addr}", { addr: d.addr }));
-    fix.type = "button";
-    fix.title = t("Behind Docker or a reverse proxy, this is the proxy’s address, not your computer’s: adding it lets in everyone who comes through that proxy");
-    const { next, done } = d.tried;
-    fix.onclick = () => set([...next, d.addr], done);
-    who.append(fix);
-  }
-  r.append(who);
-  if (!env) {
-    const field = input(d.value, "203.0.113.7, 10.0.0.0/8");
-    field.className = "words rule-match allow-ip";
-    field.setAttribute("aria-label", t("IP address or range"));
-    field.autocomplete = "off";
-    field.spellcheck = false;
-    const add = el("button", "text", t("Add"));
-    add.onclick = () => {
-      d.value = field.value.trim();
-      if (!d.value) return field.focus();
-      set([...list, ...d.value.split(/[\s,;]+/).filter(Boolean)], () => { allowDraft = { value: "", err: "" }; });
-    };
-    field.oninput = () => { d.value = field.value; };
-    field.onkeydown = (e) => { e.stopPropagation(); if (e.key === "Enter") add.onclick(); };
-    const val = el("div", "val rule-add");
-    val.append(field, add);
-    r.append(val);
-  }
-  box.append(r);
-  for (const a of list) {
-    const row = el("div", "row pref allow-ip-row");
-    const w = el("div", "who");
-    w.append(el("div", "name", a));
-    const v = el("div", "val");
-    if (!env) {
-      const x = el("button", "text", t("Remove"));
-      x.onclick = () => set(list.filter((o) => o !== a));
-      v.append(x);
-    }
-    row.append(w, v);
-    box.append(row);
-  }
-}
-
-// renderLAN: the gateway shared on the local network, for agents on other
-// machines. Gateway keys and connection examples live together in Gateway.
-let lanSelectedURL = "", lanProtocol = "openai";
-// the address picked under Share on local network is kept like Connect's
-let lanWant = "";
-try { lanWant = localStorage.getItem("magpie.lanAddress") || ""; } catch {}
-function renderLAN(s) {
-  const box = $("#lanList");
-  box.replaceChildren();
-  const row = (name, sub, value, ...tools) => {
-    const r = el("div", "row pref");
-    const who = el("div", "who");
-    who.append(el("div", "name", name));
-    if (sub) who.append(el("div", "sub", sub));
-    const val = el("div", "val");
-    if (value) val.append(el("code", "", value));
-    val.append(...tools);
-    r.append(who, val);
-    box.append(r);
-    return r;
-  };
-  const set = (body) => writingPrefs(api("settings/lan", body)).then((ns) => {
-    prefs = ns; renderSettings();
-    if (ns.rekeyed) status(ns.rekeyed, "err");
-  })
-    .catch((e) => { status(t(e.message), "err"); renderSettings(); });
-  row(t("Share on local network"), t("Agents on other computers on this network, or through a tunnel to this one such as Cloudflare Tunnel, can use magpie’s models with a gateway key from Gateway"), "",
-    segs([["off", t("Off")], ["on", t("On")]], s.lan ? "on" : "off", (v) => set({ on: v === "on" })));
-  if (!s.lan) return;
-  let urls = s.lanURLs || [], sub = "";
-  // in a container magpie finds only the container's own addresses; the
-  // page opened over the network was reached at the host's, so the
-  // gateway is offered there, on its port
-  if (s.lanContainer) {
-    const host = location.hostname, port = urls.length ? new URL(urls[0]).port : "";
-    if (web && host && port && !/^(localhost|127\.|\[::1\]$)/.test(host)) {
-      urls = ["http://" + host + ":" + port]; // an IPv6 hostname comes bracketed
-      sub = t("Where this page was opened, on the gateway’s port; MAGPIE_PUBLIC_URL sets another");
-    } else sub = t("The container’s own addresses, which other devices can’t reach: set MAGPIE_PUBLIC_URL to the host’s");
-  }
-  if (!urls.length) row(t("Address"), t("This computer has no local network address right now"), "");
-  else {
-    lanSelectedURL = urls.includes(lanWant) ? lanWant : urls[0];
-    const controls = el("div", "lan-address-controls");
-    const address = urls.length === 1 ? el("code", "lan-address-text") : el("button", "proto pick lan-interface");
-    if (urls.length > 1) {
-      address.type = "button";
-      address.setAttribute("aria-label", t("Address"));
-      address.onclick = (e) => {
-        e.stopPropagation();
-        if (address.classList.contains("open")) return closeProtoMenu();
-        const suffix = lanProtocol === "openai" ? "/v1" : "";
-        openProtoMenu(address, urls.map((u) => ({ v: u, name: u + suffix, note: "" })), lanSelectedURL,
-          (v) => { lanSelectedURL = lanWant = v; keepPick("magpie.lanAddress", v); update(); }, "Address", "lan-address-menu");
-      };
-    }
-    const copyControl = el("span", "lan-copy");
-    const update = () => {
-      const label = lanProtocol === "openai" ? "OpenAI" : "Anthropic";
-      const url = lanSelectedURL + (lanProtocol === "openai" ? "/v1" : "");
-      if (urls.length === 1) address.textContent = url;
-      else address.replaceChildren(el("span", "lan-url", url), svg(CHEV, 11, 1.6));
-      address.title = url;
-      const what = t("{label} address", { label });
-      const button = copyBtn(url, what, t("Copied {label} address", { label }));
-      button.setAttribute("aria-label", t("Copy") + " " + what);
-      copyControl.replaceChildren(button);
-    };
-    controls.append(segs([["openai", "OpenAI"], ["anthropic", "Anthropic"]], lanProtocol,
-      (v) => { lanProtocol = v; update(); }), address, copyControl);
-    row(t("Address"), "", "", controls).classList.add("lan-address-row");
-    update();
-  }
-  if (sub) row(t("In a container"), sub, "").classList.add("lan-container");
-}
-
 // renderUpdate fills in the version row: whether a newer magpie is out.
 // The app checks and downloads on its own, so usually the row just offers
 // the restart; a check can also be asked for. That check leaves the button
@@ -23000,7 +22780,7 @@ function prefsKeep(s) {
     uiFont: s.uiFont || null, codeFont: s.codeFont || null,
     otel: s.otel || {},
     trayUsages: s.trayUsages || [],
-    redact: !!s.redact, redactPersonal: !!s.redactPersonal, redactKinds: s.redactKinds || {}, redactWords: s.redactWords || [], redactWordsAnyCase: !!s.redactWordsAnyCase, redactShape: !!s.redactShape, codexWarmup: s.codexWarmup || "",
+    redact: !!s.redact, redactPersonal: !!s.redactPersonal, redactKinds: s.redactKinds || {}, redactWords: s.redactWords || [], redactWordsAnyCase: !!s.redactWordsAnyCase, redactWordsWhole: !!s.redactWordsWhole, redactShape: !!s.redactShape, codexWarmup: s.codexWarmup || "",
     claudeWarmup: s.claudeWarmup || "", codexWarmAt: s.codexWarmAt || "", claudeWarmAt: s.claudeWarmAt || "",
     codexWarmAts: warmTimes(s.codexWarmAts, s.codexWarmAt), claudeWarmAts: warmTimes(s.claudeWarmAts, s.claudeWarmAt), workbuddyCheckin: !!s.workbuddyCheckin, traeCheckin: !!s.traeCheckin, minimaxCheckin: !!s.minimaxCheckin, qoderCheckin: !!s.qoderCheckin, noStats: !!s.noStats, noUsageStats: !!s.noUsageStats,
     memberModel: !!s.memberModel, noLoopGuard: !!s.noLoopGuard, claudeLeanPrompt: !!s.claudeLeanPrompt, refusalRetries: s.refusalRetries ?? null,
@@ -24303,8 +24083,11 @@ function renderSideGw(g) {
   g = sideGwAt;
   b.hidden = !g?.url;
   if (b.hidden) return;
-  let host = g.url;
-  try { host = new URL(g.url).host; } catch {}
+  // a page other machines open (magpie web) says where they reach it,
+  // MAGPIE_PUBLIC_URL, as the Gateway page does (#1551; noahhrreion)
+  const url = web && g.publicURL || g.url;
+  let host = url;
+  try { host = new URL(url).host; } catch {}
   b.classList.toggle("off", !g.running);
   const s = b.querySelector("span");
   s.textContent = g.running ? t("Gateway") + " " + host : t("Gateway stopped");
@@ -24312,7 +24095,7 @@ function renderSideGw(g) {
   // gateway leaves it no room ("Zugangspunkt") says the address alone, the
   // word kept in its tooltip
   if (g.running && s.scrollWidth > s.clientWidth) s.textContent = host;
-  b.title = g.running ? t("Gateway") + " " + g.url : g.url;
+  b.title = g.running ? t("Gateway") + " " + url : url;
 }
 if (mode === "window") {
   $("#sideGw").onclick = () => { show("gateway"); $("#sideGw").blur(); };

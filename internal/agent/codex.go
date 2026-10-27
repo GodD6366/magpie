@@ -426,9 +426,12 @@ func codexIn(at place) *Agent {
 		ms := models()
 		model, effort := get("model"), get("model_reasoning_effort")
 		if e := catalog.Efforts(ms, model); len(e) > 0 && effort != "" && !contains(e, effort) {
-			if err := edit.SetTOMLTop(path, edit.KV{Path: "model_reasoning_effort", Value: codexcat.ModelDefault(e, effort)}); err != nil {
+			to := codexcat.ModelDefault(e, effort)
+			if err := edit.SetTOMLTop(path, edit.KV{Path: "model_reasoning_effort", Value: to}); err != nil {
 				return err
 			}
+			// magpie's own change, which Disconnect undoes while it stands
+			stash(map[string]string{at.key("codex.effort_set"): to})
 			if err := relist(); err != nil {
 				return err
 			}
@@ -524,7 +527,12 @@ func codexIn(at place) *Agent {
 		if !asProvider() {
 			return nil
 		}
-		if err := edit.DelTOMLTop(path, "model_provider", "model_catalog_json"); err != nil {
+		// a model list of the user's own, put in by hand since, stays
+		keys := []string{"model_provider"}
+		if c := get("model_catalog_json"); c == "" || ownCatalog(c) {
+			keys = append(keys, "model_catalog_json")
+		}
+		if err := edit.DelTOMLTop(path, keys...); err != nil {
 			return err
 		}
 		dropList()
@@ -1023,7 +1031,7 @@ func codexIn(at place) *Agent {
 		if p != "" && p != magpieID && !isCCSwitchMirror(p) {
 			own = say(group(p, options(catalog.Codex(), "")))
 		} else {
-			own = say(group("OpenAI", options(ownCodex(), "")))
+			own = codexInMagpie(say(group("OpenAI", options(ownCodex(), ""))))
 			// with magpie Codex's provider (magpie API, or a magpie model
 			// picked with no ChatGPT sign-in beside it), Codex's own models
 			// are reached through magpie on a ChatGPT account there: picked
@@ -1078,16 +1086,33 @@ func codexIn(at place) *Agent {
 			return "", err
 		}
 		was := unstash(at.key("codex.model"))
+		// what was there before magpie is put back only where magpie's
+		// change still stands: a key the user set by hand since keeps
+		// theirs (yhwangl on X)
 		var back []edit.KV
-		if p := unstash(at.key("codex.provider")); p != "" && p != magpieID {
+		if p := unstash(at.key("codex.provider")); p != "" && p != magpieID && get("model_provider") == "" {
 			back = append(back, edit.KV{Path: "model_provider", Value: p})
 		}
 		// the catalog of the user's own put back while its file is there:
 		// one removed since would keep Codex from loading its config
-		if c := unstash(at.key("codex.catalog")); c != "" && !ownCatalog(c) && !theirListGone(c) {
+		if c := unstash(at.key("codex.catalog")); c != "" && !ownCatalog(c) && !theirListGone(c) && get("model_catalog_json") == "" {
 			back = append(back, edit.KV{Path: "model_catalog_json", Value: c})
 		}
-		if e := unstash(at.key("codex.effort")); e != "" {
+		// the effort, where it is still one magpie set: picked on the
+		// Agents page, or moved to one its model has. One taken out
+		// reads the same however it was, and comes back.
+		id := at.id
+		if id == "" {
+			id = "codex"
+		}
+		ours := map[string]bool{"": true}
+		if set := unstash(at.key("codex.effort_set")); set != "" {
+			ours[set] = true
+		}
+		if r := appliedOf(id).Fields["effort"]; r != "" {
+			ours[r] = true
+		}
+		if e := unstash(at.key("codex.effort")); e != "" && ours[get("model_reasoning_effort")] {
 			back = append(back, edit.KV{Path: "model_reasoning_effort", Value: e})
 		}
 		if len(back) > 0 {
@@ -1116,7 +1141,7 @@ func codexIn(at place) *Agent {
 				return err
 			}
 			dropList()
-			forget(at.key("codex.model"), at.key("codex.effort"), at.key("codex.provider"), at.key("codex.catalog"), at.key("codex.out"), at.key("codex.joined"), at.key("codex.beside"))
+			forget(at.key("codex.model"), at.key("codex.effort"), at.key("codex.effort_set"), at.key("codex.provider"), at.key("codex.catalog"), at.key("codex.out"), at.key("codex.joined"), at.key("codex.beside"))
 			return nil
 		}
 		// magpie API: magpie stays Codex's provider whichever model is the
@@ -1255,7 +1280,7 @@ func codexIn(at place) *Agent {
 				return err
 			}
 			dropList()
-			forget(at.key("codex.model"), at.key("codex.effort"), at.key("codex.provider"), at.key("codex.catalog"))
+			forget(at.key("codex.model"), at.key("codex.effort"), at.key("codex.effort_set"), at.key("codex.provider"), at.key("codex.catalog"))
 			// its threads go on without magpie: the compactions magpie made
 			// in them written as Codex's own (a distro's Codex locks its
 			// files where this machine's locks can't reach)
@@ -1874,6 +1899,27 @@ func ownCodex() []catalog.Model {
 		return ms
 	}
 	return out
+}
+
+// codexInMagpie marks Served those of Codex's own models that magpie's list
+// shows Codex on a ChatGPT account of the user's (codex/gpt-5.5): its
+// pickers leave out magpie's codex/… as only a hop (viaMagpieFor), so these
+// are how they are offered, and the agent's own models switched off
+// (provider.OwnModelsHidden) never takes them out. It did once a routing
+// group gave the picker a catalog entry, and Codex's picker was the group
+// alone (shiqi_40904 on Discord).
+func codexInMagpie(own []Option) []Option {
+	shown, _ := provider.CatalogFor("codex")
+	on := map[string]bool{}
+	for _, e := range shown {
+		if provider.CodexOwn(e) {
+			on[e.Model] = true
+		}
+	}
+	for i := range own {
+		own[i].Served = on[own[i].Value]
+	}
+	return own
 }
 
 // codexOwnViaMagpie is the catalog id magpie serves one of Codex's own
