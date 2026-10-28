@@ -5,17 +5,464 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"reflect"
+	"runtime"
 	"slices"
 	"strings"
-	"sync"
 	"testing"
 
 	"github.com/tidwall/gjson"
+
 	"github.com/yetone/magpie/internal/catalog"
 	"github.com/yetone/magpie/internal/edit"
-	"github.com/yetone/magpie/internal/gateway"
 	"github.com/yetone/magpie/internal/provider"
 )
+
+// openClawConfig is openclaw.json as OpenClaw 2026.10.8 writes it after
+// `openclaw onboard --non-interactive --accept-risk --auth-choice
+// deepseek-api-key …` (the folder and the gateway token changed).
+const openClawConfig = `{
+  "agents": {
+    "entries": {
+      "main": {
+        "name": "main",
+        "workspace": "/Users/u/.openclaw/workspace",
+        "agentDir": "/Users/u/.openclaw/agents/main/agent",
+        "identity": {
+          "name": "main"
+        }
+      }
+    },
+    "defaults": {
+      "workspace": "/Users/u/.openclaw/workspace",
+      "models": {
+        "deepseek/deepseek-v4-pro": {
+          "alias": "DeepSeek"
+        }
+      },
+      "model": {
+        "primary": "deepseek/deepseek-v4-pro"
+      }
+    }
+  },
+  "plugins": {
+    "entries": {
+      "anthropic": {
+        "config": {
+          "sessionCatalog": {
+            "enabled": false
+          }
+        }
+      },
+      "codex": {
+        "config": {
+          "sessionCatalog": {
+            "enabled": false
+          }
+        }
+      },
+      "deepseek": {
+        "enabled": true
+      }
+    }
+  },
+  "meta": {
+    "migrations": {
+      "modelPolicyAllowlist": true,
+      "utilityModelSeparation": true
+    },
+    "lastTouchedVersion": "2026.10.8"
+  },
+  "gateway": {
+    "mode": "local",
+    "auth": {
+      "mode": "token",
+      "token": "gateway-token"
+    },
+    "port": 18799,
+    "bind": "loopback",
+    "tailscale": {
+      "mode": "off"
+    }
+  },
+  "tools": {
+    "profile": "full"
+  },
+  "auth": {
+    "profiles": {
+      "deepseek:default": {
+        "provider": "deepseek",
+        "mode": "api_key"
+      }
+    }
+  },
+  "models": {
+    "mode": "merge",
+    "providers": {
+      "deepseek": {
+        "baseUrl": "https://api.deepseek.com",
+        "api": "openai-completions",
+        "models": []
+      }
+    }
+  },
+  "wizard": {
+    "lastRunAt": "2026-10-28T20:43:15.671Z",
+    "lastRunVersion": "2026.10.8",
+    "lastRunCommand": "onboard",
+    "lastRunMode": "local"
+  }
+}
+`
+
+// openClawHomeWith is a HOME with OpenClaw's ~/.openclaw holding body as
+// its openclaw.json ("" for none), and magpie with a provider of two
+// models, one of them with effort levels.
+func openClawHomeWith(t *testing.T, body string) (home, path string) {
+	t.Helper()
+	home = t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
+	t.Setenv("XDG_CACHE_HOME", filepath.Join(home, ".cache"))
+	for _, k := range []string{"OPENCLAW_CONFIG_PATH", "OPENCLAW_STATE_DIR", "OPENCLAW_PROFILE", "OPENCLAW_HOME"} {
+		t.Setenv(k, "")
+	}
+	if err := provider.Save(provider.Provider{ID: "kimi", Name: "Kimi", Key: "k",
+		Chat: "https://api.moonshot.cn/v1", Models: []string{"k2", "k2.5-vision"}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := catalog.SaveLive("kimi", "https://api.moonshot.cn/v1", []catalog.Model{
+		{ID: "k2", Context: 262144, Efforts: []string{"low", "medium", "high"}},
+		{ID: "k2.5-vision", Images: true},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	path = filepath.Join(home, ".openclaw", "openclaw.json")
+	if body != "" {
+		writeFile(t, path, body)
+	}
+	return home, path
+}
+
+func openClawParse(t *testing.T, path string) map[string]any {
+	t.Helper()
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var m map[string]any
+	if err := json.Unmarshal(b, &m); err != nil {
+		t.Fatalf("%s is not JSON: %v\n%s", path, err, b)
+	}
+	return m
+}
+
+func openClawAt_(m map[string]any, keys ...string) any {
+	var v any = m
+	for _, k := range keys {
+		o, _ := v.(map[string]any)
+		v = o[k]
+	}
+	return v
+}
+
+// Connecting OpenClaw adds magpie as a provider of its own — the gateway,
+// with a key naming OpenClaw, and every one of magpie's models — and makes
+// the model picked the primary. The rest of OpenClaw's file stays, and
+// Disconnect gives it back byte for byte.
+func TestOpenClaw(t *testing.T) {
+	home, path := openClawHomeWith(t, openClawConfig)
+	a := openClaw(home)
+	if a.Path != path || !a.Detected() {
+		t.Fatalf("path %q, detected %v", a.Path, a.Detected())
+	}
+	f := a.Field("model")
+	if got := f.Get(); got != "deepseek/deepseek-v4-pro" || a.Wired() || a.Check() != "" {
+		t.Fatalf("before: %q wired %v check %q", got, a.Wired(), a.Check())
+	}
+	var own, ours bool
+	for _, o := range f.Options(a.Values()) {
+		own = own || o.Value == "deepseek/deepseek-v4-pro"
+		ours = ours || o.Value == "magpie/kimi/k2"
+	}
+	if !own || !ours {
+		t.Fatalf("options: own %v magpie %v", own, ours)
+	}
+
+	if err := a.Pick("model", "magpie/kimi/k2"); err != nil {
+		t.Fatal(err)
+	}
+	m := openClawParse(t, path)
+	if p := openClawAt_(m, "agents", "defaults", "model"); !reflect.DeepEqual(p, map[string]any{"primary": "magpie/kimi/k2"}) {
+		t.Fatalf("agents.defaults.model: %v", p)
+	}
+	if !a.Wired() || f.Get() != "magpie/kimi/k2" {
+		t.Fatalf("wired %v, model %q", a.Wired(), f.Get())
+	}
+	if c := a.Check(); c != "" {
+		t.Fatalf("check: %s", c)
+	}
+	p, _ := openClawAt_(m, "models", "providers", "magpie").(map[string]any)
+	if p["baseUrl"] != here(home).v1() || p["api"] != "openai-completions" || p["apiKey"] != agentKeyAt("openclaw", here(home).gw()) {
+		t.Fatalf("magpie's provider: %v", p)
+	}
+	models := map[string]map[string]any{}
+	for _, x := range p["models"].([]any) {
+		e := x.(map[string]any)
+		models[e["id"].(string)] = e
+	}
+	k2, vision := models["kimi/k2"], models["kimi/k2.5-vision"]
+	if len(models) != 2 || k2 == nil || vision == nil {
+		t.Fatalf("models: %v", models)
+	}
+	if k2["name"] != "kimi/k2" || k2["contextWindow"] != float64(262144) || k2["reasoning"] != true {
+		t.Fatalf("k2: %v", k2)
+	}
+	if vision["contextWindow"] != float64(openClawContext) || !reflect.DeepEqual(vision["input"], []any{"text", "image"}) || vision["reasoning"] != false {
+		t.Fatalf("k2.5-vision: %v", vision)
+	}
+	// as `openclaw models set` does, beside the user's own entry
+	if ms := openClawAt_(m, "agents", "defaults", "models"); !reflect.DeepEqual(ms, map[string]any{
+		"deepseek/deepseek-v4-pro": map[string]any{"alias": "DeepSeek"}, "magpie/kimi/k2": map[string]any{}}) {
+		t.Fatalf("agents.defaults.models: %v", ms)
+	}
+	for _, k := range []string{"plugins", "meta", "gateway", "tools", "auth", "wizard"} {
+		var want map[string]any
+		json.Unmarshal([]byte(openClawConfig), &want)
+		if !reflect.DeepEqual(m[k], want[k]) {
+			t.Fatalf("%s changed: %v", k, m[k])
+		}
+	}
+	if d := openClawAt_(m, "models", "providers", "deepseek"); d == nil {
+		t.Fatal("the user's own provider is gone")
+	}
+
+	// switching between magpie's models keeps what OpenClaw was on before;
+	// a model ref with a dot is one key
+	if err := a.Pick("model", "magpie/kimi/k2.5-vision"); err != nil {
+		t.Fatal(err)
+	}
+	if got := f.Get(); got != "magpie/kimi/k2.5-vision" {
+		t.Fatalf("model %q", got)
+	}
+	ms, _ := openClawAt_(openClawParse(t, path), "agents", "defaults", "models").(map[string]any)
+	if _, on := ms["magpie/kimi/k2.5-vision"]; !on || len(ms) != 2 {
+		t.Fatalf("agents.defaults.models after a switch: %v", ms)
+	}
+	if err := a.Disconnect(); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := os.ReadFile(path); string(got) != openClawConfig {
+		t.Fatalf("Disconnect left:\n%s", got)
+	}
+	if a.Wired() {
+		t.Fatal("still wired")
+	}
+}
+
+// A model OpenClaw names as a bare string stays a string, and one with no
+// model at all, or no file at all, is given back as it was.
+func TestOpenClawShapes(t *testing.T) {
+	for name, body := range map[string]string{
+		"string":   "{\n  \"agents\": {\n    \"defaults\": {\n      \"model\": \"anthropic/claude-opus-4-6\"\n    }\n  }\n}\n",
+		"fallback": "{\n  \"agents\": {\n    \"defaults\": {\n      \"model\": {\n        \"primary\": \"anthropic/claude-opus-4-6\",\n        \"fallbacks\": [\"openai/gpt-5.5\"]\n      }\n    }\n  }\n}\n",
+		"no model": "{\n  \"gateway\": {\n    \"port\": 18789\n  }\n}\n",
+		"no file":  "",
+	} {
+		t.Run(name, func(t *testing.T) {
+			home, path := openClawHomeWith(t, body)
+			if body == "" {
+				os.MkdirAll(filepath.Dir(path), 0o700) // detected
+			}
+			a := openClaw(home)
+			if err := a.Pick("model", "magpie/kimi/k2"); err != nil {
+				t.Fatal(err)
+			}
+			m := openClawParse(t, path)
+			got := openClawAt_(m, "agents", "defaults", "model")
+			switch name {
+			case "fallback":
+				if !reflect.DeepEqual(got, map[string]any{"primary": "magpie/kimi/k2", "fallbacks": []any{"openai/gpt-5.5"}}) {
+					t.Fatalf("model: %v", got)
+				}
+			default:
+				if got != "magpie/kimi/k2" {
+					t.Fatalf("model: %v", got)
+				}
+			}
+			if body == "" && runtime.GOOS != "windows" {
+				if st, err := os.Stat(path); err != nil || st.Mode().Perm() != 0o600 {
+					t.Fatalf("a new openclaw.json holding a key: %v %v", st.Mode(), err)
+				}
+			}
+			if err := a.Disconnect(); err != nil {
+				t.Fatal(err)
+			}
+			b, err := os.ReadFile(path)
+			if body == "" {
+				if !os.IsNotExist(err) {
+					t.Fatalf("magpie's own file is left: %v\n%s", err, b)
+				}
+				return
+			}
+			if string(b) != body {
+				t.Fatalf("Disconnect left:\n%s\nwant:\n%s", b, body)
+			}
+		})
+	}
+}
+
+// A model allow-list that has nothing of magpie's gets magpie's models
+// in, or OpenClaw refuses them; Disconnect takes them out again.
+func TestOpenClawAllowList(t *testing.T) {
+	body := "{\n  \"agents\": {\n    \"defaults\": {\n      \"model\": \"deepseek/deepseek-v4-pro\",\n      \"modelPolicy\": {\n        \"allow\": [\n          \"deepseek/*\"\n        ]\n      }\n    }\n  }\n}\n"
+	home, path := openClawHomeWith(t, body)
+	a := openClaw(home)
+	if err := a.Pick("model", "magpie/kimi/k2"); err != nil {
+		t.Fatal(err)
+	}
+	allow := openClawAt_(openClawParse(t, path), "agents", "defaults", "modelPolicy", "allow")
+	if !reflect.DeepEqual(allow, []any{"deepseek/*", "magpie/*"}) {
+		t.Fatalf("allow: %v", allow)
+	}
+	if err := a.Disconnect(); err != nil {
+		t.Fatal(err)
+	}
+	m := openClawParse(t, path)
+	if allow := openClawAt_(m, "agents", "defaults", "modelPolicy", "allow"); !reflect.DeepEqual(allow, []any{"deepseek/*"}) {
+		t.Fatalf("allow after Disconnect: %v", allow)
+	}
+	if got := openClawAt_(m, "agents", "defaults", "model"); got != "deepseek/deepseek-v4-pro" {
+		t.Fatalf("model after Disconnect: %v", got)
+	}
+}
+
+// A model of OpenClaw's own picked while it is on magpie takes magpie
+// out, and keeps the fallbacks.
+func TestOpenClawOwnModelTakesMagpieOut(t *testing.T) {
+	home, path := openClawHomeWith(t, openClawConfig)
+	a := openClaw(home)
+	if err := a.Pick("model", "magpie/kimi/k2"); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.Pick("model", "deepseek/deepseek-v4-flash"); err != nil {
+		t.Fatal(err)
+	}
+	want := strings.Replace(openClawConfig, `"primary": "deepseek/deepseek-v4-pro"`, `"primary": "deepseek/deepseek-v4-flash"`, 1)
+	if got, _ := os.ReadFile(path); string(got) != want {
+		t.Fatalf("got:\n%s\nwant:\n%s", got, want)
+	}
+	if a.Wired() {
+		t.Fatal("still wired")
+	}
+}
+
+// What the user sets in magpie's provider — a header, a timeout, a
+// model's maxTokens — is theirs: a catalog sync rewrites the endpoint and
+// the models, not those. A sync with nothing to change doesn't write.
+func TestOpenClawSyncKeepsTheirs(t *testing.T) {
+	home, path := openClawHomeWith(t, openClawConfig)
+	a := openClaw(home)
+	if err := a.Pick("model", "magpie/kimi/k2"); err != nil {
+		t.Fatal(err)
+	}
+	m := openClawParse(t, path)
+	p := openClawAt_(m, "models", "providers", "magpie").(map[string]any)
+	p["headers"] = map[string]any{"X-Mine": "1"}
+	p["timeoutSeconds"] = 600
+	p["baseUrl"] = "http://127.0.0.1:1/v1"
+	for _, x := range p["models"].([]any) {
+		if e := x.(map[string]any); e["id"] == "kimi/k2" {
+			e["maxTokens"] = 32000
+			e["reasoning"] = false
+		}
+	}
+	b, _ := json.MarshalIndent(m, "", "  ")
+	writeFile(t, path, string(b)+"\n")
+	if c := a.Check(); !strings.Contains(c, "baseUrl") {
+		t.Fatalf("check with the URL changed: %q", c)
+	}
+	if err := a.Sync(); err != nil {
+		t.Fatal(err)
+	}
+	p = openClawAt_(openClawParse(t, path), "models", "providers", "magpie").(map[string]any)
+	if p["baseUrl"] != here(home).v1() || p["timeoutSeconds"] != float64(600) || !reflect.DeepEqual(p["headers"], map[string]any{"X-Mine": "1"}) {
+		t.Fatalf("after a sync: %v", p)
+	}
+	for _, x := range p["models"].([]any) {
+		if e := x.(map[string]any); e["id"] == "kimi/k2" && (e["maxTokens"] != float64(32000) || e["reasoning"] != true) {
+			t.Fatalf("k2 after a sync: %v", e)
+		}
+	}
+	if a.Check() != "" {
+		t.Fatalf("check: %s", a.Check())
+	}
+	st, _ := os.Stat(path)
+	before, _ := os.ReadFile(path)
+	if err := a.Sync(); err != nil {
+		t.Fatal(err)
+	}
+	st2, _ := os.Stat(path)
+	if after, _ := os.ReadFile(path); string(after) != string(before) || !st2.ModTime().Equal(st.ModTime()) {
+		t.Fatal("a sync with nothing to change wrote the file")
+	}
+}
+
+// openclaw.json in JSON5, which OpenClaw reads and magpie can't, is left
+// as it is, and said so.
+func TestOpenClawJSON5LeftAlone(t *testing.T) {
+	body := "// mine\n{\n  agents: { defaults: { model: 'deepseek/deepseek-v4-pro' } },\n}\n"
+	home, path := openClawHomeWith(t, body)
+	a := openClaw(home)
+	if err := a.Pick("model", "magpie/kimi/k2"); err == nil {
+		t.Fatal("a JSON5 file was written")
+	}
+	if got, _ := os.ReadFile(path); string(got) != body {
+		t.Fatalf("changed:\n%s", got)
+	}
+	if c := a.Check(); !strings.Contains(c, "JSON5") {
+		t.Fatalf("check: %q", c)
+	}
+}
+
+// openclaw.json is where OpenClaw itself looks: $OPENCLAW_CONFIG_PATH, its
+// state folder, a named profile's folder, ~ as $OPENCLAW_HOME.
+func TestOpenClawPaths(t *testing.T) {
+	home := t.TempDir()
+	at := here(home)
+	env := map[string]string{}
+	set := func(k, v string) { env[k] = v; t.Setenv(k, v) }
+	for _, k := range []string{"OPENCLAW_CONFIG_PATH", "OPENCLAW_STATE_DIR", "OPENCLAW_PROFILE", "OPENCLAW_HOME"} {
+		set(k, "")
+	}
+	check := func(wantDir, wantPath string) {
+		t.Helper()
+		dir, path := openClawPaths(at)
+		if dir != wantDir || path != wantPath {
+			t.Fatalf("%v: %s %s, want %s %s", env, dir, path, wantDir, wantPath)
+		}
+	}
+	def := filepath.Join(home, ".openclaw")
+	check(def, filepath.Join(def, "openclaw.json"))
+	set("OPENCLAW_PROFILE", "default")
+	check(def, filepath.Join(def, "openclaw.json"))
+	set("OPENCLAW_PROFILE", "../x")
+	check(def, filepath.Join(def, "openclaw.json"))
+	set("OPENCLAW_PROFILE", "Work")
+	w := filepath.Join(home, ".openclaw-Work")
+	check(w, filepath.Join(w, "openclaw.json"))
+	set("OPENCLAW_HOME", "~/oc")
+	w = filepath.Join(home, "oc", ".openclaw-Work")
+	check(w, filepath.Join(w, "openclaw.json"))
+	set("OPENCLAW_STATE_DIR", "~/state")
+	s := filepath.Join(home, "oc", "state")
+	check(s, filepath.Join(s, "openclaw.json"))
+	set("OPENCLAW_CONFIG_PATH", filepath.Join(home, "cfg", "my.json"))
+	check(s, filepath.Join(home, "cfg", "my.json"))
+}
+
+// --- the branch's model chain, install entry and read-only policy ---
 
 func openclawHome(t *testing.T, config string) (*Agent, func() []byte) {
 	t.Helper()
@@ -24,10 +471,13 @@ func openclawHome(t *testing.T, config string) (*Agent, func() []byte) {
 	t.Setenv("USERPROFILE", home)
 	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
 	t.Setenv("XDG_CACHE_HOME", filepath.Join(home, ".cache"))
+	for _, k := range []string{"OPENCLAW_CONFIG_PATH", "OPENCLAW_STATE_DIR", "OPENCLAW_PROFILE", "OPENCLAW_HOME", "OPENCLAW_CONFIG_READONLY", "OPENCLAW_NIX_MODE"} {
+		t.Setenv(k, "")
+	}
 	if err := provider.Save(provider.Provider{ID: "relay", Name: "Relay", Key: "test-key", Chat: "http://127.0.0.1:1/v1", Models: []string{"m1", "m2.1"}}); err != nil {
 		t.Fatal(err)
 	}
-	a := openclaw(home)
+	a := openClaw(home)
 	if config != "" {
 		if err := os.MkdirAll(filepath.Dir(a.Path), 0o755); err != nil {
 			t.Fatal(err)
@@ -87,546 +537,6 @@ func TestOpenClawRegistered(t *testing.T) {
 	}
 }
 
-func TestOpenClawConnectPickDisconnect(t *testing.T) {
-	const initial = `{
-  // Keep my chat channels and fallback models.
-  "agents": {"defaults": {
-    "model": {"primary": "mine/original", "fallbacks": ["mine/backup"]},
-    "models": {"mine/original": {"alias": "original"}},
-    "workspace": "/fixture/work"
-  }},
-  "models": {"mode": "merge", "providers": {"mine": {
-    "baseUrl": "https://example.com/v1", "apiKey": "mine-key",
-    "api": "openai-completions", "models": [{"id": "original", "name": "Original"}]
-  }}},
-  "channels": {"telegram": {"enabled": false}},
-  "gateway": {"port": 18789}
-}`
-	a, read := openclawHome(t, initial)
-	if err := a.Connect(); err != nil {
-		t.Fatal(err)
-	}
-	if !a.Wired() || a.Drift() != nil {
-		t.Fatalf("not connected: model=%q drift=%+v", a.Field("model").Get(), a.Drift())
-	}
-	if err := a.Pick("model", "magpie/relay/m2.1"); err != nil {
-		t.Fatal(err)
-	}
-	_, data, err := openclawRead(a.Path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	for key, want := range map[string]string{
-		openclawModel + ".primary":               "magpie/relay/m2.1",
-		openclawProvider + ".baseUrl":            gateway.URL() + "/v1",
-		openclawProvider + ".apiKey":             keyAt(gateway.URL()),
-		openclawProvider + ".api":                "openai-completions",
-		openclawProvider + ".headers.User-Agent": "openclaw",
-		"agents.defaults.workspace":              "/fixture/work",
-		"models.mode":                            "merge",
-	} {
-		if got := gjson.GetBytes(data, key).String(); got != want {
-			t.Errorf("%s = %q, want %q", key, got, want)
-		}
-	}
-	for _, ref := range []string{"magpie/relay/m1", `magpie/relay/m2\.1`} {
-		if !gjson.GetBytes(data, "agents.defaults.models."+ref).Exists() {
-			t.Errorf("%s is missing from OpenClaw's model menu", ref)
-		}
-	}
-	if !bytes.Contains(read(), []byte("// Keep my chat channels")) {
-		t.Fatal("JSONC comments were lost")
-	}
-	if err := a.Disconnect(); err != nil {
-		t.Fatal(err)
-	}
-	if a.Wired() || a.Field("model").Get() != "mine/original" {
-		t.Fatalf("disconnect didn't restore model: %q", a.Field("model").Get())
-	}
-	_, data, _ = openclawRead(a.Path)
-	if gjson.GetBytes(data, openclawProvider).Exists() || len(gjson.GetBytes(data, "agents.defaults.models").Map()) != 1 ||
-		gjson.GetBytes(data, openclawModel+".fallbacks.0").String() != "mine/backup" ||
-		!gjson.GetBytes(data, "models.providers.mine").Exists() || !gjson.GetBytes(data, "channels.telegram").Exists() {
-		t.Fatalf("disconnect changed user config: %s", read())
-	}
-	if err := a.Connect(); err != nil {
-		t.Fatal(err)
-	}
-	if a.Field("model").Get() != "magpie/relay/m2.1" {
-		t.Fatal("reconnect didn't bring back last pick")
-	}
-}
-
-func TestOpenClawModelShapes(t *testing.T) {
-	for _, model := range []string{`"mine/original"`, `{"primary":"mine/original"}`, `{"fallbacks":["mine/backup"]}`, `null`} {
-		t.Run(model, func(t *testing.T) {
-			config := `{"agents":{"defaults":{"model":` + model + `}}}`
-			if model == "null" {
-				config = `{}`
-			}
-			a, _ := openclawHome(t, config)
-			f := a.Field("model")
-			if err := f.Set("magpie/relay/m1"); err != nil {
-				t.Fatal(err)
-			}
-			if err := f.Set("magpie/relay/m2.1"); err != nil {
-				t.Fatal(err)
-			}
-			if err := f.Set(""); err != nil {
-				t.Fatal(err)
-			}
-			_, data, _ := openclawRead(a.Path)
-			got := gjson.GetBytes(data, openclawModel)
-			if model == "null" {
-				if got.Exists() {
-					t.Fatalf("unset model was not removed: %s", data)
-				}
-			} else if !sameJSON(got.Raw, json.RawMessage(model)) {
-				t.Fatalf("model shape changed: %s, want %s", got.Raw, model)
-			}
-			if gjson.GetBytes(data, "agents.defaults.models").Exists() {
-				t.Fatal("an unrestricted model menu was restricted")
-			}
-		})
-	}
-}
-
-func TestOpenClawDisconnectKeepsUserEdits(t *testing.T) {
-	a, read := openclawHome(t, `{"agents":{"defaults":{"model":"mine/original","models":{"mine/original":{}},"modelPolicy":{"allow":["mine/original"]}}}}`)
-	if err := a.Connect(); err != nil {
-		t.Fatal(err)
-	}
-	if err := edit.SetJSON(a.Path,
-		edit.KV{Path: openclawModel + ".primary", Value: "magpie/relay/m2.1"},
-		edit.KV{Path: openclawModel + ".fallbacks", Value: []string{"mine/new-backup"}},
-		edit.KV{Path: "agents.defaults.modelPolicy.allow", Value: []string{"mine/original", "magpie/*", "mine/new"}},
-		edit.KV{Path: `agents.defaults.models.magpie/relay/m2\.1`, Value: map[string]any{"alias": "edited"}},
-	); err != nil {
-		t.Fatal(err)
-	}
-	if err := a.Disconnect(); err != nil {
-		t.Fatal(err)
-	}
-	_, data, _ := openclawRead(a.Path)
-	if a.Field("model").Get() != "mine/original" || gjson.GetBytes(data, openclawModel+".fallbacks.0").String() != "mine/new-backup" ||
-		gjson.GetBytes(data, `agents.defaults.models.magpie/relay/m2\.1.alias`).String() != "edited" ||
-		gjson.GetBytes(data, "agents.defaults.modelPolicy.allow").Raw != `["mine/original","mine/new"]` {
-		t.Fatalf("user edits lost: %s", read())
-	}
-}
-
-func TestOpenClawSyncAndDrift(t *testing.T) {
-	a, read := openclawHome(t, `{"agents":{"defaults":{"model":"mine/original","models":{"mine/original":{}}}}}`)
-	if err := a.Apply("model", "magpie/relay/m1"); err != nil {
-		t.Fatal(err)
-	}
-	before := read()
-	if err := a.Sync(); err != nil {
-		t.Fatal(err)
-	}
-	if !bytes.Equal(before, read()) {
-		t.Fatal("unchanged catalog rewrote the config")
-	}
-	if err := provider.Save(provider.Provider{ID: "relay", Name: "Relay", Key: "test-key", Chat: "http://127.0.0.1:1/v1", Models: []string{"m1", "new"}}); err != nil {
-		t.Fatal(err)
-	}
-	if err := a.Sync(); err != nil {
-		t.Fatal(err)
-	}
-	_, data, _ := openclawRead(a.Path)
-	if !gjson.GetBytes(data, "agents.defaults.models.magpie/relay/new").Exists() || gjson.GetBytes(data, `agents.defaults.models.magpie/relay/m2\.1`).Exists() {
-		t.Fatalf("stale menu: %s", read())
-	}
-	if err := edit.SetJSON(a.Path, edit.KV{Path: openclawProvider + ".baseUrl", Value: "http://127.0.0.1:9/v1"}); err != nil {
-		t.Fatal(err)
-	}
-	if d := a.Drift(); d == nil || d.Kind != "unwired" {
-		t.Fatalf("changed endpoint didn't report drift: %+v", d)
-	}
-	if err := a.Reapply(); err != nil {
-		t.Fatal(err)
-	}
-	if a.Drift() != nil {
-		t.Fatal("reapply didn't restore wiring")
-	}
-	if err := a.Disconnect(); err != nil {
-		t.Fatal(err)
-	}
-	if a.Field("model").Get() != "mine/original" {
-		t.Fatal("sync lost the original shorthand")
-	}
-}
-
-func TestOpenClawForeignProvider(t *testing.T) {
-	a, read := openclawHome(t, `{"models":{"providers":{"magpie":{"baseUrl":"https://mine.example/v1","apiKey":"own-key","models":[]}}}}`)
-	before := read()
-	if err := a.Sync(); err != nil || !bytes.Equal(before, read()) {
-		t.Fatalf("sync rewrote user's provider: %v", err)
-	}
-	if err := a.Field("model").Set("magpie/relay/m1"); err != nil {
-		t.Fatal(err)
-	}
-	if err := a.Field("model").Set("mine/picked"); err != nil {
-		t.Fatal(err)
-	}
-	if a.Field("model").Get() != "mine/picked" || !strings.Contains(string(read()), "own-key") {
-		t.Fatal("picking an own model didn't restore own provider")
-	}
-}
-
-func TestOpenClawJSON5AndUnsafeConfigs(t *testing.T) {
-	const original = `// my notes: keep port for the bot
-{
-  // primary model
-  agents: {defaults: {model: 'mine/original'}},
-  gateway: {port: 18789},
-}
-`
-	a, read := openclawHome(t, original)
-	if a.Field("model").Get() != "mine/original" {
-		t.Fatal("JSON5 was not read")
-	}
-	if _, err := os.Stat(a.Path + ".before-magpie"); !os.IsNotExist(err) {
-		t.Fatal("reading JSON5 rewrote or copied the file")
-	}
-	if err := a.Connect(); err != nil {
-		t.Fatal(err)
-	}
-	if !json.Valid(read()) || gjson.GetBytes(read(), "gateway.port").Type != gjson.Number || gjson.GetBytes(read(), "gateway.port").Int() != 18789 {
-		t.Fatal("JSON5 normalization changed a numeric setting")
-	}
-	connected := read()
-	if bytes.Contains(connected, []byte("my notes")) || bytes.Contains(connected, []byte("primary model")) ||
-		gjson.GetBytes(connected, "agents.defaults.model.primary").String() != "magpie/relay/m1" {
-		t.Fatalf("connected JSON5 was not normalized: %s", connected)
-	}
-	saved, err := os.ReadFile(a.Path + ".before-magpie")
-	if err != nil || string(saved) != original {
-		t.Fatalf("original JSON5 was not kept: %v\n%s", err, saved)
-	}
-	if err := a.Disconnect(); err != nil || a.Field("model").Get() != "mine/original" {
-		t.Fatalf("JSON5 restoration failed: %v", err)
-	}
-	if string(read()) != original {
-		t.Fatalf("disconnect changed JSON5:\n%s", read())
-	}
-	if _, err := os.Stat(a.Path + ".before-magpie"); !os.IsNotExist(err) {
-		t.Fatal("restored JSON5 kept its backup")
-	}
-	for _, config := range []string{`{"agents":`, `{"$include":"other.json"}`, `{"agents":{"$include":"agents.json"}}`, `{} trailing`} {
-		t.Run(config, func(t *testing.T) {
-			a, read := openclawHome(t, config)
-			if err := a.Field("model").Set("magpie/relay/m1"); err == nil {
-				t.Fatal("unsafe config was accepted")
-			}
-			if string(read()) != config {
-				t.Fatal("unsafe config was overwritten")
-			}
-		})
-	}
-}
-
-func TestOpenClawJSON5ReconnectAfterUserEdit(t *testing.T) {
-	const original = "// first connection\n{agents:{defaults:{model:'mine/original'}},gateway:{port:18789}}\n"
-	for _, port := range []string{"18790", "18789"} {
-		t.Run(port, func(t *testing.T) {
-			a, read := openclawHome(t, original)
-			if err := a.Connect(); err != nil {
-				t.Fatal(err)
-			}
-			changed := bytes.Replace(read(), []byte("18789"), []byte("18790"), 1)
-			if err := os.WriteFile(a.Path, changed, 0o600); err != nil {
-				t.Fatal(err)
-			}
-			if err := a.Disconnect(); err != nil {
-				t.Fatal(err)
-			}
-			if gjson.GetBytes(read(), "gateway.port").Int() != 18790 {
-				t.Fatal("disconnect lost the user's port edit")
-			}
-			if _, err := os.Stat(openclawOriginal(a.Path)); !os.IsNotExist(err) {
-				t.Error("disconnect kept an obsolete JSON5 backup")
-			}
-			// A fresh JSON5 may have different values, or the same values as the
-			// first backup but new comments. Both must survive the next cycle.
-			next := "// new notes for the second connection\n{agents:{defaults:{model:'mine/original'}},gateway:{port:" + port + "}}\n"
-			if err := os.WriteFile(a.Path, []byte(next), 0o600); err != nil {
-				t.Fatal(err)
-			}
-			if err := a.Connect(); err != nil {
-				t.Fatal(err)
-			}
-			if err := a.Disconnect(); err != nil {
-				t.Fatal(err)
-			}
-			if string(read()) != next {
-				t.Fatalf("reconnect lost the new JSON5 bytes:\n%s", read())
-			}
-			if _, err := os.Stat(openclawOriginal(a.Path)); !os.IsNotExist(err) {
-				t.Fatal("second disconnect kept its backup")
-			}
-		})
-	}
-}
-
-func TestOpenClawPathsAndReadOnly(t *testing.T) {
-	a, _ := openclawHome(t, "")
-	home := filepath.Dir(a.Dir)
-	other := t.TempDir()
-	t.Setenv("OPENCLAW_HOME", other)
-	if got := openclaw(home).Dir; got != filepath.Join(other, ".openclaw") {
-		t.Fatalf("OPENCLAW_HOME ignored: %s", got)
-	}
-	t.Setenv("OPENCLAW_STATE_DIR", filepath.Join(other, "state"))
-	if got := openclaw(home).Path; got != filepath.Join(other, "state", "openclaw.json") {
-		t.Fatalf("OPENCLAW_STATE_DIR ignored: %s", got)
-	}
-	t.Setenv("OPENCLAW_CONFIG_PATH", filepath.Join(other, "custom.json"))
-	a = openclaw(home)
-	if a.Path != filepath.Join(other, "custom.json") {
-		t.Fatal("OPENCLAW_CONFIG_PATH ignored")
-	}
-	for _, env := range []string{"OPENCLAW_CONFIG_READONLY", "OPENCLAW_NIX_MODE"} {
-		t.Run(env, func(t *testing.T) {
-			t.Setenv(env, "1")
-			if err := a.Field("model").Set("magpie/relay/m1"); err == nil {
-				t.Fatal("read-only config was written")
-			}
-			if _, err := os.Stat(a.Path); !os.IsNotExist(err) {
-				t.Fatal("read-only config was created")
-			}
-		})
-	}
-}
-
-func TestOpenClawTildePaths(t *testing.T) {
-	a, _ := openclawHome(t, "")
-	home := filepath.Dir(a.Dir)
-	for _, override := range []string{"", filepath.Join(home, "other")} {
-		t.Run("home="+override, func(t *testing.T) {
-			t.Setenv("OPENCLAW_HOME", override)
-			base := override
-			if base == "" {
-				base = home
-			}
-			t.Setenv("OPENCLAW_STATE_DIR", "~/state")
-			if got := openclaw(home); got.Dir != filepath.Join(base, "state") || got.Path != filepath.Join(base, "state", "openclaw.json") {
-				t.Fatalf("tilde state directory: %s, %s", got.Dir, got.Path)
-			}
-			t.Setenv("OPENCLAW_CONFIG_PATH", "~/custom.json")
-			if got := openclaw(home).Path; got != filepath.Join(base, "custom.json") {
-				t.Fatalf("tilde config path: %s", got)
-			}
-			t.Setenv("OPENCLAW_STATE_DIR", "~")
-			if got := openclaw(home).Dir; got != base {
-				t.Fatalf("bare tilde state directory: %s", got)
-			}
-		})
-	}
-	t.Setenv("OPENCLAW_HOME", "~/other")
-	if got := openclaw(home).Dir; got != filepath.Join(home, "other", ".openclaw") {
-		t.Fatalf("tilde home: %s", got)
-	}
-}
-
-// Sync's address filter runs inside WriteAtomic. The saved provider must
-// match those final bytes, so Disconnect can still restore the user's own.
-func TestOpenClawSyncKeepsProxy(t *testing.T) {
-	for _, proxy := range []string{corpProxy, localProxy} {
-		for _, original := range []string{"", `{"baseUrl":"https://mine.example/v1","apiKey":"own-key","models":[]}`} {
-			t.Run(proxy+original, func(t *testing.T) {
-				a, read := openclawHome(t, `{}`)
-				if original != "" {
-					if err := edit.SetJSON(a.Path, edit.KV{Path: openclawProvider, Value: json.RawMessage(original)}); err != nil {
-						t.Fatal(err)
-					}
-				}
-				if err := a.Connect(); err != nil {
-					t.Fatal(err)
-				}
-				if err := edit.SetJSON(a.Path, edit.KV{Path: openclawProvider + ".baseUrl", Value: proxy + "/v1"}); err != nil {
-					t.Fatal(err)
-				}
-				fakeMagpieAt(t, map[string]bool{proxy: true})
-				for range 2 {
-					if err := synced(a.Sync); err != nil {
-						t.Fatal(err)
-					}
-					cur := gjson.GetBytes(read(), openclawProvider)
-					if cur.Get("baseUrl").String() != proxy+"/v1" {
-						t.Fatalf("sync lost proxy: %s", cur.Raw)
-					}
-					rec, err := openclawSaved("openclaw.config:.openclaw/openclaw.json")
-					if err != nil {
-						t.Fatal(err)
-					}
-					if !sameJSON(cur.Raw, rec.Edits[openclawProvider].After) {
-						t.Error("saved provider differs from the provider written through the proxy")
-					}
-				}
-				if err := a.Disconnect(); err != nil {
-					t.Fatal(err)
-				}
-				if got := gjson.GetBytes(read(), openclawProvider); got.Exists() != (original != "") || original != "" && !sameJSON(got.Raw, json.RawMessage(original)) {
-					t.Fatalf("disconnect left %s, want original provider %s", got.Raw, original)
-				}
-			})
-		}
-	}
-}
-
-func TestOpenClawJSON5Numbers(t *testing.T) {
-	const original = `{gateway:{port:0x4965},agents:{defaults:{model:'mine/original',timeoutSeconds:+120,contextTokens:123456789012345}}}`
-	a, read := openclawHome(t, original)
-	if err := a.Connect(); err != nil {
-		t.Fatal(err)
-	}
-	connected := read()
-	for k, want := range map[string]int64{"gateway.port": 18789, "agents.defaults.timeoutSeconds": 120, "agents.defaults.contextTokens": 123456789012345} {
-		if v := gjson.GetBytes(connected, k); v.Type != gjson.Number || v.Int() != want {
-			t.Fatalf("%s changed type or precision while connected: %s", k, connected)
-		}
-	}
-	if err := a.Disconnect(); err != nil {
-		t.Fatal(err)
-	}
-	if string(read()) != original {
-		t.Fatalf("JSON5 number syntax was not restored:\n%s", read())
-	}
-}
-
-func TestOpenClawNativeAPIs(t *testing.T) {
-	a, _ := openclawHome(t, "")
-	for _, p := range []provider.Provider{
-		{ID: "responses-fixture", Name: "Responses", Responses: "https://example.com/v1", Key: "fake", Models: []string{"gpt"}},
-		{ID: "anthropic-fixture", Name: "Anthropic", Anthropic: "https://example.com", Key: "fake", Models: []string{"claude"}},
-	} {
-		if err := provider.Save(p); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if err := a.Connect(); err != nil {
-		t.Fatal(err)
-	}
-	_, data, _ := openclawRead(a.Path)
-	entries := map[string]gjson.Result{}
-	gjson.GetBytes(data, openclawProvider+".models").ForEach(func(_, m gjson.Result) bool {
-		entries[m.Get("id").String()] = m
-		return true
-	})
-	if entries["responses-fixture/gpt"].Get("api").String() != "openai-responses" ||
-		entries["anthropic-fixture/claude"].Get("api").String() != "anthropic-messages" ||
-		entries["anthropic-fixture/claude"].Get("baseUrl").String() != gateway.URL() {
-		t.Fatalf("native API adapters missing: %s", data)
-	}
-}
-
-func TestOpenClawModelMetadata(t *testing.T) {
-	m := catalog.Model{ID: "relay/reasoner", Name: "Reasoner", Context: 32768, Output: 65536, Images: true, Efforts: []string{"low", "high"}, Price: &catalog.Price{Input: 1, Output: 2}}
-	e := openclawModelJSON(m)
-	if e["contextWindow"] != 32768 || e["maxTokens"] != 32768 || e["reasoning"] != true || !slices.Contains(e["input"].([]string), "image") {
-		t.Fatalf("wrong model capabilities: %v", e)
-	}
-	if e["cost"].(map[string]any)["input"] != float64(1) {
-		t.Fatalf("missing model price: %v", e)
-	}
-}
-
-func TestOpenClawWSL(t *testing.T) {
-	a, _ := openclawHome(t, "")
-	home := filepath.Dir(a.Dir)
-	t.Setenv("OPENCLAW_CONFIG_PATH", filepath.Join(t.TempDir(), "windows.json"))
-	t.Setenv("OPENCLAW_STATE_DIR", filepath.Join(t.TempDir(), "windows-state"))
-	t.Setenv("OPENCLAW_HOME", t.TempDir())
-	t.Setenv("OPENCLAW_CONFIG_READONLY", "1")
-	t.Setenv("OPENCLAW_NIX_MODE", "1")
-	wsl := openclawIn(place{home: home, id: "openclaw@wsl:Ubuntu", spell: func(p string) string { return p }, base: func() string { return "http://172.22.0.1:20186" }})
-	if wsl.Path != a.Path {
-		t.Fatal("WSL read Windows' config variable")
-	}
-	if err := wsl.Field("model").Set("magpie/relay/m1"); err != nil {
-		t.Fatal(err)
-	}
-	_, data, _ := openclawRead(wsl.Path)
-	if gjson.GetBytes(data, openclawProvider+".baseUrl").String() != "http://172.22.0.1:20186/v1" || wsl.Check() != "" {
-		t.Fatalf("WSL gateway is wrong: %s", data)
-	}
-	if err := wsl.Field("model").Set(""); err != nil {
-		t.Fatal(err)
-	}
-}
-
-func TestOpenClawConcurrentSyncAndPick(t *testing.T) {
-	a, _ := openclawHome(t, `{"agents":{"defaults":{"model":"mine/original"}}}`)
-	if err := a.Connect(); err != nil {
-		t.Fatal(err)
-	}
-	var wg sync.WaitGroup
-	for i := range 10 {
-		wg.Go(func() {
-			if i%2 == 0 {
-				if err := a.Sync(); err != nil {
-					t.Error(err)
-				}
-			} else if err := a.Field("model").Set("magpie/relay/m2.1"); err != nil {
-				t.Error(err)
-			}
-		})
-	}
-	wg.Wait()
-	if err := a.Disconnect(); err != nil || a.Field("model").Get() != "mine/original" {
-		t.Fatalf("concurrent edits lost original model: %v, %q", err, a.Field("model").Get())
-	}
-}
-
-func TestOpenClawCorruptSavedConfig(t *testing.T) {
-	a, read := openclawHome(t, `{"agents":{"defaults":{"model":"mine/original"}}}`)
-	if err := a.Connect(); err != nil {
-		t.Fatal(err)
-	}
-	before := read()
-	values := stashLoad()
-	for k := range values {
-		if strings.HasPrefix(k, "openclaw.config:") {
-			values[k] = "broken"
-		}
-	}
-	stashPut(values)
-	if err := a.Disconnect(); err == nil || !bytes.Equal(before, read()) {
-		t.Fatal("unreadable saved config was treated as empty")
-	}
-}
-
-func TestOpenClawDisconnectPreview(t *testing.T) {
-	a, read := openclawHome(t, `{"agents":{"defaults":{"model":"mine/original"}}}`)
-	if err := a.Connect(); err != nil {
-		t.Fatal(err)
-	}
-	before := read()
-	exe, err := os.Executable()
-	if err != nil {
-		t.Fatal(err)
-	}
-	changes, err := DisconnectPreview(a, exe)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(changes) == 0 || !bytes.Equal(before, read()) {
-		t.Fatalf("preview changed files or showed no restore: %+v", changes)
-	}
-	found := false
-	for _, c := range changes {
-		for _, line := range c.Lines {
-			if strings.Contains(line.Text, "mine/original") {
-				found = true
-			}
-		}
-	}
-	if !found {
-		t.Fatalf("preview didn't restore original model: %+v", changes)
-	}
-}
-
 func TestOpenClawModelChain(t *testing.T) {
 	for _, original := range []string{`"mine/original"`, `{"primary":"mine/original","fallbacks":["mine/backup"],"other":true}`} {
 		t.Run(original, func(t *testing.T) {
@@ -657,7 +567,7 @@ func TestOpenClawModelChain(t *testing.T) {
 			if err := a.Disconnect(); err != nil {
 				t.Fatal(err)
 			}
-			if !sameJSON(gjson.GetBytes(read(), openclawModel).Raw, json.RawMessage(original)) {
+			if !sameJSON(gjson.GetBytes(read(), openClawModel).Raw, json.RawMessage(original)) {
 				t.Fatalf("restore: %s", read())
 			}
 			if gjson.GetBytes(read(), "other").Int() != 42 {
@@ -680,24 +590,6 @@ func TestOpenClawModelChainInvalid(t *testing.T) {
 	}
 }
 
-func TestOpenClawModelChainReconnect(t *testing.T) {
-	a, _ := openclawHome(t, `{"agents":{"defaults":{"model":"mine/original"}}}`)
-	want := ModelChain{Primary: "anthropic/claude-opus-5", Fallbacks: []string{"magpie/group/fast"}}
-	if err := a.ApplyModelChain(want); err != nil {
-		t.Fatal(err)
-	}
-	if err := a.Disconnect(); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := a.ConnectHow(); err != nil {
-		t.Fatal(err)
-	}
-	got, err := a.ReadModelChain()
-	if err != nil || got.Primary != want.Primary || !slices.Equal(got.Fallbacks, want.Fallbacks) {
-		t.Fatalf("reconnect %+v %v", got, err)
-	}
-}
-
 func TestOpenClawModelChainRestricted(t *testing.T) {
 	a, read := openclawHome(t, `{"agents":{"defaults":{"model":"mine/original","models":{"mine/original":{}},"modelPolicy":{"allow":["mine/*"]}}}}`)
 	want := ModelChain{Primary: "magpie/group/auto", Fallbacks: []string{"anthropic/claude-opus-5"}}
@@ -713,7 +605,7 @@ func TestOpenClawModelChainRestricted(t *testing.T) {
 	if !strings.Contains(gjson.GetBytes(read(), "agents.defaults.modelPolicy.allow").Raw, "anthropic/claude-opus-5") {
 		t.Fatal("fallback excluded by policy")
 	}
-	out, err := edit.PatchJSON(read(), []edit.KV{{Path: openclawModel + ".fallbacks", Value: []string{"mine/changed"}}}, nil)
+	out, err := edit.PatchJSON(read(), []edit.KV{{Path: openClawModel + ".fallbacks", Value: []string{"mine/changed"}}}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -723,7 +615,7 @@ func TestOpenClawModelChainRestricted(t *testing.T) {
 	if err := a.Disconnect(); err != nil {
 		t.Fatal(err)
 	}
-	if gjson.GetBytes(read(), openclawModel+".fallbacks.0").String() != "mine/changed" {
+	if gjson.GetBytes(read(), openClawModel+".fallbacks.0").String() != "mine/changed" {
 		t.Fatal("external edit lost")
 	}
 }
@@ -757,6 +649,63 @@ func TestOpenClawAgentModelOverride(t *testing.T) {
 			}
 			if !sameJSON(gjson.GetBytes(read(), tc.target).Raw, json.RawMessage(before)) {
 				t.Fatalf("restore override: %s", read())
+			}
+		})
+	}
+}
+
+func TestOpenClawWSL(t *testing.T) {
+	a, _ := openclawHome(t, "")
+	home := filepath.Dir(a.Dir)
+	t.Setenv("OPENCLAW_CONFIG_PATH", filepath.Join(t.TempDir(), "windows.json"))
+	t.Setenv("OPENCLAW_STATE_DIR", filepath.Join(t.TempDir(), "windows-state"))
+	t.Setenv("OPENCLAW_HOME", t.TempDir())
+	t.Setenv("OPENCLAW_CONFIG_READONLY", "1")
+	t.Setenv("OPENCLAW_NIX_MODE", "1")
+	wsl := openclawIn(place{home: home, id: "openclaw@wsl:Ubuntu", spell: func(p string) string { return p }, base: func() string { return "http://172.22.0.1:20186" }})
+	if wsl.Path != a.Path {
+		t.Fatal("WSL read Windows' config variable")
+	}
+	if err := wsl.Field("model").Set("magpie/relay/m1"); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(wsl.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gjson.GetBytes(data, openClawProvider+".baseUrl").String() != "http://172.22.0.1:20186/v1" || wsl.Check() != "" {
+		t.Fatalf("WSL gateway is wrong: %s", data)
+	}
+	if err := wsl.Field("model").Set(""); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestOpenClawPathsAndReadOnly(t *testing.T) {
+	a, _ := openclawHome(t, "")
+	home := filepath.Dir(a.Dir)
+	other := t.TempDir()
+	t.Setenv("OPENCLAW_HOME", other)
+	if got := openClaw(home).Dir; got != filepath.Join(other, ".openclaw") {
+		t.Fatalf("OPENCLAW_HOME ignored: %s", got)
+	}
+	t.Setenv("OPENCLAW_STATE_DIR", filepath.Join(other, "state"))
+	if got := openClaw(home).Path; got != filepath.Join(other, "state", "openclaw.json") {
+		t.Fatalf("OPENCLAW_STATE_DIR ignored: %s", got)
+	}
+	t.Setenv("OPENCLAW_CONFIG_PATH", filepath.Join(other, "custom.json"))
+	a = openClaw(home)
+	if a.Path != filepath.Join(other, "custom.json") {
+		t.Fatal("OPENCLAW_CONFIG_PATH ignored")
+	}
+	for _, env := range []string{"OPENCLAW_CONFIG_READONLY", "OPENCLAW_NIX_MODE"} {
+		t.Run(env, func(t *testing.T) {
+			t.Setenv(env, "1")
+			if err := a.Field("model").Set("magpie/relay/m1"); err == nil {
+				t.Fatal("read-only config was written")
+			}
+			if _, err := os.Stat(a.Path); !os.IsNotExist(err) {
+				t.Fatal("read-only config was created")
 			}
 		})
 	}

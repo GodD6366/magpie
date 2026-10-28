@@ -218,7 +218,9 @@ type providerJSON struct {
 	// first, the gateway still trying them in their order
 	KeepLoginAs string `json:"keepLoginAs,omitempty"`
 	// SwitchOnly: magpie only moves Codex's own sign-in between its
-	// accounts, never routing its requests for failover (#1907)
+	// accounts, never routing its requests for failover (#1907); on
+	// Claude's, the accounts are kept to Claude Code's own sign-in and
+	// serve no request through magpie (myduso on Discord)
 	SwitchOnly bool `json:"switchOnly,omitempty"`
 	// CapStop and CapCareful: how its accounts end at their caps
 	// (plugins#349), set on their own with capstop and capcareful
@@ -686,7 +688,7 @@ func providerInfoWith(p provider.Provider, agents []agentUse, desktop map[string
 		}
 		key := restKey(k)
 		if r, ok := keyRestOf(key); ok {
-			out.KeyList[i].Rest = &provider.KeyRest{Why: r.Why, Status: r.Status, Until: r.Until, Key: key}
+			out.KeyList[i].Rest = &provider.KeyRest{Why: r.Why, Status: r.Status, Until: r.Until, Key: key, Probed: r.Probed}
 		}
 	}
 	if !out.Key.Set && p.Ready() {

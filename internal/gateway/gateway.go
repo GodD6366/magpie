@@ -254,8 +254,12 @@ func namesInCatalog() map[string]bool {
 }
 
 // switchedOff says a request for model went nowhere because p, which
-// serves it, is switched off in magpie (provider.Provider.Off).
+// serves it, is switched off in magpie (provider.Provider.Off), or kept to
+// Claude Code's own sign-in (provider.Provider.KeptToAgent).
 func switchedOff(p provider.Provider, model string) string {
+	if p.KeptToAgent() {
+		return fmt.Sprintf("%s's accounts are kept to Claude Code's own sign-in in Magpie, so %q is not served; untick \"Only switch Claude Code's sign-in\" under its accounts in Magpie's Providers to use it", p.Name, model)
+	}
 	return fmt.Sprintf("%s is switched off in Magpie, so %q is not served; switch it on again in Magpie's Providers to use it", p.Name, model)
 }
 
@@ -2222,7 +2226,16 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 			scope += "|" + words
 		}
 	} else {
-		cands, pl = s.plan(p, model, from)
+		// a routing group among the fallbacks is routed as a request to it
+		// would be, its pause rules too (pausedOut's)
+		cands, pl = s.planPaused(p, model, from, func(fg provider.Group, fms []provider.Member) []provider.Member {
+			folder := ""
+			if provider.PausesByFolder(fg, fms) {
+				folder = factsOf(from, body).dir
+			}
+			kept, _ := provider.PausedOut(fg, fms, agent, folder, ruleClock())
+			return kept
+		})
 		if handedOnOf(r) != nil {
 			// Codex's own sign-in, asked as often as it is asked: only
 			// the fallbacks are left (codexFallBack)

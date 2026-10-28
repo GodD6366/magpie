@@ -1,730 +1,765 @@
 package agent
 
+// OpenClaw (openclaw/openclaw, a personal assistant that answers on
+// WhatsApp, Telegram, Discord and the rest) keeps its settings in one file,
+// openclaw.json. Where it is follows OpenClaw's own resolveConfigPath
+// (src/config/paths.ts) and resolveStateDir (src/config/state-dir.ts):
+// $OPENCLAW_CONFIG_PATH, else openclaw.json in $OPENCLAW_STATE_DIR, else in
+// ~/.openclaw-<profile> for a named $OPENCLAW_PROFILE, else in ~/.openclaw,
+// where ~ is $OPENCLAW_HOME when it is set.
+//
+// A provider of the user's own is an entry of models.providers
+// (src/config/zod-schema.core.ts, ModelProviderSchema): a baseUrl, an
+// apiKey, an api (openai-completions is OpenAI's chat completions) and its
+// models, each an id and a name, with input, reasoning and contextWindow
+// (ModelDefinitionSchema). The schema is strict: a key OpenClaw doesn't
+// know makes the file invalid, so magpie writes only those. A model is
+// named provider/model, split at the first slash
+// (src/agents/model-selection-normalize.ts), so magpie's
+// magpie/<provider>/<model> is OpenClaw's ref as it is. The model OpenClaw
+// runs on is agents.defaults.model, a ref or {primary, fallbacks}
+// (docs/concepts/models.md); `openclaw models set` sets primary and keeps
+// the fallbacks, and adds the ref to agents.defaults.models
+// (src/commands/models/shared.ts), which a config from before 2026.8.1
+// still reads as the models allowed. A non-empty
+// agents.defaults.modelPolicy.allow is the models allowed: magpie adds
+// "magpie/*" to it when nothing of magpie's is in it.
+//
+// magpie adds itself as the provider "magpie", the gateway's /v1 with a key
+// naming OpenClaw and one model entry per catalog model, and makes the model
+// picked the primary. What was the primary is stashed and put back on
+// Disconnect, while magpie's is still the primary. The user's own keys stay
+// as written, in magpie's provider and its model entries too (headers,
+// timeoutSeconds, a model's maxTokens). OpenClaw writes the file as JSON
+// (src/config/io.write.ts) but reads JSON5; a file that isn't JSON magpie
+// can read is left alone. OpenClaw's gateway takes a change to models and
+// the default model without a restart (docs/gateway/configuration/
+// hot-reload.md), but a chat already pinned to a model keeps it until
+// /model default.
+//
+// The GUI also edits the whole sequence: ReadModelChain and SetModelChain
+// read and write agents.defaults.model's primary and fallbacks together,
+// with the agent's own model override (agents.entries.*.model or
+// agents.list[].model) kept in step, as OpenClaw resolves that first. A
+// chain may start on a model of OpenClaw's own and reach magpie only on
+// fallback, which keeps magpie's provider in the file. The values written
+// are OpenClaw's refs as they are (magpie/<provider>/<model> is magpie's).
+//
+// Not wired: a config split with $include.
+
 import (
-	"bytes"
 	"encoding/json"
-	"errors"
 	"fmt"
-	"io"
-	"io/fs"
 	"os"
 	"path/filepath"
+	"regexp"
 	"slices"
-	"sort"
-	"strconv"
 	"strings"
-	"sync"
 
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/jsonc"
-	"github.com/titanous/json5"
-	"github.com/yetone/magpie/internal/catalog"
+
 	"github.com/yetone/magpie/internal/edit"
-	"github.com/yetone/magpie/internal/provider"
 )
 
-const openclawModel = "agents.defaults.model"
-const openclawProvider = "models.providers.magpie"
+// what OpenClaw says after a change (notice.go)
+var noticeOpenClaw = newNotice("OpenClaw takes this up without a restart. A chat that already has a model keeps it: send /model default in that chat to move it onto this one.")
 
-var openclawMu sync.Mutex
+// openClawContext is what OpenClaw is told of a model whose context magpie
+// doesn't know.
+const openClawContext = 128000
 
-// openclawEdit remembers individual values, not the whole config: disconnect
-// restores only values that still say what magpie wrote.
-type openclawEdit struct {
-	Before json.RawMessage `json:"before,omitempty"`
-	After  json.RawMessage `json:"after"`
+// the key paths magpie writes in openclaw.json
+const (
+	openClawProvider = "models.providers." + magpieID
+	openClawModel    = "agents.defaults.model"
+	openClawModels   = "agents.defaults.models"
+	openClawAllow    = "agents.defaults.modelPolicy.allow"
+	openClawAll      = magpieID + "/*"
+)
+
+// openClawProfile is a profile name OpenClaw takes (profile-utils.ts).
+var openClawProfile = regexp.MustCompile(`(?i)^[a-z0-9][a-z0-9_-]{0,63}$`)
+
+// openClawHome is OpenClaw's ~: $OPENCLAW_HOME, a leading ~ in it the
+// system's home (resolveEffectiveHomeDir).
+func openClawHome(at place) string {
+	h := strings.TrimSpace(at.getenv("OPENCLAW_HOME"))
+	if h == "" || h == "undefined" || h == "null" {
+		return at.home
+	}
+	return openClawTilde(h, at.home)
 }
 
-type openclawRecord struct {
-	Edits map[string]openclawEdit `json:"edits"`
-	Model json.RawMessage         `json:"model,omitempty"`
+// openClawTilde is p with a leading ~ as home.
+func openClawTilde(p, home string) string {
+	if p == "~" {
+		return home
+	}
+	if rest, ok := strings.CutPrefix(p, "~/"); ok {
+		return filepath.Join(home, rest)
+	}
+	if rest, ok := strings.CutPrefix(p, `~\`); ok {
+		return filepath.Join(home, rest)
+	}
+	return p
 }
 
-func openclaw(home string) *Agent { return openclawIn(here(home)) }
+// openClawPaths are OpenClaw's state folder and its openclaw.json.
+func openClawPaths(at place) (dir, path string) {
+	home := openClawHome(at)
+	dir = filepath.Join(home, ".openclaw")
+	if p := strings.TrimSpace(at.getenv("OPENCLAW_PROFILE")); p != "" && !strings.EqualFold(p, "default") && openClawProfile.MatchString(p) {
+		dir = filepath.Join(home, ".openclaw-"+p)
+	}
+	if d := strings.TrimSpace(at.getenv("OPENCLAW_STATE_DIR")); d != "" {
+		dir = openClawTilde(d, home)
+	}
+	path = filepath.Join(dir, "openclaw.json")
+	if p := strings.TrimSpace(at.getenv("OPENCLAW_CONFIG_PATH")); p != "" {
+		path = openClawTilde(p, home)
+	}
+	return dir, path
+}
 
-func openclawIn(at place) *Agent {
-	home := openclawPath(at.home, at.getenv("OPENCLAW_HOME"))
-	if home == "" {
-		home = at.home
+// openClawRead is openclaw.json as JSON with its comments blanked out, nil
+// for a missing file; one that isn't JSON (JSON5's bare keys) is an error,
+// never taken as empty.
+func openClawRead(path string) ([]byte, error) {
+	b, err := edit.Read(path)
+	if err != nil {
+		return nil, err
 	}
-	dir := openclawPath(home, at.getenv("OPENCLAW_STATE_DIR"))
-	if dir == "" {
-		dir = filepath.Join(home, ".openclaw")
+	if len(strings.TrimSpace(string(b))) == 0 {
+		return nil, nil
 	}
-	path := openclawPath(home, at.getenv("OPENCLAW_CONFIG_PATH"))
-	if path == "" {
-		path = filepath.Join(dir, "openclaw.json")
+	s := jsonc.ToJSONInPlace(append([]byte(nil), b...))
+	if !json.Valid(s) || !gjson.ParseBytes(s).IsObject() {
+		return nil, fmt.Errorf("OpenClaw's %s isn't JSON magpie can read (JSON5?); it was left as it is", path)
 	}
-	// A relative key also works on the copied HOME used by disconnect preview.
+	return s, nil
+}
+
+// openClawKey is a key as one part of a key path.
+func openClawKey(k string) string { return strings.ReplaceAll(k, ".", `\.`) }
+
+// openClawEntry is one of magpie's models as OpenClaw is told it.
+type openClawEntry struct {
+	ID            string   `json:"id"`
+	Name          string   `json:"name"`
+	Reasoning     bool     `json:"reasoning"`
+	Input         []string `json:"input"`
+	ContextWindow int      `json:"contextWindow"`
+}
+
+// openClawWant is magpie's models as OpenClaw is told them, each laid over
+// the entry of the same id there was (raw), so the user's own keys in it
+// stay.
+func openClawWant(raw gjson.Result) []any {
+	was := map[string]map[string]any{}
+	for _, m := range raw.Array() {
+		var e map[string]any
+		if json.Unmarshal([]byte(m.Raw), &e) == nil {
+			if id, _ := e["id"].(string); id != "" {
+				was[id] = e
+			}
+		}
+	}
+	out := []any{}
+	for _, m := range magpieModels("openclaw") {
+		ctx := m.Context
+		if ctx <= 0 {
+			ctx = openClawContext
+		}
+		e := openClawEntry{ID: m.ID, Name: m.ID, Input: []string{"text"}, ContextWindow: ctx}
+		if m.Images {
+			e.Input = append(e.Input, "image")
+		}
+		e.Reasoning = slices.ContainsFunc(m.Efforts, func(l string) bool { return l != "none" })
+		var mine map[string]any
+		b, _ := json.Marshal(e)
+		json.Unmarshal(b, &mine)
+		kept := was[m.ID]
+		if kept == nil {
+			out = append(out, mine)
+			continue
+		}
+		for k, v := range mine {
+			kept[k] = v
+		}
+		out = append(out, kept)
+	}
+	return out
+}
+
+// openClawPrimary is the model a value of agents.defaults.model names: the
+// string, or an object's primary.
+func openClawPrimary(r gjson.Result) string {
+	if r.IsObject() {
+		return r.Get("primary").String()
+	}
+	if r.Type == gjson.String {
+		return r.String()
+	}
+	return ""
+}
+
+// openClawWas is what agents.defaults.model was before magpie, as written,
+// which of the objects holding magpie's keys magpie made, and the sequences
+// magpie wrote there (model, model menu entries, allow entries).
+type openClawWas struct {
+	Had   bool            `json:"had,omitempty"`
+	Model json.RawMessage `json:"model,omitempty"`
+	// Wrote is agents.defaults.model as magpie last left it
+	Wrote json.RawMessage `json:"wrote,omitempty"`
+	// Made are the key paths of objects that weren't there before magpie
+	Made []string `json:"made,omitempty"`
+	// Menu and Allow are the entries magpie added to agents.defaults.models
+	// and agents.defaults.modelPolicy.allow, as full key paths and values
+	Menu  []string `json:"menu,omitempty"`
+	Allow []string `json:"allow,omitempty"`
+	// OverrideKey, Override and WroteOverride: the selected agent's own model
+	// (agents.entries.*.model or agents.list[].model) as it was, and as
+	// magpie left it
+	OverrideKey   string          `json:"overrideKey,omitempty"`
+	Override      json.RawMessage `json:"override,omitempty"`
+	WroteOverride json.RawMessage `json:"wroteOverride,omitempty"`
+	// File: the file wasn't there before magpie
+	File bool `json:"file,omitempty"`
+}
+
+// openClawProviderAt is magpie's provider entry for a gateway at gw, as
+// it is written (models aside).
+func openClawProviderAt(gw string) map[string]string {
+	return map[string]string{"baseUrl": gw + "/v1", "apiKey": agentKeyAt("openclaw", gw), "api": "openai-completions"}
+}
+
+func openClaw(home string) *Agent { return openClawAt(here(home)) }
+
+// openclawIn is the agent at a place (wslKind.in).
+func openclawIn(at place) *Agent { return openClawAt(at) }
+
+func openClawAt(at place) *Agent {
+	dir, path := openClawPaths(at)
+	// A relative key also works on the copied HOME used by disconnect
+	// preview (preview.go).
 	rel, err := filepath.Rel(at.home, path)
 	if err != nil {
 		rel = path // another volume on Windows
 	}
-	key := at.key("openclaw.config:") + filepath.ToSlash(rel)
-	get := func(k string) string {
-		_, data, err := openclawRead(path)
-		if err != nil {
-			return ""
-		}
-		return gjson.GetBytes(data, k).String()
+	keyWas := at.key("openclaw.config:") + filepath.ToSlash(rel) + ":model"
+	read := func() gjson.Result {
+		s, _ := openClawRead(path)
+		return gjson.ParseBytes(s)
 	}
-	model := func() string {
-		c, _ := openclawChain(path)
-		return c.Primary
-	}
+	ours := func(c gjson.Result) bool { return prefixed(openClawPrimary(c.Get(openClawModel))) }
 	writable := func() error {
 		if at.getenv("OPENCLAW_CONFIG_READONLY") == "1" || at.getenv("OPENCLAW_NIX_MODE") == "1" {
 			return fmt.Errorf("OpenClaw config is read-only")
 		}
 		return nil
 	}
-	unwire := func() error {
+	// patch applies sets and deletes to the file as it is, in one write
+	patch := func(set []edit.KV, del []string) error {
 		if err := writable(); err != nil {
 			return err
 		}
-		return openclawRestore(path, key, "")
+		raw, err := edit.Read(path)
+		if err != nil {
+			return err
+		}
+		out, err := edit.PatchJSON(raw, set, del)
+		if err != nil {
+			return fmt.Errorf("%s: %w", path, err)
+		}
+		if raw == nil {
+			// OpenClaw keeps its folder to its user (io.write.ts), and the
+			// file holds keys
+			if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+				return err
+			}
+			if err := os.WriteFile(path, nil, 0o600); err != nil {
+				return err
+			}
+		}
+		return edit.WriteAtomic(path, out)
 	}
-	readChain := func() (ModelChain, error) { return openclawChain(path) }
-	return &Agent{
-		ID: "openclaw", Name: "OpenClaw", Icon: "openclaw-color", Bin: "openclaw", Dir: dir, Path: path,
-		Spelled: prefixed, UA: []string{"openclaw"}, Unwire: unwire,
-		ReadModelChain: readChain,
-		SetModelChain: func(c ModelChain) error {
-			if err := writable(); err != nil {
-				return err
+	// wire writes magpie's provider and its models, the user's own keys in
+	// it left as they are; with chain, also the default model's primary and
+	// (a non-nil Fallbacks) its fallbacks, the model menu and the allow
+	// list. was, if given, records what magpie added there.
+	wire := func(c gjson.Result, chain *ModelChain, was *openClawWas) ([]edit.KV, []string) {
+		var set []edit.KV
+		var del []string
+		p := c.Get(openClawProvider)
+		for k, v := range openClawProviderAt(at.gw()) {
+			if p.Get(k).String() != v || p.Get(k).Type != gjson.String {
+				set = append(set, edit.KV{Path: openClawProvider + "." + k, Value: v})
 			}
-			if err := validateOpenClawChain(c); err != nil {
-				return err
+		}
+		want := openClawWant(p.Get("models"))
+		if !sameJSON(p.Get("models").Raw, want) {
+			set = append(set, edit.KV{Path: openClawProvider + ".models", Value: want})
+		}
+		if chain == nil {
+			return set, del
+		}
+		ref := chain.Primary
+		refs := append([]string{ref}, chain.Fallbacks...)
+		m := c.Get(openClawModel)
+		if m.IsObject() {
+			if openClawPrimary(m) != ref {
+				set = append(set, edit.KV{Path: openClawModel + ".primary", Value: ref})
 			}
-			if c.Fallbacks == nil {
-				c.Fallbacks = []string{}
+			if chain.Fallbacks != nil && !sameJSON(m.Get("fallbacks").Raw, chain.Fallbacks) {
+				set = append(set, edit.KV{Path: openClawModel + ".fallbacks", Value: chain.Fallbacks})
 			}
-			return openclawWriteChain(path, key, at, c.Primary, &c)
-		},
-		// A chain can start on an own model and reach magpie only on fallback.
-		Joined: func() bool { return ourKey(get(openclawProvider + ".apiKey")) },
-		Check: func() string {
-			if !prefixed(model()) && !ourKey(get(openclawProvider+".apiKey")) {
-				return ""
-			}
-			return wiringOff("OpenClaw", path, func(k string) (string, bool) {
-				v := get(openclawProvider + "." + k)
-				return v, v != ""
-			}, "baseUrl", at.v1(), "apiKey", at.gwKey())
-		},
-		Sync: func() error {
-			if err := writable(); err != nil {
-				return err
-			}
-			// A provider the user changed to their own key is no longer ours.
-			if !ourKey(get(openclawProvider + ".apiKey")) {
-				return nil
-			}
-			return openclawWrite(path, key, at, "")
-		},
-		Fields: []Field{{
-			Key: "model", Label: "model", Get: model,
-			Set: func(v string) error {
-				if err := writable(); err != nil {
-					return err
+		} else if len(chain.Fallbacks) > 0 {
+			set = append(set, edit.KV{Path: openClawModel, Value: map[string]any{
+				"primary": ref, "fallbacks": chain.Fallbacks,
+			}})
+		} else if m.String() != ref || m.Type != gjson.String {
+			set = append(set, edit.KV{Path: openClawModel, Value: ref})
+		}
+		// as `openclaw models set` does; the refs of models magpie put there
+		// before go, as they had nothing of the user's in them
+		if ms := c.Get(openClawModels); ms.IsObject() {
+			ms.ForEach(func(k, v gjson.Result) bool {
+				if prefixed(k.String()) && !slices.Contains(refs, k.String()) && v.IsObject() && len(v.Map()) == 0 {
+					del = append(del, openClawModels+"."+openClawKey(k.String()))
 				}
-				if ref, ok := strings.CutPrefix(v, magpieID+"/"); ok && isMagpie(ref) {
-					return openclawWrite(path, key, at, v)
-				}
-				if v != "" {
-					c, err := readChain()
-					if err != nil {
-						return err
-					}
-					if len(c.Fallbacks) > 0 {
-						return openclawWrite(path, key, at, v)
-					}
-				}
-				return openclawRestore(path, key, v)
-			},
-			Options: func(cur map[string]string) []Option {
-				return append(openclawOwn(path, cur["model"]), viaMagpie("openclaw", magpieID+"/")...)
-			},
-		}},
-	}
-}
-
-// OpenClaw expands path overrides against OPENCLAW_HOME, whose own tilde
-// is relative to the OS home (src/infra/home-dir.ts).
-func openclawPath(home, path string) string {
-	if rest, ok := strings.CutPrefix(path, "~"); ok && (rest == "" || rest[0] == '/' || rest[0] == filepath.Separator) {
-		return filepath.Clean(home + rest)
-	}
-	return path
-}
-
-// openclawRead validates before editing. JSONC keeps its layout. Other JSON5
-// syntax (bare keys, single quotes) is parsed here but left on disk: the first
-// edit that needs strict JSON copies the original aside and writes JSON, and
-// Disconnect puts that copy back when nothing else has changed. Includes are
-// not flattened: their source files belong to the user.
-func openclawRead(path string) (raw, data []byte, err error) {
-	raw, err = edit.Read(path)
-	if err != nil {
-		return nil, nil, err
-	}
-	if len(bytes.TrimSpace(raw)) == 0 {
-		raw = []byte("{}\n")
-	}
-	doc, err := openclawDoc(path, raw)
-	if err != nil {
-		return nil, nil, err
-	}
-	data, err = json.Marshal(doc)
-	return raw, data, err
-}
-
-func openclawDoc(path string, raw []byte) (map[string]any, error) {
-	dec := json5.NewDecoder(bytes.NewReader(raw))
-	dec.UseNumber()
-	var doc map[string]any
-	if err := dec.Decode(&doc); err != nil || doc == nil {
-		return nil, fmt.Errorf("OpenClaw: cannot parse %s: %v", path, err)
-	}
-	var extra any
-	if err := dec.Decode(&extra); err != io.EOF {
-		return nil, fmt.Errorf("OpenClaw: invalid trailing data in %s", path)
-	}
-	if openclawIncludes(doc) {
-		return nil, fmt.Errorf("OpenClaw uses $include; configure its models in OpenClaw instead")
-	}
-	if err := openclawNumbers(doc); err != nil {
-		return nil, err
-	}
-	return doc, nil
-}
-
-// openclawJSONC reports whether raw is JSON or JSONC, whose comments and
-// layout PatchJSON can keep. Other JSON5 is edited as normalized JSON.
-func openclawJSONC(raw []byte) bool {
-	return json.Valid(jsonc.ToJSON(append([]byte(nil), raw...)))
-}
-
-func openclawOriginal(path string) string { return path + ".before-magpie" }
-
-// openclawNormalize copies a non-JSONC file aside once, then returns the JSON
-// the editor can patch. A later disconnect restores that copy only when the
-// JSON still says what magpie left.
-func openclawNormalize(path string, raw []byte) ([]byte, error) {
-	if openclawJSONC(raw) {
-		return raw, nil
-	}
-	doc, err := openclawDoc(path, raw)
-	if err != nil {
-		return nil, err
-	}
-	backup := openclawOriginal(path)
-	if _, err := os.Stat(backup); errors.Is(err, fs.ErrNotExist) {
-		if err := edit.WriteAtomic(backup, raw); err != nil {
-			return nil, err
-		}
-	} else if err != nil {
-		return nil, err
-	}
-	out, err := json.MarshalIndent(doc, "", "  ")
-	if err != nil {
-		return nil, err
-	}
-	return append(out, '\n'), nil
-}
-
-// openclawRestoreOriginal puts a normalized JSON5 file back when disconnect
-// left the same values. Otherwise it keeps the user's changes and discards
-// the old copy, so the next connection backs up the current JSON5.
-func openclawRestoreOriginal(path string, left []byte) error {
-	backup := openclawOriginal(path)
-	was, err := os.ReadFile(backup)
-	if err != nil {
-		if errors.Is(err, fs.ErrNotExist) {
-			return nil
-		}
-		return err
-	}
-	cur, err := os.ReadFile(path)
-	if err != nil {
-		return err
-	}
-	if !bytes.Equal(cur, left) {
-		return os.Remove(backup)
-	}
-	then, err := openclawDoc(path, was)
-	if err != nil {
-		return os.Remove(backup)
-	}
-	now, err := openclawDoc(path, cur)
-	if err != nil {
-		return err
-	}
-	x, err1 := json.Marshal(now)
-	y, err2 := json.Marshal(then)
-	if err1 != nil {
-		return err1
-	}
-	if err2 != nil {
-		return err2
-	}
-	if !bytes.Equal(x, y) {
-		return os.Remove(backup)
-	}
-	if err := edit.WriteAtomic(path, was); err != nil {
-		return err
-	}
-	return os.Remove(backup)
-}
-
-// json5.Number is a string type, unlike json.Number: convert it before
-// marshaling or numeric settings such as gateway.port would become strings.
-func openclawNumbers(v any) error {
-	convert := func(v any) (any, error) {
-		if n, ok := v.(json5.Number); ok {
-			if json.Valid([]byte(n)) {
-				return json.Number(n), nil
-			}
-			f, err := n.Float64()
-			if err != nil {
-				return nil, err
-			}
-			s := strconv.FormatFloat(f, 'g', -1, 64)
-			if !json.Valid([]byte(s)) {
-				return nil, fmt.Errorf("OpenClaw: non-finite config number %s", n)
-			}
-			return json.Number(s), nil
-		}
-		return v, openclawNumbers(v)
-	}
-	switch x := v.(type) {
-	case map[string]any:
-		for k, child := range x {
-			n, err := convert(child)
-			if err != nil {
-				return err
-			}
-			x[k] = n
-		}
-	case []any:
-		for i, child := range x {
-			n, err := convert(child)
-			if err != nil {
-				return err
-			}
-			x[i] = n
-		}
-	}
-	return nil
-}
-
-func openclawIncludes(v any) bool {
-	switch x := v.(type) {
-	case map[string]any:
-		if _, ok := x["$include"]; ok {
-			return true
-		}
-		for _, child := range x {
-			if openclawIncludes(child) {
 				return true
-			}
-		}
-	case []any:
-		for _, child := range x {
-			if openclawIncludes(child) {
-				return true
-			}
-		}
-	}
-	return false
-}
-
-func openclawSaved(key string) (openclawRecord, error) {
-	var rec openclawRecord
-	if raw := stashLoad()[key]; raw != "" {
-		if err := json.Unmarshal([]byte(raw), &rec); err != nil {
-			return rec, fmt.Errorf("OpenClaw: cannot read saved configuration: %w", err)
-		}
-	}
-	if rec.Edits == nil {
-		rec.Edits = map[string]openclawEdit{}
-	}
-	return rec, nil
-}
-
-// openclawWrite changes the provider, model and model menu together in one
-// atomic write. A restricted model menu gets magpie's models beside its own.
-func openclawWrite(path, key string, at place, model string) error {
-	return openclawWriteChain(path, key, at, model, nil)
-}
-
-func openclawWriteChain(path, key string, at place, model string, chain *ModelChain) error {
-	openclawMu.Lock()
-	defer openclawMu.Unlock()
-	raw, data, err := openclawRead(path)
-	if err != nil {
-		return err
-	}
-	rec, err := openclawSaved(key)
-	if err != nil {
-		return err
-	}
-	var set []edit.KV
-	var del []string
-	remember := func(k string, value any) {
-		b, _ := json.Marshal(value)
-		e, ok := rec.Edits[k]
-		if !ok {
-			e.Before = json.RawMessage(gjson.GetBytes(data, k).Raw)
-		}
-		e.After = b
-		rec.Edits[k] = e
-		set = append(set, edit.KV{Path: k, Value: value})
-	}
-	if model != "" {
-		if _, ok := rec.Edits[openclawModel+".primary"]; !ok {
-			rec.Model = json.RawMessage(gjson.GetBytes(data, openclawModel).Raw)
-		}
-		before := gjson.GetBytes(data, openclawModel)
-		remember(openclawModel+".primary", model)
-		if before.Type == gjson.String && len(rec.Edits[openclawModel+".primary"].Before) == 0 {
-			e := rec.Edits[openclawModel+".primary"]
-			e.Before = json.RawMessage(before.Raw)
-			rec.Edits[openclawModel+".primary"] = e
-		}
-	}
-	if chain != nil {
-		remember(openclawModel+".fallbacks", chain.Fallbacks)
-	}
-	// The selected agent's model overrides defaults. Keep that override in sync
-	// without changing models belonging to other agents.
-	if target := openclawAgentModel(data); target != "" && (model != "" || chain != nil) {
-		v := gjson.GetBytes(data, target)
-		if v.Exists() {
-			value := map[string]any{}
-			if v.IsObject() {
-				if err := json.Unmarshal([]byte(v.Raw), &value); err != nil {
-					return err
+			})
+			for _, r := range refs {
+				if r == "" {
+					continue
 				}
-			} else if v.Type == gjson.String {
-				value["primary"] = v.String()
+				k := openClawModels + "." + openClawKey(r)
+				if !c.Get(k).Exists() {
+					set = append(set, edit.KV{Path: k, Value: map[string]any{}})
+					if was != nil {
+						was.Menu = append(was.Menu, k)
+					}
+				}
 			}
-			if model != "" {
-				value["primary"] = model
-			}
-			if chain != nil {
-				value["fallbacks"] = chain.Fallbacks
-			}
-			remember(target, value)
 		}
+		// a restricted list must admit every ref magpie puts there as well
+		if allow := c.Get(openClawAllow); allow.IsArray() && len(allow.Array()) > 0 {
+			covers := func(r string) bool {
+				return slices.ContainsFunc(allow.Array(), func(a gjson.Result) bool {
+					s := a.String()
+					if s == "*" || s == r || s == openClawAll {
+						return true
+					}
+					if prefixed(r) {
+						return s == magpieID+"/"+strings.SplitN(strings.TrimPrefix(r, magpieID+"/"), "/", 2)[0]+"/*"
+					}
+					return s == strings.SplitN(r, "/", 2)[0]+"/*"
+				})
+			}
+			var add []any
+			magpie := false
+			for _, r := range refs {
+				if r == "" || covers(r) || slices.ContainsFunc(add, func(v any) bool { return v == r }) {
+					continue
+				}
+				if prefixed(r) {
+					magpie = true
+					continue
+				}
+				add = append(add, r)
+			}
+			if magpie && !covers(openClawAll) {
+				add = append(add, openClawAll)
+			}
+			if len(add) > 0 {
+				var list []any
+				json.Unmarshal([]byte(allow.Raw), &list)
+				set = append(set, edit.KV{Path: openClawAllow, Value: append(list, add...)})
+				if was != nil {
+					for _, v := range add {
+						was.Allow = append(was.Allow, v.(string))
+					}
+				}
+			}
+		}
+		return set, del
 	}
-	// A restricted menu must admit the sequence the user selected as well.
-	selected := []string{model}
-	if chain != nil {
-		selected = append([]string{chain.Primary}, chain.Fallbacks...)
-	} else {
-		if c, err := openclawChain(path); err == nil {
-			selected = append([]string{c.Primary}, c.Fallbacks...)
+	// unwire takes magpie's provider out, and OpenClaw back to the model it
+	// ran on before — when it still runs on magpie's: a pick the user made
+	// since is theirs and stands. own, if given, is the model to run on.
+	unwire := func(own string) error {
+		s, err := openClawRead(path)
+		if err != nil {
+			return err
 		}
-		if model != "" {
-			selected[0] = model
-		}
-	}
-	remember(openclawProvider, openclawProviderAt(at.gw()))
-	if menu := gjson.GetBytes(data, "agents.defaults.models"); menu.IsObject() && len(menu.Map()) > 0 {
-		listed := map[string]bool{}
-		for _, m := range magpieModels("openclaw") {
-			k := "agents.defaults.models." + strings.ReplaceAll(magpieID+"/"+m.ID, ".", `\.`)
-			listed[k] = true
-			if !gjson.GetBytes(data, k).Exists() {
-				remember(k, map[string]any{})
+		c := gjson.ParseBytes(s)
+		var was openClawWas
+		json.Unmarshal([]byte(stashLoad()[keyWas]), &was)
+		var set []edit.KV
+		del := []string{openClawProvider}
+		m := c.Get(openClawModel)
+		orig := gjson.ParseBytes(was.Model)
+		switch {
+		case own != "":
+			if m.IsObject() {
+				set = append(set, edit.KV{Path: openClawModel + ".primary", Value: own})
+			} else {
+				set = append(set, edit.KV{Path: openClawModel, Value: own})
+			}
+		case len(was.Wrote) > 0 && sameJSON(m.Raw, json.RawMessage(was.Wrote)):
+			// magpie's sequence as it left it: the value goes back
+			if !was.Had {
+				del = append(del, openClawModel)
+			} else if orig.IsObject() && m.IsObject() {
+				// only what magpie changed, so the rest keeps its layout
+				if !sameOpenClawValue(m.Get("primary"), orig.Get("primary")) {
+					if p := orig.Get("primary"); p.Exists() {
+						set = append(set, edit.KV{Path: openClawModel + ".primary", Value: p.Value()})
+					} else {
+						del = append(del, openClawModel+".primary")
+					}
+				}
+				if !sameOpenClawValue(m.Get("fallbacks"), orig.Get("fallbacks")) {
+					if f := orig.Get("fallbacks"); f.Exists() {
+						set = append(set, edit.KV{Path: openClawModel + ".fallbacks", Value: f.Value()})
+					} else {
+						del = append(del, openClawModel+".fallbacks")
+					}
+				}
+			} else {
+				set = append(set, edit.KV{Path: openClawModel, Value: was.Model})
+			}
+		case !ours(c) && !openClawChainMine(c):
+			// the user's own pick stands
+		default:
+			// the user changed part of it: magpie's own values go back
+			if ours(c) {
+				if p := openClawPrimary(orig); p != "" {
+					if m.IsObject() {
+						set = append(set, edit.KV{Path: openClawModel + ".primary", Value: p})
+					} else {
+						set = append(set, edit.KV{Path: openClawModel, Value: p})
+					}
+				} else if m.IsObject() && len(m.Map()) > 1 {
+					del = append(del, openClawModel+".primary")
+				} else {
+					del = append(del, openClawModel)
+				}
+			}
+			if m.IsObject() && openClawFallbacksMine(m) {
+				if f := orig.Get("fallbacks"); f.Exists() {
+					set = append(set, edit.KV{Path: openClawModel + ".fallbacks", Value: f.Value()})
+				} else {
+					del = append(del, openClawModel+".fallbacks")
+				}
+			}
+			// A string original stays a string where only magpie's keys are
+			// left in the object magpie made of it.
+			if orig.Type == gjson.String && m.IsObject() && !slices.ContainsFunc(set, func(kv edit.KV) bool {
+				return strings.HasPrefix(kv.Path, openClawModel+".")
+			}) {
+				set = append(set, edit.KV{Path: openClawModel, Value: was.Model})
 			}
 		}
-		for _, ref := range selected {
-			if ref == "" {
+		if ms := c.Get(openClawModels); ms.IsObject() {
+			ms.ForEach(func(k, v gjson.Result) bool {
+				if v.IsObject() && len(v.Map()) == 0 && (prefixed(k.String()) || slices.Contains(was.Menu, openClawModels+"."+openClawKey(k.String()))) {
+					del = append(del, openClawModels+"."+openClawKey(k.String()))
+				}
+				return true
+			})
+		}
+		if allow := c.Get(openClawAllow); allow.IsArray() && len(was.Allow) > 0 {
+			var list []any
+			for _, a := range allow.Array() {
+				if !slices.Contains(was.Allow, a.String()) {
+					list = append(list, a.Value())
+				}
+			}
+			if len(list) < len(allow.Array()) {
+				if list == nil {
+					list = []any{}
+				}
+				set = append(set, edit.KV{Path: openClawAllow, Value: list})
+			}
+		}
+		// the selected agent's own model magpie kept in step goes back too
+		if was.OverrideKey != "" {
+			cur := c.Get(was.OverrideKey)
+			if len(was.WroteOverride) > 0 && sameJSON(cur.Raw, json.RawMessage(was.WroteOverride)) || prefixed(openClawPrimary(cur)) {
+				if len(was.Override) > 0 {
+					set = append(set, edit.KV{Path: was.OverrideKey, Value: was.Override})
+				} else {
+					del = append(del, was.OverrideKey)
+				}
+			}
+		}
+		if err := patch(set, del); err != nil {
+			return err
+		}
+		// the objects magpie made, where nothing else is in them now,
+		// deepest first; and the file, where magpie made it and it is
+		// left empty
+		for i := len(was.Made) - 1; i >= 0; i-- {
+			k := was.Made[i]
+			if strings.HasSuffix(k, "[]") {
 				continue
 			}
-			k := "agents.defaults.models." + strings.ReplaceAll(ref, ".", `\.`)
-			listed[k] = true
-			if !gjson.GetBytes(data, k).Exists() {
-				remember(k, map[string]any{})
-			}
-		}
-		for k, e := range rec.Edits {
-			if strings.HasPrefix(k, "agents.defaults.models.") && !listed[k] && len(e.Before) == 0 && sameJSON(gjson.GetBytes(data, k).Raw, e.After) {
-				del = append(del, k)
-				delete(rec.Edits, k)
-			}
-		}
-	}
-	// Newer OpenClaw versions have an explicit policy independent of models.
-	policy := "agents.defaults.modelPolicy.allow"
-	if p := gjson.GetBytes(data, policy); p.IsArray() {
-		var allow []string
-		if err := json.Unmarshal([]byte(p.Raw), &allow); err != nil {
-			return err
-		}
-		before := slices.Clone(allow)
-		for _, ref := range append([]string{"magpie/*"}, selected...) {
-			if ref != "" && !slices.Contains(allow, ref) {
-				allow = append(allow, ref)
-			}
-		}
-		if !slices.Equal(before, allow) {
-			remember(policy, allow)
-		}
-	}
-	sort.Strings(del)
-	base, err := openclawNormalize(path, raw)
-	if err != nil {
-		return err
-	}
-	out, err := edit.PatchJSON(base, set, del)
-	if err != nil {
-		return err
-	}
-	if !bytes.Equal(out, raw) {
-		if err := edit.WriteAtomic(path, out); err != nil {
-			return err
-		}
-	}
-	// Sync's write filter can keep a remote gateway or reverse proxy. Save
-	// the provider actually written, so Disconnect compares against that.
-	_, written, err := openclawRead(path)
-	if err != nil {
-		return err
-	}
-	e := rec.Edits[openclawProvider]
-	e.After = json.RawMessage(gjson.GetBytes(written, openclawProvider).Raw)
-	rec.Edits[openclawProvider] = e
-	b, _ := json.Marshal(rec)
-	stash(map[string]string{key: string(b)})
-	return nil
-}
-
-func openclawRestore(path, key, model string) error {
-	openclawMu.Lock()
-	defer openclawMu.Unlock()
-	raw, data, err := openclawRead(path)
-	if err != nil {
-		return err
-	}
-	rec, err := openclawSaved(key)
-	if err != nil {
-		return err
-	}
-	var set []edit.KV
-	var del []string
-	for k, e := range rec.Edits {
-		cur := gjson.GetBytes(data, k)
-		if !sameJSON(cur.Raw, e.After) && !(k == openclawModel+".primary" && prefixed(cur.String())) {
-			// Keep edits the user made after connecting, including policy entries.
-			if k == "agents.defaults.modelPolicy.allow" && cur.IsArray() {
-				var allow, before []string
-				json.Unmarshal([]byte(cur.Raw), &allow)
-				json.Unmarshal(e.Before, &before)
-				if !slices.Contains(before, "magpie/*") {
-					allow = slices.DeleteFunc(allow, func(v string) bool { return v == "magpie/*" })
-					set = append(set, edit.KV{Path: k, Value: allow})
+			if r := read().Get(k); r.IsObject() && len(r.Map()) == 0 {
+				if err := edit.DelJSON(path, k); err != nil {
+					return err
 				}
 			}
-			continue
 		}
-		if len(e.Before) == 0 {
-			del = append(del, k)
-		} else {
-			set = append(set, edit.KV{Path: k, Value: e.Before})
-		}
-	}
-	// Put a string shorthand back only if no fallback or other user field
-	// was added to the object while connected.
-	curModel := gjson.GetBytes(data, openclawModel)
-	modelFields := len(curModel.Map())
-	if slices.Contains(del, openclawModel+".fallbacks") {
-		modelFields--
-	}
-	if e, ok := rec.Edits[openclawModel+".primary"]; ok && (sameJSON(curModel.Get("primary").Raw, e.After) || prefixed(curModel.Get("primary").String())) &&
-		curModel.IsObject() && modelFields == 1 && (len(rec.Model) == 0 || gjson.ParseBytes(rec.Model).Type == gjson.String) {
-		set = slices.DeleteFunc(set, func(kv edit.KV) bool { return strings.HasPrefix(kv.Path, openclawModel+".") })
-		del = slices.DeleteFunc(del, func(k string) bool { return strings.HasPrefix(k, openclawModel+".") })
-		if len(rec.Model) > 0 {
-			set = append(set, edit.KV{Path: openclawModel, Value: rec.Model})
-		} else {
-			del = append(del, openclawModel)
-		}
-	}
-	if model != "" {
-		if target := openclawAgentModel(data); target != "" && gjson.GetBytes(data, target).Exists() {
-			set = slices.DeleteFunc(set, func(kv edit.KV) bool { return kv.Path == target })
-			del = slices.DeleteFunc(del, func(k string) bool { return k == target })
-			v := gjson.GetBytes(data, target)
-			if v.Type == gjson.String {
-				set = append(set, edit.KV{Path: target, Value: model})
-			} else {
-				set = append(set, edit.KV{Path: target + ".primary", Value: model})
+		if was.File {
+			if r := read(); r.IsObject() && len(r.Map()) == 0 {
+				return os.Remove(path)
 			}
 		}
-		set = slices.DeleteFunc(set, func(kv edit.KV) bool {
-			return kv.Path == openclawModel || strings.HasPrefix(kv.Path, openclawModel+".")
-		})
-		del = slices.DeleteFunc(del, func(k string) bool { return k == openclawModel || strings.HasPrefix(k, openclawModel+".") })
-		if curModel.Type == gjson.String {
-			set = append(set, edit.KV{Path: openclawModel, Value: model})
-		} else {
-			set = append(set, edit.KV{Path: openclawModel + ".primary", Value: model})
-		}
-	}
-	// A provider magpie created can leave an empty models object behind.
-	// That object was not in the user's file, so it goes with the provider.
-	if slices.Contains(del, openclawProvider) && len(gjson.GetBytes(data, "models").Map()) == 1 {
-		del = append(del, "models")
-	}
-	sort.Slice(set, func(i, j int) bool { return set[i].Path < set[j].Path })
-	sort.Strings(del)
-	base, err := openclawNormalize(path, raw)
-	if err != nil {
-		return err
-	}
-	out, err := edit.PatchJSON(base, set, del)
-	if err != nil {
-		return err
-	}
-	if !bytes.Equal(out, raw) {
-		if err := edit.WriteAtomic(path, out); err != nil {
-			return err
-		}
-	}
-	if err := openclawRestoreOriginal(path, out); err != nil {
-		return err
-	}
-	forget(key)
-	return nil
-}
-
-func openclawOwn(path, current string) []Option {
-	_, data, err := openclawRead(path)
-	if err != nil {
 		return nil
 	}
-	refs := map[string]bool{}
-	gjson.GetBytes(data, "agents.defaults.models").ForEach(func(k, _ gjson.Result) bool {
-		refs[k.String()] = true
-		return true
-	})
-	gjson.GetBytes(data, "models.providers").ForEach(func(p, v gjson.Result) bool {
-		v.Get("models").ForEach(func(_, m gjson.Result) bool {
-			refs[p.String()+"/"+m.Get("id").String()] = true
-			return true
-		})
-		return true
-	})
-	if current != "" {
-		refs[current] = true
-	}
-	gjson.GetBytes(data, openclawModel+".fallbacks").ForEach(func(_, v gjson.Result) bool {
-		refs[v.String()] = true
-		return true
-	})
-	var ids []string
-	for ref := range refs {
-		if !prefixed(ref) {
-			ids = append(ids, ref)
+	// apply makes chain the default model (and the agent's own override, where
+	// there is one), stashing what was there first
+	apply := func(chain ModelChain) error {
+		if err := writable(); err != nil {
+			return err
 		}
-	}
-	sort.Strings(ids)
-	return group("OpenClaw", static(ids...))
-}
-
-func openclawProviderAt(gw string) any {
-	ms := []map[string]any{}
-	for _, m := range magpieModels("openclaw") {
-		e := openclawModelJSON(m)
-		switch {
-		case slices.Contains(m.APIs, string(provider.Responses)):
-			e["api"] = "openai-responses"
-		case slices.Contains(m.APIs, string(provider.Anthropic)):
-			e["api"], e["baseUrl"] = "anthropic-messages", gw
+		if err := validateOpenClawChain(chain); err != nil {
+			return err
 		}
-		ms = append(ms, e)
-	}
-	return map[string]any{"baseUrl": gw + "/v1", "apiKey": keyAt(gw), "api": "openai-completions",
-		"headers": map[string]string{"User-Agent": "openclaw"}, "models": ms}
-}
-
-func openclawModelJSON(m catalog.Model) map[string]any {
-	e := map[string]any{"id": m.ID, "name": m.Name, "reasoning": len(m.Efforts) > 0, "input": []string{"text"}}
-	if m.Images {
-		e["input"] = []string{"text", "image"}
-	}
-	if m.Context > 0 {
-		e["contextWindow"] = m.Context
-	}
-	if n := maxTokens(m); n > 0 {
-		e["maxTokens"] = n
-	}
-	if m.Price != nil {
-		e["cost"] = map[string]any{"input": m.Price.Input, "output": m.Price.Output, "cacheRead": m.Price.CacheRead, "cacheWrite": m.Price.CacheWrite}
-	}
-	return e
-}
-
-func openclawChain(path string) (ModelChain, error) {
-	_, data, err := openclawRead(path)
-	if err != nil {
-		return ModelChain{}, err
-	}
-	v := gjson.GetBytes(data, openclawModel)
-	c, err := openclawParseChain(v)
-	if err != nil {
-		return c, err
-	}
-	if target := openclawAgentModel(data); target != "" {
-		v := gjson.GetBytes(data, target)
-		own, err := openclawParseChain(v)
+		s, err := openClawRead(path)
 		if err != nil {
-			return c, err
+			return err
+		}
+		c := gjson.ParseBytes(s)
+		var was openClawWas
+		if b := stashLoad()[keyWas]; b != "" {
+			json.Unmarshal([]byte(b), &was)
+		} else if !ours(c) {
+			m := c.Get(openClawModel)
+			was = openClawWas{Had: m.Exists(), File: s == nil}
+			if m.Exists() {
+				was.Model = json.RawMessage(m.Raw)
+			}
+		}
+		for _, k := range []string{"models", "models.providers", "agents", "agents.defaults"} {
+			if !c.Get(k).Exists() && !slices.Contains(was.Made, k) {
+				was.Made = append(was.Made, k)
+			}
+		}
+		set, del := wire(c, &chain, &was)
+		// The selected agent's model overrides defaults. Keep that override in
+		// sync without changing models belonging to other agents.
+		if target := openClawAgentModel(c); target != "" {
+			v := c.Get(target)
+			if v.Exists() {
+				if was.OverrideKey != target {
+					was.OverrideKey = target
+					was.Override = json.RawMessage(v.Raw)
+				}
+				value := map[string]any{}
+				if v.IsObject() {
+					if err := json.Unmarshal([]byte(v.Raw), &value); err != nil {
+						return err
+					}
+				} else if v.Type == gjson.String {
+					value["primary"] = v.String()
+				}
+				value["primary"] = chain.Primary
+				if chain.Fallbacks != nil {
+					value["fallbacks"] = chain.Fallbacks
+				}
+				set = append(set, edit.KV{Path: target, Value: value})
+			}
+		}
+		if err := patch(set, del); err != nil {
+			return err
+		}
+		// what magpie left in agents.defaults.model and the override, for
+		// unwire
+		last := read()
+		if r := last.Get(openClawModel); r.Exists() {
+			was.Wrote = json.RawMessage(r.Raw)
+		}
+		if was.OverrideKey != "" {
+			if r := last.Get(was.OverrideKey); r.Exists() {
+				was.WroteOverride = json.RawMessage(r.Raw)
+			}
+		}
+		b, _ := json.Marshal(was)
+		stash(map[string]string{keyWas: string(b)})
+		return nil
+	}
+	connect := func(ref string) error { return apply(ModelChain{Primary: ref}) }
+	return atomic(&Agent{
+		ID: "openclaw", Name: "OpenClaw", Icon: "openclaw-color", Spelled: prefixed, NoNames: true,
+		Bin: "openclaw", Dir: dir, Path: path,
+		Notice: func() string { return noticeOpenClaw.String() },
+		Unwire: func() error { return unwire("") },
+		Joined: func() bool {
+			s, err := openClawRead(path)
+			if err != nil {
+				return false
+			}
+			return gatewayKey(gjson.ParseBytes(s).Get(openClawProvider + ".apiKey").String())
+		},
+		ReadModelChain: func() (ModelChain, error) {
+			s, err := openClawRead(path)
+			if err != nil {
+				return ModelChain{}, err
+			}
+			return openClawChain(gjson.ParseBytes(s))
+		},
+		SetModelChain: func(chain ModelChain) error {
+			if chain.Fallbacks == nil {
+				chain.Fallbacks = []string{}
+			}
+			return apply(chain)
+		},
+		Sync: func() error {
+			s, err := openClawRead(path)
+			if err != nil {
+				return err
+			}
+			c := gjson.ParseBytes(s)
+			if !c.Get(openClawProvider).Exists() {
+				return nil
+			}
+			set, del := wire(c, nil, nil)
+			if len(set) == 0 && len(del) == 0 {
+				return nil
+			}
+			return patch(set, del)
+		},
+		Check: func() string {
+			s, err := openClawRead(path)
+			if err != nil {
+				return err.Error()
+			}
+			c := gjson.ParseBytes(s)
+			if !ours(c) && !openClawChainMine(c) {
+				return ""
+			}
+			p := c.Get(openClawProvider)
+			if !p.Exists() {
+				return "OpenClaw's " + openClawProvider + " (openclaw.json) is gone, so it no longer reaches magpie"
+			}
+			want := openClawProviderAt(at.gw())
+			return wiringOff("OpenClaw", path, func(k string) (string, bool) {
+				v := p.Get(k)
+				return v.String(), v.Exists()
+			}, "baseUrl", want["baseUrl"], "apiKey", want["apiKey"])
+		},
+		Fields: []Field{{
+			// the model OpenClaw runs on: one of magpie's is
+			// magpie/<provider>/<model>, OpenClaw's ref for it as it is
+			Key: "model", Label: "model",
+			Get: func() string { return openClawPrimary(read().Get(openClawModel)) },
+			Set: func(v string) error {
+				s, err := openClawRead(path)
+				if err != nil {
+					return err
+				}
+				c := gjson.ParseBytes(s)
+				if ref, ok := strings.CutPrefix(v, magpieID+"/"); ok && isMagpie(ref) {
+					return connect(v)
+				}
+				if c.Get(openClawProvider).Exists() {
+					// a chain that reaches magpie on fallback keeps the
+					// provider: only the model it starts on changes
+					if openClawFallbacksMine(c.Get(openClawModel)) && v != "" {
+						return patch([]edit.KV{{Path: openClawModel + ".primary", Value: v}}, nil)
+					}
+					return unwire(v)
+				}
+				if ours(c) {
+					return unwire(v)
+				}
+				if v == "" {
+					return nil
+				}
+				if m := c.Get(openClawModel); m.IsObject() {
+					return patch([]edit.KV{{Path: openClawModel + ".primary", Value: v}}, nil)
+				}
+				return patch([]edit.KV{{Path: openClawModel, Value: v}}, nil)
+			},
+			Options: func(cur map[string]string) []Option {
+				return append(openClawOwn(keyWas, cur["model"]), viaMagpie("openclaw", magpieID+"/")...)
+			},
+		}},
+	}, path)
+}
+
+// openClawOwn is the model OpenClaw ran on before magpie, or runs on now,
+// for the picker: OpenClaw's own providers are its sign-ins and plugins,
+// which magpie can't list.
+func openClawOwn(keyWas, cur string) []Option {
+	var was openClawWas
+	json.Unmarshal([]byte(stashLoad()[keyWas]), &was)
+	var out []Option
+	for _, m := range []string{openClawPrimary(gjson.ParseBytes(was.Model)), cur} {
+		if m == "" || prefixed(m) || slices.ContainsFunc(out, func(o Option) bool { return o.Value == m }) {
+			continue
+		}
+		p, id, _ := strings.Cut(m, "/")
+		out = append(out, Option{Value: m, Icon: modelIcon(p, id), Note: "OpenClaw's own"})
+	}
+	return group("openclaw", out)
+}
+
+// openClawChain is the effective sequence: the selected agent's override,
+// where it has one, else agents.defaults.model.
+func openClawChain(c gjson.Result) (ModelChain, error) {
+	chain, err := openClawParseChain(c.Get(openClawModel))
+	if err != nil {
+		return chain, err
+	}
+	if target := openClawAgentModel(c); target != "" {
+		v := c.Get(target)
+		own, err := openClawParseChain(v)
+		if err != nil {
+			return chain, err
 		}
 		if own.Primary != "" {
-			c.Primary = own.Primary
-			c.Fallbacks = own.Fallbacks
-		}
-		if v.Get("fallbacks").Exists() {
-			c.Fallbacks = own.Fallbacks
+			chain = own
+		} else if v.Get("fallbacks").Exists() {
+			chain.Fallbacks = own.Fallbacks
 		}
 	}
-	return c, nil
+	return chain, nil
 }
 
 // Resolve only a configured default or sole agent. An explicit fleet without
 // an owner continues to edit global defaults rather than guessing an agent.
-func openclawAgentModel(data []byte) string {
+func openClawAgentModel(c gjson.Result) string {
 	type entry struct {
 		id, path string
 		marked   bool
 	}
 	var entries []entry
-	roster := gjson.GetBytes(data, "agents.entries")
+	roster := c.Get("agents.entries")
 	if roster.Exists() {
 		roster.ForEach(func(k, v gjson.Result) bool {
 			if v.IsObject() {
-				entries = append(entries, entry{k.String(), "agents.entries." + strings.ReplaceAll(k.String(), ".", `\.`) + ".model", v.Get("default").Bool()})
+				entries = append(entries, entry{k.String(), "agents.entries." + openClawKey(k.String()) + ".model", v.Get("default").Bool()})
 			}
 			return true
 		})
 	} else {
-		for i, v := range gjson.GetBytes(data, "agents.list").Array() {
+		for i, v := range c.Get("agents.list").Array() {
 			if v.IsObject() {
 				entries = append(entries, entry{v.Get("id").String(), fmt.Sprintf("agents.list.%d.model", i), v.Get("default").Bool()})
 			}
 		}
 	}
-	owner := gjson.GetBytes(data, "agents.defaults.systemAgent.agentId").String()
+	owner := c.Get("agents.defaults.systemAgent.agentId").String()
 	for _, e := range entries {
 		if owner != "" && e.id == owner {
 			return e.path
 		}
 	}
-	if gjson.GetBytes(data, "agents.ownership").String() != "explicit" {
+	if c.Get("agents.ownership").String() != "explicit" {
 		var marked []entry
 		for _, e := range entries {
 			if e.marked {
@@ -741,7 +776,7 @@ func openclawAgentModel(data []byte) string {
 	return ""
 }
 
-func openclawParseChain(v gjson.Result) (ModelChain, error) {
+func openClawParseChain(v gjson.Result) (ModelChain, error) {
 	c := ModelChain{Fallbacks: []string{}}
 	if v.Type == gjson.String {
 		c.Primary = v.String()
@@ -775,4 +810,31 @@ func validateOpenClawChain(c ModelChain) error {
 		seen[id] = true
 	}
 	return nil
+}
+
+// openClawFallbacksMine says an agents.defaults.model value has a fallback
+// of magpie's, so magpie's provider must stay while it is set.
+// sameOpenClawValue reports whether two gjson values say the same, absent
+// ones alike.
+func sameOpenClawValue(a, b gjson.Result) bool {
+	if !a.Exists() || !b.Exists() {
+		return a.Exists() == b.Exists()
+	}
+	return sameJSON(a.Raw, json.RawMessage(b.Raw))
+}
+
+func openClawFallbacksMine(m gjson.Result) bool {
+	return slices.ContainsFunc(m.Get("fallbacks").Array(), func(f gjson.Result) bool {
+		return prefixed(f.String())
+	})
+}
+
+// openClawChainMine says the value is connected to magpie: a magpie model,
+// or a fallback of magpie's.
+func openClawChainMine(c gjson.Result) bool {
+	chain, err := openClawChain(c)
+	if err != nil {
+		return false
+	}
+	return prefixed(chain.Primary) || slices.ContainsFunc(chain.Fallbacks, prefixed)
 }
