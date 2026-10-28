@@ -1458,7 +1458,7 @@ func (s *Server) countOn(w http.ResponseWriter, r *http.Request, p provider.Prov
 					continue
 				}
 			}
-			keepRetry(w.Header(), res.Header, b)
+			keepRetryOut(w.Header(), res.Header, b)
 			writeError(w, provider.Anthropic, res.StatusCode, c.p.Explain(c.p.Name+": "+provider.APIError(b, res.Status), res.StatusCode, b))
 			return
 		}
@@ -2090,6 +2090,17 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 			writeError(w, from, 400, fmt.Sprintf("model %q does not support image input%s%s", call.Model, textOnlyNote(p, model, group), noSeerNote()))
 			turnedAway()
 			return
+		}
+	}
+	// a careful provider's capped accounts read again now where what is
+	// known of their usage is too old to send on (plugins#349)
+	if isGroup {
+		if ps, models := carefulOf(p, model, ms); anyCareful(ps) {
+			readCareful(r.Context(), ps, models)
+		}
+	} else if p.CapCareful || len(p.Fallback) > 0 {
+		if ps, models := carefulOf(p, model, nil); anyCareful(ps) {
+			readCareful(r.Context(), ps, models)
 		}
 	}
 	// the primary, then its fallbacks while it can't take the request and

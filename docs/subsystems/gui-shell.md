@@ -258,7 +258,17 @@ CoreText on macOS and Fontconfig on Linux. Discovery is lazy, cached in the
 handler, and refreshed by the menu. It returns names and CSS traits, never
 font files or paths. A failed refresh answers 503 and preserves the previous
 collection; an empty successful collection is distinct from failure.
-`magpie web` and `nogui` do not expose this desktop catalogue.
+A `nogui` build can't read the catalogue and answers 404.
+
+A browser tab (`magpie web`, or the app's page opened in a browser) has the
+same rows when boot says `fonts` (Norcleeh on Discord). Its choice is the
+browser's own, kept in `localStorage` under `magpie.fonts` and applied by
+`fonts.js` before the first paint: the tab can be on another computer, so
+it neither changes nor takes the app's `settings.UIFont`/`CodeFont`. Its
+list is `/api/fonts` less the families the browser doesn't draw
+(`desktopFonts.here`: text in the family measures apart from a generic
+family's on a canvas), so another computer's fonts, and Safari's
+user-installed ones, aren't offered. In a nogui build the rows stay hidden.
 
 `settings.UIFont` and `settings.CodeFont` keep the family, style name,
 OpenType weight, CSS slope and width percentage. A missing choice keeps the
@@ -310,7 +320,9 @@ its story's head has "Request and response", which fetches
 `GET /api/gateway/call?route=…` (`Server.RouteCall`) only when pressed.
 A call carries the Routing request it was (`Call.Route`, the trace's
 `Route.ID`, set where `serve`, the Codex backend and a refused title
-record it); a route id is not a call id. When the ring no longer has it,
+record it; the Codex backend's refused key and empty failure too, but not
+a compaction's, which opens no route: `TestCodexKeyRefusedCarriesItsRoute`);
+a route id is not a call id. When the ring no longer has it,
 the story shows the request archive's copy through `archivePanel` if the
 route names one (`Route.Archive`, `call.archiveName()`, set only when the
 archive was on for that request), and otherwise says how to turn the

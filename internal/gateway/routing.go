@@ -687,7 +687,7 @@ func (s *Server) UnrestAll(key string) int {
 	}
 	liftedLocked(key, now)
 	restingUntil.Unlock()
-	unsink(key)
+	unsinkAll(key)
 	s.trace.lifted()
 	return n
 }
@@ -1114,7 +1114,15 @@ func (s *Server) restAfterMarked(c candidate, status int, header http.Header, bo
 		d, r.By, r.Failures = s.rateRest(c, header, body, sharedPool, now)
 		// rate limited with quota left: to the back, where the order sinks
 		if c.full(now).IsZero() && !(c.isOpenRouterFree() && sharedPool) {
-			sink(c.restKey(), now)
+			// a remote magpie's rest is the model's alone (caa53673, the
+			// key's own limit apart): the sink keeps the same scope, or
+			// one model's 429 would send the remote's other models, never
+			// limited, behind the others too
+			if remoteModelRest(c, failRate, header) {
+				sink(c.restID(), now)
+			} else {
+				sink(c.restKey(), now)
+			}
 		}
 	case failRestricted:
 		// out until the vendor lifts it: an appeal, not a wait (#1849)
@@ -1275,7 +1283,7 @@ func (s *Server) restAfterMarked(c candidate, status int, header http.Header, bo
 // on Discord: "Remote Magpie: Claude Code: You've hit your session
 // limit" answered every model of it for the five hours it named).
 func remoteModelRest(c candidate, why string, header http.Header) bool {
-	if !c.p.IsRemoteMagpie() && header.Get(answeredThereHeader) == "" || header.Get(remoteKeyLimitHeader) != "" {
+	if !c.p.IsRemoteMagpie() && header.Get(answeredThereHeader) == "" || header.Get(remoteKeyLimitHeader) != "" || header.Get(keyLimitThereHeader) != "" {
 		return false
 	}
 	return why == failQuota || why == failCredit || why == failRate || why == failRestricted || why == failVerify
@@ -1453,6 +1461,15 @@ func keepRetry(dst, src http.Header, body []byte) {
 			dst.Set("Retry-After", strconv.Itoa(int(d.Seconds())))
 		}
 	}
+	if src.Get(remoteKeyLimitHeader) != "" {
+		// another magpie's gateway key is over its own limit: noted for
+		// restAfter, which rests that magpie whole (remoteModelRest), as
+		// the held try's header is all it reads (#2791, ggbdpq: the
+		// marker was left out, and the key's limit rested one model). A
+		// note, not the marker, so a magpie this one answers doesn't read
+		// another's key limit as this one's
+		dst.Set(keyLimitThereHeader, "1")
+	}
 	if who := src.Get(providerHeader); who != "" {
 		// another magpie refused it, naming its provider that did: this
 		// magpie's own name for the provider goes in the same header
@@ -1471,6 +1488,18 @@ func keepRetry(dst, src http.Header, body []byte) {
 		dst.Set(zdrHeader, "1")
 	}
 }
+
+// keepRetryOut is keepRetry onto a reply that goes to the client as it
+// is, with no holdWriter to drop magpie's own notes.
+func keepRetryOut(dst, src http.Header, body []byte) {
+	keepRetry(dst, src, body)
+	dst.Del(answeredThereHeader)
+	dst.Del(keyLimitThereHeader)
+}
+
+// keyLimitThereHeader carries, from keepRetry to restAfter, that another
+// magpie refused with its gateway key's own limit (remoteKeyLimitHeader).
+const keyLimitThereHeader = "X-Magpie-Key-Limit-There"
 
 // answeredThereHeader carries, from keepRetry to restAfter, the provider
 // another magpie named on its refusal (providerHeader): the refusal is
@@ -1589,6 +1618,11 @@ type left struct {
 	// credits: a Codex account that goes on on its credits once its
 	// allowance is used up (spendsCredits)
 	credits bool
+	// bal is a prepaid wallet's balance in balUnit (Allowance.Left,
+	// #3950); balIn says whose wallet it is, provider and unit, and is
+	// empty when no balance was told: routes.Seat.LeftIn
+	bal            float64
+	balUnit, balIn string
 }
 
 // learns: c is a subscription whose allowance isn't known yet, of an agent
@@ -1644,12 +1678,14 @@ func weighRouted(p provider.Provider, cs []candidate, model string, from provide
 	for _, c := range cs {
 		var a provider.Allowance
 		var ok bool
+		whose := c.p.ID // whose wallet a balance is in
 		if c.p.Account == nil {
 			// a key that reads its own windows is weighed by them as an
 			// account is; any other key isn't known
 			a, ok = keyAllowance(c.p)
 		} else {
 			ag := c.p.Account.UsageAgent()
+			whose = ag
 			if _, had := known[ag]; !had {
 				known[ag] = allowances(ag)
 			}
@@ -1660,8 +1696,14 @@ func weighRouted(p provider.Provider, cs []candidate, model string, from provide
 			pc, due := a.Pace(c.model, now)
 			amt, of, unit := a.Count(c.model, now)
 			rs := a.Restarts(now)
-			wg.lefts[c.allowanceKey()] = left{used: u, renews: r, fullest: a.Fullest(c.model, now), soon: a.Renewal(c.model, now), lapse: a.Lapse(c.model, now), pace: pc, due: due, amount: amt, of: of, unit: unit,
+			l := left{used: u, renews: r, fullest: a.Fullest(c.model, now), soon: a.Renewal(c.model, now), lapse: a.Lapse(c.model, now), pace: pc, due: due, amount: amt, of: of, unit: unit,
 				restarts: rs, dueRestart: !rs.IsZero() && due.Equal(rs), credits: spendsCredits(c.p, a)} // one not known counts as unused
+			if b, bu, has := a.Left(c.model); has {
+				// a wallet's figure is weighed only against the same
+				// provider's in the same unit (routes.Seat.LeftIn)
+				l.bal, l.balUnit, l.balIn = b, bu, whose+"\x00"+bu
+			}
+			wg.lefts[c.allowanceKey()] = l
 		}
 	}
 	if len(cs) < 2 {
@@ -1682,7 +1724,8 @@ func weighRouted(p provider.Provider, cs []candidate, model string, from provide
 			pace = provider.FreshPace
 		}
 		seats[i] = routes.Seat{Key: c.rest, Account: c.p.Account != nil, Known: known, Learns: learns(c, wg.lefts),
-			Used: l.used, Soon: l.soon, Lapse: l.lapse, Pace: pace, Weight: keyWeight(c), Resting: resting(c), Tokens: routed.used[c.restKey()].now(now), Credits: l.credits}
+			Used: l.used, Soon: l.soon, Lapse: l.lapse, Pace: pace, Weight: keyWeight(c), Resting: resting(c), Tokens: routed.used[c.restKey()].now(now), Credits: l.credits,
+			Left: l.bal, LeftIn: l.balIn}
 	}
 	routed.Unlock()
 	if st.ByUse {

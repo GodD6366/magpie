@@ -1062,6 +1062,30 @@ var wslRoot = func(name string) string {
 	return `\\wsl$\` + name // before Windows 11 / WSL 0.50
 }
 
+// wslHungPath, while recent, says a wsl.exe listing timed out: each
+// command a hung WSL held for its 10s timeout (20s with the running list),
+// `magpie providers` for Copilot's sign-in in a distro, `magpie version`
+// for start-up's moves.
+func wslHungPath() string { return filepath.Join(filepath.Dir(provider.Path()), "wsl-hung") }
+
+// wslHungAfter: a failure this slow is a hang, not no WSL; a var for tests.
+var wslHungAfter = 5 * time.Second
+
+const wslHungAge = 10 * time.Minute // how long another process takes it as hung
+
+func wslHungLately() bool {
+	fi, err := os.Stat(wslHungPath())
+	return err == nil && time.Since(fi.ModTime()) < wslHungAge
+}
+
+func wslHung(hung bool) {
+	if hung {
+		_ = os.WriteFile(wslHungPath(), []byte(time.Now().UTC().Format(time.RFC3339)+"\n"), 0o600)
+	} else {
+		_ = os.Remove(wslHungPath())
+	}
+}
+
 func wslStatePath() string { return filepath.Join(filepath.Dir(provider.Path()), "wsl.json") }
 
 func wslDistros() []distro {
@@ -1075,8 +1099,21 @@ func wslDistros() []distro {
 		wslForgetOldBins()
 	}
 	if time.Since(wsl.at) > wslListAge {
-		wsl.names, wsl.listed = wslList("-l", "-q")
+		if wsl.at.IsZero() && wslHungLately() {
+			// another magpie waited out a hung wsl.exe moments ago: a
+			// command doesn't wait 10s more (this one lists again in a minute)
+			wsl.names, wsl.listed = nil, false
+		} else {
+			start := time.Now()
+			wsl.names, wsl.listed = wslList("-l", "-q")
+			wslHung(!wsl.listed && time.Since(start) >= wslHungAfter)
+		}
 		wsl.at = time.Now()
+		if !wsl.listed || len(wsl.names) == 0 {
+			// none to run: a wsl.exe that couldn't list them isn't asked
+			// again which run, another timeout under the lock the GUI waits on
+			wsl.running, wsl.runOK, wsl.runAt = map[string]bool{}, wsl.listed, time.Now()
+		}
 	}
 	wslRunningLocked()
 	installed := map[string]bool{}
@@ -1253,24 +1290,32 @@ func wslLastSeen(name, key string) string {
 	return ""
 }
 
-// wslClaudeStandIn is StandIn for a Claude Code in a WSL distro routed
-// through magpie: the first, of the distros running now, whose
-// settings.json has a stand-in. Only magpie's memory of them and which run
-// (wslRunningLocked) are asked — nothing is probed, and a stopped distro
-// is never opened.
-func wslClaudeStandIn(model string) string {
+// wslReady are the distros running now that the probe found kind in, each
+// with its mirrored networking settled, ready for a read of its files.
+// Only magpie's memory of them and which run (wslRunningLocked) are
+// asked — nothing is probed, and a stopped distro is never opened.
+func wslReady(kind string) []distro {
 	wsl.Lock()
 	wslRunningLocked()
 	var ds []distro
 	for _, n := range wsl.names {
-		if d := wsl.seen[n]; d != nil && wsl.running[n] && wslKindOf("claude").found(*d) {
+		if d := wsl.seen[n]; d != nil && wsl.running[n] && wslKindOf(kind).found(*d) {
 			ds = append(ds, *d)
 		}
 	}
 	wsl.Unlock()
 	cfg := wslConfig()
-	for _, d := range ds {
-		d.mirror(cfg)
+	for i := range ds {
+		ds[i].mirror(cfg)
+	}
+	return ds
+}
+
+// wslClaudeStandIn is StandIn for a Claude Code in a WSL distro routed
+// through magpie: the first, of the distros running now, whose
+// settings.json has a stand-in.
+func wslClaudeStandIn(model string) string {
+	for _, d := range wslReady("claude") {
 		path := filepath.Join(d.local(d.Home), ".claude", "settings.json")
 		if m := claudeStandInAt(path, model, d.base()); m != "" {
 			return m
@@ -1295,6 +1340,19 @@ func wslClaudeClassifier(model string) string {
 	for _, d := range ds {
 		d.mirror(cfg)
 		if m := claudeClassifierIn(d.place("claude@wsl:"+d.Name), model); m != "" {
+			return m
+		}
+	}
+	return ""
+}
+
+// wslCodexStandIn is StandIn for a Codex in a WSL distro routed through
+// magpie: the first, of the distros running now, whose config.toml has
+// magpie as its provider, as this machine's codexStandIn reads it.
+func wslCodexStandIn() string {
+	for _, d := range wslReady("codex") {
+		path := filepath.Join(d.place("codex@wsl:"+d.Name).codexHome(), "config.toml")
+		if m := codexStandIn(path); m != "" {
 			return m
 		}
 	}

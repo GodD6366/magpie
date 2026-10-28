@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -24,7 +25,7 @@ func TestRenamedProviderShownOnce(t *testing.T) {
 	}
 	then := time.Now().Add(-time.Hour)
 	Append(Record{Time: then, Agent: "codex", Session: "s1", Provider: "myrelay", Model: "gpt-9", Input: 100, Output: 10, Status: 200})
-	probelog.Sink(probelog.Row{Time: then.Add(time.Second), Kind: probelog.KindList, Provider: "myrelay", Host: "relay.example", Endpoint: "GET /v1/models", Status: 200, Millis: 30})
+	probelog.Sink(probelog.Row{Time: then.Add(time.Second), Kind: probelog.KindList, Provider: "myrelay", Host: "relay.example", Endpoint: "GET /v1/models", Status: 502, Millis: 30, Error: "bad gateway"})
 	// read once under the old id, so what is kept of it is built again
 	if p := QueryPage(All, Filter{}, 0, 50); !slices.Equal(p.Providers, []string{"myrelay"}) {
 		t.Fatalf("before: %v", p.Providers)
@@ -162,5 +163,112 @@ func TestProbesOfADeletedProviderStayWithIt(t *testing.T) {
 	}
 	if p := QueryPage(All, Filter{Provider: "twice.example"}, 0, 50); p.Total != 2 {
 		t.Fatalf("twice.example's rows: total %d", p.Total)
+	}
+}
+
+// CyberCaius on Discord: Leee's model list was asked at leee.baby while it
+// was being added, and it was saved on another host of that site, so the
+// Usage page's provider filter listed Leee and leee.baby (as example and
+// example.me before: a provider on api.example.me). A probe recorded under
+// a host no provider is on is the one provider's on a host of the same site
+// (its registrable domain, whatever the subdomain or port), and after that
+// one is deleted, the one the log's calls to that site went to. A site two
+// providers are on, a hosting platform's names (vercel.app is a suffix of
+// its own) and an address stay as they were recorded.
+func TestProbesOfAProviderOnAnotherHostOfItsSiteListIt(t *testing.T) {
+	reportedHome(t)
+	then := time.Now().Add(-time.Hour)
+	adding := probelog.With(context.Background(), probelog.KindList, "", "")
+	for _, u := range []string{
+		"https://leee.baby/v1/models", "https://Leee.Baby/v1/models", "https://www.leee.baby:443/v1/models",
+		"https://two.example/v1/models", "https://mine.vercel.app/v1/models", "http://127.0.0.1:7/v1/models",
+	} {
+		probelog.Note(adding, u, http.MethodGet, then, 401, nil) // an answered list is no row (quietProbe)
+	}
+	id, err := provider.Add(provider.Provider{Name: "Leee", Key: "k", Chat: "https://api.leee.baby/v1", Models: []string{"gpt-9"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	saved, err := provider.Find(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range []provider.Provider{
+		{ID: "two-a", Name: "Two A", Key: "a", Chat: "https://a.two.example/v1", Models: []string{"m"}},
+		{ID: "two-b", Name: "Two B", Key: "b", Chat: "https://b.two.example/v1", Models: []string{"m"}},
+		{ID: "theirs", Name: "Theirs", Key: "c", Chat: "https://theirs.vercel.app/v1", Models: []string{"m"}},
+		{ID: "local", Name: "Local", Key: "d", Chat: "http://127.0.0.1:8/v1", Models: []string{"m"}},
+	} {
+		if err := provider.Save(p); err != nil {
+			t.Fatal(err)
+		}
+	}
+	list := func() []string { return QueryPage(All, Filter{}, 0, 50).Providers }
+	want := []string{"127.0.0.1:7", id, "mine.vercel.app", "two.example"}
+	if !slices.Equal(list(), want) { // saved, no call made yet
+		t.Fatalf("no calls: providers %v, want %v", list(), want)
+	}
+	Append(Record{Time: then.Add(time.Minute), Agent: "codex", Session: "s1", Provider: id, Host: saved.Where(), Model: "gpt-9", Input: 100, Output: 10, Status: 200})
+	if !slices.Equal(list(), want) {
+		t.Fatalf("saved: providers %v, want %v", list(), want)
+	}
+	if p := QueryPage(All, Filter{Provider: id}, 0, 50); p.Total != 4 || p.Sum.Calls != 1 {
+		t.Fatalf("%s's rows: total %d, sum %+v", id, p.Total, p.Sum)
+	}
+	if err := provider.Delete(id); err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(list(), want) {
+		t.Fatalf("deleted: providers %v, want %v", list(), want)
+	}
+	if p := QueryPage(All, Filter{Provider: id}, 0, 50); p.Total != 4 {
+		t.Fatalf("deleted %s's rows: total %d", id, p.Total)
+	}
+}
+
+// cybercaius on Discord: a provider deleted and another added under its
+// id were one on the Usage page, the new one with the old one's calls.
+// The deleted one's calls stay its own, under an id of their own, named
+// as it was and marked deleted; the new one has only its own.
+func TestDeletedProviderKeepsItsCallsFromOneAddedUnderItsID(t *testing.T) {
+	reportedHome(t)
+	if err := provider.Save(provider.Provider{ID: "relay", Name: "Old relay", Key: "k", Chat: "http://127.0.0.1:1/v1", Models: []string{"gpt-9"}}); err != nil {
+		t.Fatal(err)
+	}
+	then := time.Now().Add(-time.Hour)
+	Append(Record{Time: then, Agent: "codex", Session: "s1", Provider: "relay", Model: "gpt-9", Input: 100, Output: 10, Status: 200})
+	Append(Record{Time: then.Add(time.Second), Agent: "codex", Session: "s1", Provider: "relay", Model: "gpt-9", Input: 100, Output: 10, Status: 200})
+	if err := provider.Delete("relay"); err != nil {
+		t.Fatal(err)
+	}
+	if err := provider.Save(provider.Provider{ID: "relay", Name: "New relay", Key: "k2", Chat: "http://127.0.0.1:2/v1", Models: []string{"gpt-9"}}); err != nil {
+		t.Fatal(err)
+	}
+	Append(Record{Time: time.Now().Add(time.Second), Agent: "codex", Session: "s2", Provider: "relay", Model: "gpt-9", Input: 100, Output: 10, Status: 200})
+
+	page := QueryPage(All, Filter{}, 0, 50)
+	if len(page.Providers) != 2 || page.Providers[0] != "relay" || !strings.HasPrefix(page.Providers[1], "relay~") {
+		t.Fatalf("providers %v", page.Providers)
+	}
+	old := page.Providers[1]
+	d, ok := provider.UsageRenames().Gone(old)
+	if !ok || d.ID != "relay" || d.Name != "Old relay" {
+		t.Fatalf("gone %q: %+v %v", old, d, ok)
+	}
+	if p := QueryPage(All, Filter{Provider: "relay"}, 0, 50); p.Sum.Calls != 1 {
+		t.Fatalf("the new one's: %+v", p.Sum)
+	}
+	if p := QueryPage(All, Filter{Provider: old}, 0, 50); p.Sum.Calls != 2 {
+		t.Fatalf("the deleted one's: %+v", p.Sum)
+	}
+	if vs := Vias(time.Time{}).Of("codex|s1"); len(vs) != 1 || vs[0].Provider != old {
+		t.Fatalf("vias of the deleted one %+v", vs)
+	}
+	calls := map[string]int{}
+	for _, g := range Summarize(All).Models {
+		calls[g.ID] += g.Calls
+	}
+	if calls["relay/gpt-9"] != 1 || calls[old+"/gpt-9"] != 2 {
+		t.Fatalf("summary %v", calls)
 	}
 }
