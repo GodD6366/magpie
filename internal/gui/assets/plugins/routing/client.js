@@ -680,10 +680,20 @@ function routingPage(part) {
       ? t("{who} goes first: of those alike, its wallet has the most left — {n}, where {other} has {m}.", { who: who(f), n: balText(f), other: who(o), m: balText(o) }) : null;
   }
 
+  // why a request has no one weighed for it: magpie holds it before
+  // routing (masking it, or still reading it), or nothing took it
+  function noneWhy(r) {
+    if (!r.done) return r.phase === "redact"
+      ? t("magpie is masking this request before routing it (Settings › Privacy), so who takes it isn't picked yet.")
+      : t("magpie hasn't routed this request yet, so who takes it isn't picked yet.");
+    if (r.error) return t("Nothing took this request: {error}", { error: r.error });
+    return t("Nothing could take {model}.", { model: r.model });
+  }
+
   // why routing put the first where it did
   function firstWhy(r) {
     const f = r.order[0];
-    if (!f) return t("Nothing could take {model}.", { model: r.model });
+    if (!f) return noneWhy(r);
     const w = who(f);
     if (r.sealedTask && r.leadAccount === f.id) return t("{who} goes first: it answered the parent agent and may be needed to read this encrypted task.", { who: w });
     if (r.compaction && r.order.length === 1) return t("{who} compacted this conversation natively, and only it can read that compaction, so the conversation stays on it: other accounts aren't asked. Start a new conversation to use them.", { who: w });
@@ -2326,19 +2336,53 @@ function routingPage(part) {
     const m = modeOf(routing);
     const on = r.order.filter((x) => !x.fallback).length;
     const pool = !g && f ? poolOf(f.provider) : null;
-    const lone = !g && on <= 1 && !pool;
+    // none weighed: a request magpie holds before routing it (masked
+    // first, or still read), or one nothing took. It says so, not "0 on"
+    // over the one-account hint (Jason on Discord: a held Codex turn read
+    // "magpie · 0 on" and "only one account is on")
+    const none = !r.order.length;
+    const lone = !g && on === 1 && !pool;
     // the head is told again every second: a chip whose text node is
     // swapped while it is pressed gets no click in WebKit (#2151), so
     // only what changed is written
     setText(chip, t(m[0]));
-    chip.hidden = lone;
+    chip.hidden = lone || (none && !g);
     goTo(chip, g ? "group:" + g.id : pool ? "pool:" + f.provider : "", g ? g.name : f?.name || r.provider);
     hubText();
-    const name = g ? g.name : f?.name || r.provider, tail = (g ? " · " + t("routing group") : "") + " · " + t(on === 1 ? "one on" : "{n} on", { n: on })
+    const name = g ? g.name : f?.name || r.provider, tail = (g ? " · " + t("routing group") : "")
+      + (none ? (r.done ? "" : " · " + waitWord(r)) : " · " + t(on === 1 ? "one on" : "{n} on", { n: on }))
       + (many > 1 ? " · " + t("{n} agents at once", { n: many }) : "");
     if (what.childElementCount !== 2 || what.firstChild.textContent !== name || what.lastChild.textContent !== tail) what.replaceChildren(el("b", "", name), el("span", "", tail));
     // keys that read their own windows are weighed as accounts are
-    setText(mode, lone ? t(LONE) : g && routing === "order" ? t(GROUP_ORDER) : g && routing === "weight" ? t(GROUP_WEIGHT) : t(!routing && f?.kind === "key" && !r.order.some((x) => x.known) && !g ? KEYS_SMART : m[1]));
+    setText(mode, none ? noneWhy(r) : lone ? t(LONE) : g && routing === "order" ? t(GROUP_ORDER) : g && routing === "weight" ? t(GROUP_WEIGHT) : t(!routing && f?.kind === "key" && !r.order.some((x) => x.known) && !g ? KEYS_SMART : m[1]));
+    holdMode(r);
+  }
+  // holdMode keeps the line under the head, live, as tall as the last
+  // few requests told it, as holdStory does the story: it sits over the
+  // list, so a request picked whose line is shorter (one nothing took
+  // says so in a line, where one account on gave three) pulled the list
+  // up under the reader's click. A layout is read only when the line's
+  // words or the width change, not on each second's telling (#3164)
+  let modeHold = { key: "", told: new Map() };
+  function holdMode(r) {
+    const w = storyW;
+    if (rp || day || !w) {
+      if (mode.style.minHeight) mode.style.minHeight = "";
+      modeHold = { key: "", told: new Map() };
+      return;
+    }
+    const key = JSON.stringify([w, document.documentElement.lang]);
+    if (key !== modeHold.key) modeHold = { key, told: new Map() };
+    if (modeHold.told.get(r.id)?.[0] !== mode.textContent) {
+      mode.style.minHeight = "";
+      modeHold.told.set(r.id, [mode.textContent, mode.getBoundingClientRect().height]);
+      const ids = [...modeHold.told.keys()].sort((x, y) => y - x);
+      for (const id of ids.slice(3)) if (id !== r.id) modeHold.told.delete(id);
+    }
+    const own = modeHold.told.get(r.id)[1];
+    const held = Math.max(...[...modeHold.told.values()].map((h) => h[1]));
+    const min = held > own ? held + "px" : "";
+    if (mode.style.minHeight !== min) mode.style.minHeight = min;
   }
   // goTo makes what names a routing a way to where it is set: a provider's
   // own under Several accounts or keys, a group's its card
@@ -2683,7 +2727,9 @@ function routingPage(part) {
     });
   }
   // grown since it was measured (a font come in): measured again as it is
-  new ResizeObserver(() => { storyW = steps.clientWidth; storyDrawn = ""; holdStory(); }).observe(steps);
+  // and the head's line told again, so it is held from the first width
+  // on, not from the second's next telling (a pick before it isn't held)
+  new ResizeObserver(() => { storyW = steps.clientWidth; storyDrawn = ""; holdStory(); if (headOf) header(...headOf); }).observe(steps);
   // renderCtx draws the request's context window under its story, with
   // its session's prompts request by request; drawn again only when what
   // it shows changes. Live, the next request is patched into the card
@@ -2849,6 +2895,7 @@ function routingPage(part) {
   // go up to the stage, which read as the page jumping to its top)
   function pick(r) {
     pinned = !day && r.id === newest()?.id ? null : r;
+    awayAt = 0;
     if (rp) { rp = null; rbar.hidden = true; }
     stopPlays();
     cur = r;
@@ -4367,6 +4414,7 @@ function routingPage(part) {
     ticking = 0;
     seen = false;
     endReplay(true);
+    leftPick();
     for (const tr of trips) tr.res();
     trips = [];
     wake();
@@ -4375,16 +4423,41 @@ function routingPage(part) {
   // Visibility events can arrive after the browser has suspended frames, so
   // finish hidden work here too. The first visible frame alone owns resume.
   function start() {
+    const waking = !!sightWait; // the poll waited: it reads what came meanwhile
     inSightAgain();
     countdown();
     if (!shown()) { pause(); return; }
+    backToPick(!waking);
     kick();
+  }
+  // A pick holds the stage while the reader is with it (and #1389 lets it
+  // go once it has left the list). Gone from the page — another app,
+  // another page, the window hidden — and back to requests that came
+  // meanwhile, the reader comes back to live, not to a pick they may well
+  // have forgotten: a 16:36 request the agent had canceled held the stage
+  // at 17:09 while the list under it filled with newer ones (未寒 on
+  // Discord, 10-28). Back to none, the pick stays.
+  let awayAt = 0, blurred = false; // the newest request when the reader left a pick; 0 while with it
+  function leftPick() {
+    if (pinned && !day && !rp && !awayAt) awayAt = newest()?.id || 1;
+  }
+  // backToPick: the reader is back; done, it was the last word on this
+  // time away (the poll may still be reading what came meanwhile)
+  function backToPick(done) {
+    if (!awayAt || blurred || !shown() || !loaded) return;
+    const was = awayAt;
+    if (done) awayAt = 0;
+    if (!pinned || day || rp || !((newest()?.id || 0) > was)) return;
+    awayAt = 0;
+    pinned = null;
+    followListed();
   }
   // in sight again: the view picked, the window shown, another tab left,
   // the window covered and drawing frames once more
   new MutationObserver(start).observe($("#view-routing"), { attributes: true, attributeFilter: ["hidden"] });
   document.addEventListener("visibilitychange", start);
-  window.addEventListener("focus", start);
+  window.addEventListener("blur", () => { blurred = true; leftPick(); });
+  window.addEventListener("focus", () => { blurred = false; start(); });
   // countdowns tick once a second, only while the page is in sight: a
   // tick with nothing to draw wakes the web content process all the same
   // (#3185), so out of sight there is none until start() sees it again
@@ -4534,6 +4607,8 @@ function routingPage(part) {
             cur = newest();
             if (cur) { sync(true); say(affWhy(cur, true) || ruleWhy(cur, true) || firstWhy(cur)); }
           }
+          // back in sight to requests that came while away: live again
+          if (back) backToPick(true);
           if (!pinned && !rp) {
             cur = newest();
             if (cur) sync();

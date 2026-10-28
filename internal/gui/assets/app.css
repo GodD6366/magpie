@@ -270,9 +270,12 @@ body.panel .seg { display: none; }
    WebKit turns a whole svg on a layer snapped to the pixel grid, so off a
    whole pixel its ring circles about a point a pixel or so off its centre */
 .icon.spin svg > * { transform-box: view-box; transform-origin: 50% 50%; animation: spin .9s linear infinite; }
-/* a newer magpie is ready: a quiet pill before the header's icons */
+/* a newer magpie is ready: a quiet pill before the header's icons. It
+   opens from nothing, so the title bar's tools beside the sidebar (app.js
+   tools) slide over to make room, not jump 80px at once (#4057) */
 .update {
   align-self: center; display: inline-flex; align-items: center; gap: 4px;
+  max-width: 20em; overflow: hidden;
   height: 22px; margin-right: 6px; padding: 0 9px 0 7px; border-radius: 999px;
   font-size: 11.5px; font-weight: 560; letter-spacing: .005em; white-space: nowrap;
   color: var(--accent); background: var(--accent-soft);
@@ -336,7 +339,7 @@ body.window .top.inrow .actions { margin-left: 0; }
   body.web .top #nav button { flex: none; height: 40px; padding: 0 14px; font-size: 14px; }
   body.web .top .actions { gap: 4px; }
 }
-@keyframes update-in { from { opacity: 0; transform: translateY(-3px) scale(.94); } }
+@keyframes update-in { from { opacity: 0; max-width: 0; margin-right: 0; padding: 0; } }
 @keyframes spin { to { transform: rotate(360deg); } }
 
 /* ---- the sidebar (app.js layoutNav) -------------------------------------- */
@@ -727,6 +730,7 @@ body.window .row.agent .who .ag-cli { flex: 0 1 auto; overflow: hidden; }
 /* the agents plugins add: one row, its way to Plugins */
 .ag-install-plugins { width: 100%; align-items: center; font: inherit; color: var(--accent); text-align: left; cursor: pointer; transition: background .2s; }
 .ag-install-plugins:hover { background: var(--accent-soft); }
+.ag-install-head + .ag-install-plugins { margin-top: 6px; }
 .ag-install-plugins:focus-visible { outline: 1.5px solid var(--fg-2); outline-offset: 1px; }
 .ag-install-plugins .ag-install-who { flex: none; padding-top: 0; }
 .ag-install-plugins .puzzle { flex: none; width: 18px; height: 18px; display: grid; place-items: center; }
@@ -2331,8 +2335,10 @@ body.window .ag-sk-icon { width: 22px; height: 22px; border-radius: 6px; }
 /* a gateway key: the copy right beside the masked key, the rest under
    its … (the owner: a copy out in the row's middle looked lost) */
 .gw-keys .acc > .plan + .copy { margin-left: -5px; }
-/* narrow, the masked key gives up its room before the key's name does */
-.gw-keys .acc > .plan { flex-shrink: 6; }
+/* narrow, the masked key gives up its room before the key's name does.
+   Not the Providers keys list's rules (.accts.keys): Limit and Models keep
+   their room there while hidden, so a hover doesn't push the row about */
+.gw-keys .acc > .plan { flex: 0 6 auto; min-width: 3em; overflow: hidden; text-overflow: ellipsis; }
 .gw-keys .gw-key-more { flex: none; color: var(--muted); }
 .gw-keys .gw-key-more:is(:hover, .open) { color: var(--fg); }
 #view-gateway .row-head, #view-usage .row-head { margin: 14px 0 6px; padding: 0 2px; }
